@@ -17,6 +17,7 @@
 
 from collections.abc import Callable
 from typing import Any
+import time
 
 import torch
 import torch_npu
@@ -305,6 +306,9 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         # Expert offload: incrementally page in needed experts, update log2phy
         use_prefill_pool = False
         prefill_slot = -1
+
+        _do_compute_timing = False
+        _timing_mgr = None
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
@@ -318,6 +322,11 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 except ValueError:
                     layer_idx = 0
                 prefill_slot = layer_idx % len(mgr._prefill_w13)
+
+            if (mgr._profile_timing and num_tokens <= mgr.offload_threshold
+                    and not _EXTRA_CTX.capturing):
+                _do_compute_timing = True
+                _timing_mgr = mgr
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         fused_scale_flag = (
@@ -357,6 +366,10 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
         w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
 
+        if _do_compute_timing:
+            torch_npu.npu.current_stream().synchronize()
+            _ct0 = time.perf_counter()
+
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
@@ -380,6 +393,9 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 swiglu_limit=layer.swiglu_limit,
             )
         )
+        if _do_compute_timing:
+            torch_npu.npu.current_stream().synchronize()
+            _timing_mgr.record_compute_time(layer, (time.perf_counter() - _ct0) * 1000.0)
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
         # Trigger next-layer expert prefetch AFTER GMM kernel submission

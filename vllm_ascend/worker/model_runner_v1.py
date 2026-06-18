@@ -1900,6 +1900,10 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if hasattr(self, "offload_manager") and scheduler_output.finished_req_ids:
+            self.offload_manager.flush_sequence_cache_stats(
+                finished_reqs=len(scheduler_output.finished_req_ids))
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.21.0"):
                 capturer = get_global_experts_capturer()

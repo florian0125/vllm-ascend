@@ -792,6 +792,10 @@ class ExpertOffloadConfig:
         "cache_stats_log_interval": 1000,
         "cache_debug_log_updates": False,
         "expert_prefetch_enabled": False,
+        # End-of-test hit-rate summary windowing
+        "seq_stats_warmup_seqs": 0,
+        "seq_stats_num_seqs": 0,
+        "cache_profile_timing": False,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -854,6 +858,14 @@ class ExpertOffloadConfig:
             raise TypeError("cache_debug_log_updates must be a boolean")
         if not isinstance(self.config["expert_prefetch_enabled"], bool):
             raise TypeError("expert_prefetch_enabled must be a boolean")
+
+        for key in ("seq_stats_warmup_seqs", "seq_stats_num_seqs"):
+            if not isinstance(self.config[key], int):
+                raise TypeError(f"{key} must be an integer")
+            if self.config[key] < 0:
+                raise ValueError(f"{key} must >= 0")
+        if not isinstance(self.config["cache_profile_timing"], bool):
+            raise TypeError("cache_profile_timing must be a boolean")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

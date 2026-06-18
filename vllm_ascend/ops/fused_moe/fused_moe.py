@@ -17,6 +17,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
+import time
 
 import torch
 import torch.nn.functional as F
@@ -182,6 +183,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # Expert offload: incrementally page in needed experts, update log2phy
         use_prefill_pool = False
         prefill_slot = -1
+
+        # compute-timing gate, default off so non-offload paths are
+        _do_compute_timing = False
+        _timing_mgr = None
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
@@ -195,6 +200,12 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 except ValueError:
                     layer_idx = 0
                 prefill_slot = layer_idx % len(mgr._prefill_w13)
+
+            # time MoE compute on the decode cache path only
+            if (mgr._profile_timing and num_tokens <= mgr.offload_threshold
+                    and not _EXTRA_CTX.capturing):
+                _do_compute_timing = True
+                _timing_mgr = mgr
 
         if layer.vllm_config.model_config is not None and layer.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.21.0"):
@@ -273,6 +284,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 w1_scale_bias = None
                 w2_scale_bias = None
 
+        # bracket the routed MoE compute with a sync'd host timer
+        if _do_compute_timing:
+            torch_npu.npu.current_stream().synchronize()
+            _ct0 = time.perf_counter()
+
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
@@ -298,6 +314,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 swiglu_limit=layer.swiglu_limit,
             )
         )
+        # read compute time after the combine completes, report it.
+        if _do_compute_timing:
+            torch_npu.npu.current_stream().synchronize()
+            _timing_mgr.record_compute_time(layer, (time.perf_counter() - _ct0) * 1000.0)
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
         # Trigger next-layer expert prefetch AFTER GMM kernel submission

@@ -4,6 +4,9 @@ import queue
 import threading
 import time
 
+import atexit
+import statistics
+
 import torch
 import torch_npu
 import torch.nn.functional as F
@@ -42,6 +45,25 @@ class ExpertOffloadManager:
         self.topk = vllm_config.model_config.hf_config.num_experts_per_tok
         self.offload_threshold = self.num_device_experts // self.topk
 
+        self._run_meta: dict = {}
+        try:
+            mc = vllm_config.model_config
+            sc = vllm_config.scheduler_config
+            pc = vllm_config.parallel_config
+            model = str(getattr(mc, "model", "?")).rstrip("/").rsplit("/", 1)[-1]
+            self._run_meta = {
+                "model": model,
+                "dtype": str(getattr(mc, "dtype", "?")),
+                "quant": str(getattr(mc, "quantization", None) or "none"),
+                "tp": getattr(pc, "tensor_parallel_size", "?"),
+                "dp": getattr(pc, "data_parallel_size", "?"),
+                "max_num_seqs": getattr(sc, "max_num_seqs", "?"),
+                "max_model_len": getattr(mc, "max_model_len", "?"),
+                "enforce_eager": getattr(mc, "enforce_eager", "?"),
+            }
+        except Exception:
+            self._run_meta = {}
+
         # CPU weight buffers (post-transpose format, matching device after
         # process_weights_after_loading):
         #   w13 per expert: [hidden_size, w13_up_dim]
@@ -76,6 +98,48 @@ class ExpertOffloadManager:
         self.last_miss_experts: list[list[int]] = []
         self._debug_update_weights = self.offload_config.cache_debug_log_updates
 
+        # End-of-test cache hit-rate summary (decode path only)
+        self._seq_token_layer_hits: dict[int, float] = {}     # layer_idx -> hit rate, current step
+        self._seq_token_stats: list[tuple[float, float, float, float]] = []  # per step of current seq
+        self._seq_token_batch: list[int] = []                 # per step of current seq: batch size
+        self._seq_layer_rates: dict[int, list[float]] = {}    # layer_idx -> per-step rates, current seq
+        self._pending_token_batch: int = 0                    # batch size of the step in flight
+        self._seq_stats_warmup_seqs = self.offload_config.seq_stats_warmup_seqs
+        self._seq_stats_num_seqs = self.offload_config.seq_stats_num_seqs
+        self._seq_warmup_remaining = self._seq_stats_warmup_seqs
+        self._summary_seq_stats: list[tuple[float, float, float, float]] = []  # per measured window
+        self._summary_step_sum: list[float] = [0.0, 0.0, 0.0, 0.0]
+        self._summary_step_cnt: int = 0
+        self._summary_gen_tokens: int = 0
+        self._summary_request_cnt: int = 0
+        self._summary_layer_rate_sum: dict[int, float] = {}
+        self._summary_layer_rate_cnt: dict[int, int] = {}
+        self._seq_stats_done: bool = False
+
+        # per-layer timing (decode path, profiling only)
+        self._profile_timing = self.offload_config.cache_profile_timing
+        self._seq_token_layer_compute: dict[int, float] = {}   # current step: layer -> compute ms
+        self._seq_token_layer_copy: dict[int, float] = {}      # current step: layer -> upload ms
+        self._seq_token_compute_stats: list[tuple] = []        # per step of current seq
+        self._seq_token_copy_stats: list[tuple] = []
+        self._seq_token_compute_total: list[float] = []        # per step: sum across layers
+        self._seq_token_copy_total: list[float] = []
+        self._seq_layer_compute: dict[int, list[float]] = {}   # current seq: layer -> per-step ms
+        self._seq_layer_copy: dict[int, list[float]] = {}
+        self._summary_compute_step_sum: list[float] = [0.0, 0.0, 0.0, 0.0]
+        self._summary_copy_step_sum: list[float] = [0.0, 0.0, 0.0, 0.0]
+        self._summary_timing_step_cnt: int = 0                 # measured steps with timing
+        self._summary_compute_total_sum: float = 0.0           # sum over steps of per-step total
+        self._summary_copy_total_sum: float = 0.0
+        self._summary_compute_win: list[tuple] = []            # per measured window
+        self._summary_copy_win: list[tuple] = []
+        self._summary_layer_compute_sum: dict[int, float] = {}
+        self._summary_layer_compute_cnt: dict[int, int] = {}
+        self._summary_layer_copy_sum: dict[int, float] = {}
+        self._summary_layer_copy_cnt: dict[int, int] = {}
+
+        atexit.register(self._dump_final_stats_at_exit)
+
         ExpertOffloadManager._instance = self
 
         self.load_stream = torch_npu.npu.Stream()
@@ -83,7 +147,7 @@ class ExpertOffloadManager:
         # Prefill pool: ndl layers × all experts on NPU, shared round-robin
         self._prefill_w13: list[torch.Tensor] = []
         self._prefill_w2: list[torch.Tensor] = []
-        self._prefill_w13_scale: list[torch.Tensor] = []       # W8A8
+        self._prefill_w13_scale: list[torch.Tensor] = []        # W8A8
         self._prefill_w13_scale_fp32: list[torch.Tensor] = []   # W8A8
         self._prefill_w13_offset: list[torch.Tensor] = []       # W8A8
         self._prefill_w2_scale: list[torch.Tensor] = []         # W8A8
@@ -510,10 +574,10 @@ class ExpertOffloadManager:
         ntotal = self.num_total_experts
         is_w8a8 = self._prefill_w13[pool_slot].dtype == torch.int8
 
-        import logging
-        _dbg = logging.getLogger(__name__)
-        _dbg.warning("[PREFILL_LOAD] layer=%d pool_slot=%d ntotal=%d is_w8a8=%s",
-                     layer_idx, pool_slot, ntotal, is_w8a8)
+        # import logging
+        # _dbg = logging.getLogger(__name__)
+        # _dbg.warning("[PREFILL_LOAD] layer=%d pool_slot=%d ntotal=%d is_w8a8=%s",
+        #              layer_idx, pool_slot, ntotal, is_w8a8)
 
         from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
@@ -591,6 +655,7 @@ class ExpertOffloadManager:
             # Prefill: layerwise reuse + full-overwrite of all experts
             if (self._prefill_initialized
                     and not self._skip_prefill):
+                self.flush_sequence_cache_stats()
                 try:
                     layer_idx = self.moe_layers.index(layer)
                 except ValueError:
@@ -682,7 +747,7 @@ class ExpertOffloadManager:
             already_there = needed & on_device           # no-op
             need_to_load = needed - already_there          # CPU→NPU copy
             if self.cache_policy is not None:
-                self._record_cache_stats(layer_idx, already_there, need_to_load, needed, on_device)
+                self._record_cache_stats(layer_idx, already_there, need_to_load, needed, on_device, topk_ids_h.shape[0])
             reusable_slots = [s for s, e in slot_owner.items()
                             if e not in needed]          # slots to recycle
 
@@ -697,14 +762,19 @@ class ExpertOffloadManager:
                 #     len(need_to_load), len(reusable_slots),
                 #     sorted(needed)[:30],
                 # )
-                _dbg.warning("[UPDATE-W] l=%d cache_hit=%s cache_miss=%s hit_rate=%.2f",
-                             layer_idx, sorted(already_there), sorted(need_to_load),len(already_there) / 6)
+                # _dbg.warning("[UPDATE-W] l=%d cache_hit=%s cache_miss=%s hit_rate=%.2f",
+                #              layer_idx, sorted(already_there), sorted(need_to_load),len(already_there) / 6)
                 if need_to_load and len(need_to_load) > len(reusable_slots):
                     _dbg.warning("[UPDATE-W] l=%d SHORTFALL: need %d load but only %d slots, to_load=%s",
                                 layer_idx, len(need_to_load), len(reusable_slots),
                                 sorted(need_to_load)[:20])
 
             dev = layer.w13_weight.device
+
+            # start the upload timer just before the copy loop
+            _time_upload = self._profile_timing and self.cache_policy is not None
+            _tc0 = time.perf_counter() if _time_upload else 0.0
+
             n_copies = 0
             for eid in need_to_load:
                 if self.cache_policy is not None:
@@ -765,6 +835,10 @@ class ExpertOffloadManager:
                 n_copies += 1
 
             self.load_stream.synchronize()
+
+            if _time_upload:
+                copy_ms = (time.perf_counter() - _tc0) * 1000.0 if n_copies else 0.0
+                self._seq_token_layer_copy[layer_idx] = copy_ms
 
     # ------------------------------------------------------------------ #
     #  Next-layer expert prefetch                                          #
@@ -1036,8 +1110,15 @@ class ExpertOffloadManager:
         self._prefetch_queue.put((layer_idx, hidden_states, compute_event))
 
     # ------------------------------------------------------------------ #
-    #  Internal helpers                                                    #
+    #  Internal helpers                                                  #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _stats4(values: list[float]) -> tuple:
+        """avg, median, min, max of a non-empty list. NEW (v6); also usable
+        by the hit-rate path but left there as-is to keep this delta minimal."""
+        return (sum(values) / len(values), statistics.median(values),
+                min(values), max(values))
 
     def _record_cache_stats(
         self,
@@ -1046,7 +1127,9 @@ class ExpertOffloadManager:
         miss_experts: set[int],
         needed: set[int],
         on_device: set[int],
+        num_tokens: int = 1,
     ):
+        self._record_seq_layer_hit(layer_idx, len(hit_experts), len(needed))
         self.cache_calls[layer_idx] += 1
         self.cache_requests[layer_idx] += len(needed)
         self.cache_hits[layer_idx] += len(hit_experts)
@@ -1077,6 +1160,319 @@ class ExpertOffloadManager:
             self.last_miss_experts[layer_idx],
             sorted(on_device),
         )
+
+    def record_compute_time(self, layer, compute_ms: float):
+        """Stash one (layer, decode-step) MoE compute time for the summary.
+
+        NEW (v6): called from fused_moe.py apply after the routed
+        fused_experts call, on the decode path only. Does NOT trigger a token
+        close (compute is recorded after the hit/upload hook within the same
+        step); the close in _record_seq_layer_hit (next step) folds it in.
+        Guarded so it is a no-op unless timing + policy are on and the
+        summary hasn't printed.
+        """
+        if (not self._profile_timing or self.cache_policy is None
+                or self._seq_stats_done):
+            return
+        try:
+            layer_idx = self.moe_layers.index(layer)
+        except ValueError:
+            return
+        self._seq_token_layer_compute[layer_idx] = compute_ms
+
+    def _record_seq_layer_hit(self, layer_idx: int, num_hits: int,
+                              num_requested: int, num_tokens: int = 1):
+        """Record one (layer, decode-step) hit rate for the final summary.
+
+        hit rate = |hit_experts| / |needed| for this layer this step. A
+        repeated layer_idx means a new decode forward STEP has started (each
+        step visits each MoE layer once), so close out the previous step
+        first. num_tokens is the step's batch size, captured once per step
+        (constant across layers) to count generated tokens at flush time.
+        """
+        if self._seq_stats_done or num_requested <= 0:
+            return
+        if layer_idx in self._seq_token_layer_hits:
+            self._close_token_stats()
+        self._seq_token_layer_hits[layer_idx] = num_hits / num_requested
+        self._pending_token_batch = num_tokens
+
+    def _close_token_stats(self):
+        """Fold the in-flight decode step into per-step stats.
+
+        Hit rate: avg/median/min/max across this step's layers (v4). NEW (v6):
+        when timing is on, also fold per-step compute and upload 4-stats,
+        per-step totals (sum across layers), and per-layer series.
+        """
+        rates_by_layer = self._seq_token_layer_hits
+        if not rates_by_layer:
+            return
+        rates = list(rates_by_layer.values())
+        self._seq_token_stats.append(self._stats4(rates))
+        self._seq_token_batch.append(self._pending_token_batch)
+        for lidx, rate in rates_by_layer.items():
+            self._seq_layer_rates.setdefault(lidx, []).append(rate)
+        # NEW (v6): timing fold.
+        if self._profile_timing:
+            comp = self._seq_token_layer_compute
+            if comp:
+                vals = list(comp.values())
+                self._seq_token_compute_stats.append(self._stats4(vals))
+                self._seq_token_compute_total.append(sum(vals))
+                for lidx, v in comp.items():
+                    self._seq_layer_compute.setdefault(lidx, []).append(v)
+            cop = self._seq_token_layer_copy
+            if cop:
+                vals = list(cop.values())
+                self._seq_token_copy_stats.append(self._stats4(vals))
+                self._seq_token_copy_total.append(sum(vals))
+                for lidx, v in cop.items():
+                    self._seq_layer_copy.setdefault(lidx, []).append(v)
+        self._seq_token_layer_hits = {}
+        self._seq_token_layer_compute = {}
+        self._seq_token_layer_copy = {}
+
+    def flush_sequence_cache_stats(self, finished_reqs: int = 0):
+        """Close out one window into the summary accumulators. SILENT.
+
+        v4 semantics unchanged (warmup discard / measured accumulate / summary
+        on reaching seq_stats_num_seqs). NEW (v6): also accumulate the timing
+        per-window means, per-step sums/totals, and per-layer series.
+        """
+        self._close_token_stats()
+        token_stats = self._seq_token_stats
+        if not token_stats:
+            return
+
+        def _reset():
+            self._seq_token_stats = []
+            self._seq_token_batch = []
+            self._seq_layer_rates = {}
+            # NEW (v6): timing per-seq buffers.
+            self._seq_token_compute_stats = []
+            self._seq_token_copy_stats = []
+            self._seq_token_compute_total = []
+            self._seq_token_copy_total = []
+            self._seq_layer_compute = {}
+            self._seq_layer_copy = {}
+
+        if self._seq_stats_done:
+            _reset()
+            return
+        if self._seq_warmup_remaining > 0:
+            self._seq_warmup_remaining -= 1
+            if self._debug_update_weights:
+                logger.info(
+                    "[EXPERT-OFFLOAD-FINAL] warmup window discarded "
+                    "(decode_steps=%d, warmup_remaining=%d)",
+                    len(token_stats), self._seq_warmup_remaining,
+                )
+            _reset()
+            return
+        n = len(token_stats)
+        self._summary_seq_stats.append((
+            sum(t[0] for t in token_stats) / n,
+            sum(t[1] for t in token_stats) / n,
+            sum(t[2] for t in token_stats) / n,
+            sum(t[3] for t in token_stats) / n,
+        ))
+        for i in range(4):
+            self._summary_step_sum[i] += sum(t[i] for t in token_stats)
+        self._summary_step_cnt += n
+        self._summary_gen_tokens += sum(self._seq_token_batch)
+        self._summary_request_cnt += finished_reqs
+        for lidx, rates in self._seq_layer_rates.items():
+            self._summary_layer_rate_sum[lidx] = (
+                self._summary_layer_rate_sum.get(lidx, 0.0) + sum(rates))
+            self._summary_layer_rate_cnt[lidx] = (
+                self._summary_layer_rate_cnt.get(lidx, 0) + len(rates))
+        # NEW (v6): timing accumulation for this window.
+        if self._profile_timing:
+            cs = self._seq_token_compute_stats
+            if cs:
+                m = len(cs)
+                for i in range(4):
+                    self._summary_compute_step_sum[i] += sum(t[i] for t in cs)
+                self._summary_compute_win.append(tuple(
+                    sum(t[i] for t in cs) / m for i in range(4)))
+                self._summary_compute_total_sum += sum(self._seq_token_compute_total)
+                self._summary_timing_step_cnt += m
+                for lidx, vals in self._seq_layer_compute.items():
+                    self._summary_layer_compute_sum[lidx] = (
+                        self._summary_layer_compute_sum.get(lidx, 0.0) + sum(vals))
+                    self._summary_layer_compute_cnt[lidx] = (
+                        self._summary_layer_compute_cnt.get(lidx, 0) + len(vals))
+            cps = self._seq_token_copy_stats
+            if cps:
+                m2 = len(cps)
+                for i in range(4):
+                    self._summary_copy_step_sum[i] += sum(t[i] for t in cps)
+                self._summary_copy_win.append(tuple(
+                    sum(t[i] for t in cps) / m2 for i in range(4)))
+                self._summary_copy_total_sum += sum(self._seq_token_copy_total)
+                for lidx, vals in self._seq_layer_copy.items():
+                    self._summary_layer_copy_sum[lidx] = (
+                        self._summary_layer_copy_sum.get(lidx, 0.0) + sum(vals))
+                    self._summary_layer_copy_cnt[lidx] = (
+                        self._summary_layer_copy_cnt.get(lidx, 0) + len(vals))
+        _reset()
+        if (self._seq_stats_num_seqs > 0
+                and len(self._summary_seq_stats) >= self._seq_stats_num_seqs):
+            self._print_summary_stats()
+
+    def _print_summary_stats(self):
+        """Print the one-shot end-of-test summary (slide-ready) and latch done.
+
+        v5 layout + NEW (v6) timing sections, shown only when timing data was
+        collected. step_mean denominator for timing is the count of timed
+        steps (may equal the hit-rate step count).
+        """
+        if self._seq_stats_done:
+            return
+        seq_stats = self._summary_seq_stats
+        if not seq_stats:
+            return
+        self._seq_stats_done = True
+        nw = len(seq_stats)
+        nstep = self._summary_step_cnt
+        window_mean = [sum(s[i] for s in seq_stats) / nw for i in range(4)]
+        step_mean = [self._summary_step_sum[i] / nstep for i in range(4)]
+
+        layers = sorted(self._summary_layer_rate_sum)
+        pl_lines: list[str] = []
+        row: list[str] = []
+        for lidx in layers:
+            r = self._summary_layer_rate_sum[lidx] / self._summary_layer_rate_cnt[lidx]
+            row.append("L%02d=%.2f" % (lidx, r))
+            if len(row) == 6:
+                pl_lines.append("   " + " ".join(row))
+                row = []
+        if row:
+            pl_lines.append("   " + " ".join(row))
+
+        m = self._run_meta
+        bar = "=" * 64
+        lines = ["", bar, " EXPERT-OFFLOAD CACHE HIT-RATE SUMMARY", bar]
+        if m:
+            lines += [
+                " Run config",
+                "   model            : %s" % m.get("model", "?"),
+                "   dtype / quant     : %s / %s" % (m.get("dtype", "?"), m.get("quant", "?")),
+                "   parallel          : tp=%s  dp=%s" % (m.get("tp", "?"), m.get("dp", "?")),
+                "   max_num_seqs      : %s    max_model_len: %s    eager: %s"
+                    % (m.get("max_num_seqs", "?"), m.get("max_model_len", "?"),
+                       m.get("enforce_eager", "?")),
+            ]
+        lines += [
+            " Offload config",
+            "   device_experts    : %d / %s routed    device_layers: %d    moe_layers: %d"
+                % (self.num_device_experts, self.num_total_experts,
+                   self.num_device_layers, len(self.moe_layers)),
+            "   top_k             : %d    offload_threshold: %d  (decode cache when batch<=%d)"
+                % (self.topk, self.offload_threshold, self.offload_threshold),
+            "   cache_policy      : %s"
+                % ("LRC" if self.cache_policy is not None else "off (arbitrary eviction)"),
+            " Workload measured (decode phase only)",
+            "   requests          : %d%s"
+                % (self._summary_request_cnt,
+                   "" if self._summary_request_cnt > 0 else "  (finished-request hook not applied)"),
+            "   flush_windows     : %d" % nw,
+            "   decode_steps      : %d" % nstep,
+            "   gen_tokens        : %d" % self._summary_gen_tokens,
+            " Hit rate (routed experts resident / routed experts needed)",
+            "   over decode_steps : avg=%.4f  median=%.4f  min=%.4f  max=%.4f" % tuple(step_mean),
+            "   over windows      : avg=%.4f  median=%.4f  min=%.4f  max=%.4f" % tuple(window_mean),
+        ]
+
+        # NEW (v6): timing sections, only if timing data was collected.
+        nts = self._summary_timing_step_cnt
+        if self._profile_timing and self._summary_compute_win and nts > 0:
+            c_step = [self._summary_compute_step_sum[i] / nts for i in range(4)]
+            u_step = [self._summary_copy_step_sum[i] / nts for i in range(4)]
+            ncw = len(self._summary_compute_win)
+            nuw = max(1, len(self._summary_copy_win))
+            c_win = [sum(w[i] for w in self._summary_compute_win) / ncw for i in range(4)]
+            u_win = [sum(w[i] for w in self._summary_copy_win) / nuw for i in range(4)] \
+                if self._summary_copy_win else [0.0, 0.0, 0.0, 0.0]
+            c_total = self._summary_compute_total_sum / nts
+            u_total = self._summary_copy_total_sum / nts
+            lines += [
+                " MoE timing (ms)  [compute = routed fused_experts; upload = cache-miss H2D]",
+                "   total per step    : compute=%.3f   upload=%.3f   (mean over steps, summed across layers)"
+                    % (c_total, u_total),
+                "   compute over steps: avg=%.3f  median=%.3f  min=%.3f  max=%.3f" % tuple(c_step),
+                "   compute over wins : avg=%.3f  median=%.3f  min=%.3f  max=%.3f" % tuple(c_win),
+                "   upload  over steps: avg=%.3f  median=%.3f  min=%.3f  max=%.3f" % tuple(u_step),
+                "   upload  over wins : avg=%.3f  median=%.3f  min=%.3f  max=%.3f" % tuple(u_win),
+            ]
+
+        lines += [" Per-layer mean hit rate"] + pl_lines
+
+        # NEW (v6): per-layer mean timing (compute / upload), chunked 4/row.
+        if self._profile_timing and self._summary_layer_compute_sum:
+            lines += [" Per-layer mean time (ms): compute / upload"]
+            trow: list[str] = []
+            for lidx in sorted(self._summary_layer_compute_sum):
+                c = self._summary_layer_compute_sum[lidx] / self._summary_layer_compute_cnt[lidx]
+                u = (self._summary_layer_copy_sum.get(lidx, 0.0)
+                     / self._summary_layer_copy_cnt[lidx]) if self._summary_layer_copy_cnt.get(lidx) else 0.0
+                trow.append("L%02d=%.3f/%.3f" % (lidx, c, u))
+                if len(trow) == 4:
+                    lines.append("   " + " ".join(trow))
+                    trow = []
+            if trow:
+                lines.append("   " + " ".join(trow))
+
+        lines += [bar, ""]
+        logger.info("[EXPERT-OFFLOAD-FINAL]\n%s", "\n".join(lines))
+
+        # Markdown-table variant (v5) + NEW (v6) timing rows when present.
+        md = [
+            "",
+            "| field | value |",
+            "|---|---|",
+            "| model | %s |" % m.get("model", "?"),
+            "| device_experts / routed | %d / %s |"
+                % (self.num_device_experts, self.num_total_experts),
+            "| device_layers / moe_layers | %d / %d |"
+                % (self.num_device_layers, len(self.moe_layers)),
+            "| max_num_seqs / top_k / threshold | %s / %d / %d |"
+                % (m.get("max_num_seqs", "?"), self.topk, self.offload_threshold),
+            "| requests / decode_steps / gen_tokens | %d / %d / %d |"
+                % (self._summary_request_cnt, nstep, self._summary_gen_tokens),
+            "| hit_rate over steps (avg/med/min/max) | %.4f / %.4f / %.4f / %.4f |"
+                % tuple(step_mean),
+            "| hit_rate over windows (avg/med/min/max) | %.4f / %.4f / %.4f / %.4f |"
+                % tuple(window_mean),
+        ]
+        if self._profile_timing and self._summary_compute_win and nts > 0:
+            md += [
+                "| compute ms total/step (mean) | %.3f |" % c_total,
+                "| upload ms total/step (mean) | %.3f |" % u_total,
+                "| compute ms over steps (avg/med/min/max) | %.3f / %.3f / %.3f / %.3f |" % tuple(c_step),
+                "| upload ms over steps (avg/med/min/max) | %.3f / %.3f / %.3f / %.3f |" % tuple(u_step),
+            ]
+        md += [""]
+        logger.info("[EXPERT-OFFLOAD-FINAL-MD]\n%s", "\n".join(md))
+
+    def _dump_final_stats_at_exit(self):
+        """atexit backstop: print the summary at engine teardown.
+
+        NEW: offline benchmarks (vllm bench throughput / latency) tear the
+        in-process engine down without a trailing prompt or, possibly, a
+        finished-request step — so without this the accumulated stats would
+        be lost. Folds the in-flight sequence (warmup accounting still
+        applies) and prints if anything was measured and the summary hasn't
+        already printed. Exceptions swallowed: logging may be partially
+        torn down at interpreter exit.
+        """
+        try:
+            if self._seq_stats_done:
+                return
+            self.flush_sequence_cache_stats()
+            self._print_summary_stats()
+        except Exception:
+            pass
 
     def _drain_pending_weights(self):
         if not self._pending_weights:
