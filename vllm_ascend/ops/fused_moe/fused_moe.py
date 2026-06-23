@@ -50,6 +50,9 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 
+from vllm_ascend.expert_offload.expert_offload_manager import (  # v10
+    has_expert_offload_manager, get_expert_offload_manager)
+
 if vllm_version_is("0.21.0"):
     from vllm.model_executor.layers.fused_moe.layer import get_compressed_expert_map
 else:
@@ -1018,6 +1021,15 @@ class AscendFusedMoE(FusedMoE):
             assert fc3_context is not None
             shared_out = fc3_context.shared_out
         else:
+            # v10: per-layer shared-expert MLP timing (decode path, eager).
+            _stmgr = None
+            if getattr(self, 'enable_expert_offload', False) and has_expert_offload_manager():
+                _m = get_expert_offload_manager()
+                if (_m._profile_timing and not _EXTRA_CTX.capturing
+                        and hidden_states.shape[0] <= _m.offload_threshold):
+                    _stmgr = _m
+            if _stmgr is not None:
+                torch_npu.npu.current_stream().synchronize(); _t_shared = time.perf_counter()
             shared_out = self._forward_shared_experts(
                 hidden_states,
                 FusedMoEEvents(
@@ -1029,4 +1041,7 @@ class AscendFusedMoE(FusedMoE):
                     swiglu_limit=fused_moe_results.swiglu_limit,
                 ),
             )
+            if _stmgr is not None:
+                torch_npu.npu.current_stream().synchronize()
+                _stmgr.record_shared_time(self, (time.perf_counter() - _t_shared) * 1000.0)
         return shared_out, routed_out

@@ -81,6 +81,11 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 
+import time  # v10
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX  # v10
+from vllm_ascend.expert_offload.expert_offload_manager import (  # v10
+    has_expert_offload_manager, get_expert_offload_manager)
+
 if vllm_version_is("0.21.0"):
     from vllm.model_executor.layers.deepseek_compressor import CompressorStateCache  # type:ignore
     from vllm.model_executor.layers.deepseek_v4_attention import DeepseekV4IndexerCache  # type:ignore
@@ -855,7 +860,21 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hidden_states = self.input_layernorm(hidden_states)
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
+        
+        # v10: per-layer attention timing (MoE layers only, decode path, eager).
+        _atmgr = None
+        if has_expert_offload_manager() and hasattr(self.mlp, "experts"):
+            _m = get_expert_offload_manager()
+            if (_m._profile_timing and not _EXTRA_CTX.capturing
+                    and hidden_states.shape[0] <= _m.offload_threshold):
+                _atmgr = _m
+        if _atmgr is not None:
+            torch_npu.npu.current_stream().synchronize(); _t_attn = time.perf_counter()
         hidden_states = self.self_attn(**attn_kwargs)
+        if _atmgr is not None:
+            torch_npu.npu.current_stream().synchronize()
+            _atmgr.record_attention_time(self.mlp.experts, (time.perf_counter() - _t_attn) * 1000.0)
+
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)

@@ -257,6 +257,17 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 f"zero_expert_type={zero_expert_type}"
             )
 
+        # v10: resolve a timing handle on the decode path (x.size(0) == num_tokens,
+        # known before select_experts). Eager only.
+        _tmgr = None
+        if getattr(layer, 'enable_expert_offload', False):
+            from vllm_ascend.expert_offload import ExpertOffloadManager
+            _om = ExpertOffloadManager.get_instance()
+            if _om._profile_timing and not _EXTRA_CTX.capturing and x.size(0) <= _om.offload_threshold:
+                _tmgr = _om
+        if _tmgr is not None:
+            torch_npu.npu.current_stream().synchronize(); _t_router = time.perf_counter()
+
         if self.multistream_overlap_gate:
             fc3_context = get_flash_common3_context()
             assert fc3_context is not None, (
@@ -283,6 +294,9 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 num_experts=num_logical_experts,
                 tid2eid=tid2eid,
             )
+        if _tmgr is not None:
+            torch_npu.npu.current_stream().synchronize()
+            _tmgr.record_router_time(layer, (time.perf_counter() - _t_router) * 1000.0)
         assert topk_ids is not None
         assert topk_weights is not None
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -366,9 +380,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
         w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
 
-        if _do_compute_timing:
-            torch_npu.npu.current_stream().synchronize()
-            _ct0 = time.perf_counter()
+        if _tmgr is not None:
+            torch_npu.npu.current_stream().synchronize(); _t_compute = time.perf_counter()
 
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
@@ -393,9 +406,9 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 swiglu_limit=layer.swiglu_limit,
             )
         )
-        if _do_compute_timing:
+        if _tmgr is not None:
             torch_npu.npu.current_stream().synchronize()
-            _timing_mgr.record_compute_time(layer, (time.perf_counter() - _ct0) * 1000.0)
+            _tmgr.record_compute_time(layer, (time.perf_counter() - _t_compute) * 1000.0)
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
         # Trigger next-layer expert prefetch AFTER GMM kernel submission

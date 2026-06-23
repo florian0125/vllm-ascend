@@ -19,7 +19,7 @@ set -uo pipefail
 
 # ─── EDIT HERE ▸ 1. WHAT TO RUN ──────────────────────────────────────────────
 MODEL="${MODEL:-/data/keyi/llms/deepseek-v4-w8a8}"       # DeepSeek-V4 W8A8 checkpoint
-CARD="${CARD:-7}"                                    # NPU id (your env uses 7)
+CARD="${CARD:-6}"                                    # NPU id (your env uses 7)
 SERVED_NAME="${SERVED_NAME:-glm-5}"                  # must match server <-> bench client
 PORT="${PORT:-7001}"
 
@@ -36,7 +36,7 @@ RATE="${RATE:-inf}"                                  # request rate req/s; inf =
 TP="${TP:-1}"                                        # --tensor-parallel-size
 DP="${DP:-1}"                                        # --data-parallel-size
 SEED="${SEED:-1024}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"                  # your V4 command used 0.9
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"                 # your V4 command used 0.9
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"                # empty = model native
 MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-}"      # empty = vLLM default
