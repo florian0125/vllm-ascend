@@ -146,14 +146,14 @@ build_additional_config() {
     # baseline run (PREFETCH=0) reproduces the prefetch-off JSON.
     local prefetch_key=""
     [[ "${PREFETCH}" == "1" ]] && prefetch_key=",\"expert_prefetch_enabled\":true"
-    # seq-stats keys appended only when SEQ_STATS=1, so SEQ_STATS=0 reproduces
+    # seq-stats keys appended only when SEQ_STATS=1, so SEQ_STATS=0 reproducesa
     # the original V4-command JSON byte-for-byte (for unpatched builds).
     local seq_keys=""
     if [[ "${SEQ_STATS}" == "1" ]]; then
       seq_keys=",\"seq_stats_warmup_seqs\":${SEQ_WARMUP},\"seq_stats_num_seqs\":${SEQ_NUM}"
       [[ "${TIMING}" == "1" ]] && seq_keys="${seq_keys},\"cache_profile_timing\":true"
     fi
-    parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${prefetch_key},\"cache_debug_log_updates\":$(bool "${CACHE_DEBUG}")${seq_keys}}" )
+    parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${prefetch_key},\"moe_offload_debug\":$(bool "${CACHE_DEBUG}")${seq_keys}}" )
   fi
   [[ "${WPREFETCH}" == "1" ]] && parts+=( "\"weight_prefetch_config\":{\"enabled\":true}" )
   [[ ${#parts[@]} -eq 0 ]] && return
