@@ -151,12 +151,21 @@ class ExpertOffloadManager:
         # harvested into the step dict at the hit (after any close). Post-hook
         # metrics (upload, compute, shared) stash directly.
         self._profile_timing = self.offload_config.cache_profile_timing
-        self._t_metrics = ("attn", "router", "upload", "compute", "shared")
+        self._t_timing_metrics = ("attn", "router", "upload", "compute", "shared",
+                                  "pf_compute", "pf_h2d")
+        self._t_rate_metrics = ("pred_acc", "pf_in_lrc", "pf_useful")
+        self._t_metrics = self._t_timing_metrics + self._t_rate_metrics
         self._t_prehook = ("attn", "router")
         self._t_label = {
             "attn": "Attention", "router": "Router (select_experts)",
             "upload": "Cache-miss upload (H2D)", "compute": "Routed experts (fused_experts)",
             "shared": "Shared expert MLP",
+            # NEW
+            "pf_compute": "Prefetch predict (CPU)",
+            "pf_h2d": "Prefetch upload (H2D)",
+            "pred_acc": "Prediction accuracy (|P&G|/|P|)",
+            "pf_in_lrc": "Predicted already resident (|hit|/|P|)",
+            "pf_useful": "Prefetched-expert usefulness (|miss&G|/|miss|)",
         }
         self._t_pending = {m: {} for m in self._t_prehook}        # layer_idx -> ms (await harvest)
         self._t_step = {m: {} for m in self._t_metrics}           # current step: layer_idx -> ms
@@ -204,6 +213,8 @@ class ExpertOffloadManager:
         self._prefetch_layer_npu_event: dict[int, torch_npu.npu.Event] = {}
         self._prefetch_thread: threading.Thread | None = None
         self._npu_device: torch.device | None = None
+
+        self._prefetch_profile_pending: dict[int, dict] = {}
 
         # Pinned CPU staging buffers for graph-mode prefetch prediction.
         # Allocated lazily in _finalize_offload (hidden_dim / num_total_experts
@@ -927,6 +938,9 @@ class ExpertOffloadManager:
             if self.cache_policy is not None:
                 self._record_cache_stats(layer_idx, already_there, need_to_load,
                                          needed, on_device, topk_ids_h.shape[0])
+                # fold the prefetch profiling sample for this layer into
+                # the same step (no-op unless cache_profile_timing is on and a sample exists
+                self._record_prefetch_stats(layer_idx, needed)
             reusable_slots = [s for s, e in slot_owner.items()
                             if e not in needed]          # slots to recycle
 
@@ -1157,9 +1171,19 @@ class ExpertOffloadManager:
             # reading hidden_states and touching next layer's weights.
             compute_event.synchronize()
 
-            # Predict which experts the next layer needs
+            # NEW: EAGER-path profiling gate. Mirrors _record_layer_time's gate
+            # exactly (profiling + cache policy + summary not yet printed) so
+            # the stash can never grow without a consumer. When off, the timer
+            # calls below are skipped entirely — zero overhead.
+            _record_profiling = (self._profile_timing
+                                 and self.cache_policy is not None
+                                 and not self._seq_stats_done)
+
+            # Predict which experts the next layer needs.
+            _t0 = time.perf_counter() if _record_profiling else 0.0
             predicted = self.predict_next_layer_experts(layer_idx,
                                                         hidden_states)
+            _compute_ms = ((time.perf_counter() - _t0) * 1000.0 if _record_profiling else 0.0)
             if predicted is None or next_idx >= len(self.moe_layers):
                 # No prediction possible — signal done immediately
                 done = self._prefetch_layer_done.get(next_idx)
@@ -1176,7 +1200,9 @@ class ExpertOffloadManager:
 
             # Execute the prefetch (H2D copies)
             completion_event = self._do_prefetch(next_idx, predicted,
-                                                 log2phy_np)
+                                                 log2phy_np,
+                                                 record_profiling=_record_profiling,
+                                                 compute_ms=_compute_ms)
 
             # Store NPU completion event and signal threading.Event
             with self._prefetch_state_lock:
@@ -1192,6 +1218,8 @@ class ExpertOffloadManager:
         predicted_experts: set[int],
         log2phy_np,
         use_sleep: bool = True,
+        record_profiling: bool = False,
+        compute_ms: float = 0.0,
     ) -> torch_npu.npu.Event | None:
         """Load predicted experts for layer next_idx from CPU to NPU.
 
@@ -1210,6 +1238,14 @@ class ExpertOffloadManager:
             use_sleep: If True, insert a small delay between w13 and w2 copies
                 to avoid burst traffic.  Should be False when called from a
                 graph host callback to avoid blocking graph execution.
+            record_profiling: NEW. EAGER worker only. When True, time the H2D
+                copy loop (perf_counter + prefetch-stream synchronize, mirroring
+                the on-demand "upload" timer in _update_weights) and stash the
+                {predicted, already_there, need_to_load, compute_ms, h2d_ms}
+                sample for the main thread. Always False from the graph host
+                callback, so graph mode adds no profiling work and no sync.
+            compute_ms: NEW. CPU prediction time measured by the caller (worker),
+                stashed alongside the H2D time.
         """
         next_layer = self.moe_layers[next_idx]
 
@@ -1230,6 +1266,12 @@ class ExpertOffloadManager:
         already_there = on_device & predicted_experts
 
         if not need_to_load:
+            # prediction still happened — record it so the prediction
+            # accuracy reflects this step.
+            if record_profiling:
+                self._stash_prefetch_profile(
+                    next_idx, predicted_experts, already_there,
+                    need_to_load, compute_ms, 0.0)
             return None
 
         # Protected set: experts we must not evict
@@ -1237,6 +1279,11 @@ class ExpertOffloadManager:
         reusable_slots = [s for s, e in slot_owner.items()
                           if e not in protected]
         if not reusable_slots:
+            # prediction recorded;
+            if record_profiling:
+                self._stash_prefetch_profile(
+                    next_idx, predicted_experts, already_there,
+                    need_to_load, compute_ms, 0.0)
             return None  # all resident experts are protected — skip
         
         if self._debug:
@@ -1248,6 +1295,9 @@ class ExpertOffloadManager:
                                 "to_load=%s",
                                 next_idx, len(need_to_load), len(reusable_slots),
                                 sorted(need_to_load)[:20])
+
+        # bracket the H2D copy loop for the pf_h2d metric.
+        _tp0 = time.perf_counter() if record_profiling else 0.0
 
         with torch_npu.npu.stream(self._prefetch_stream):
             n_copies = 0
@@ -1337,10 +1387,46 @@ class ExpertOffloadManager:
                 torch.from_numpy(log2phy_np).to(
                     device=next_layer.log2phy.device))
 
+            # EAGER-only. Synchronize the prefetch stream to measure actual
+            # H2D completion (worker thread, off the compute path), then stash
+            # the full sample for the main thread.
+            if record_profiling:
+                self._prefetch_stream.synchronize()
+                _h2d_ms = (time.perf_counter() - _tp0) * 1000.0
+                self._stash_prefetch_profile(
+                    next_idx, predicted_experts, already_there,
+                    need_to_load, compute_ms, _h2d_ms)
+
             # Record prefetch completion event
             completion_event = torch_npu.npu.Event()
             self._prefetch_stream.record_event(completion_event)
             return completion_event
+
+    def _stash_prefetch_profile(self, next_idx: int,
+                                predicted: set[int],
+                                already_there: set[int],
+                                need_to_load: set[int],
+                                compute_ms: float,
+                                h2d_ms: float) -> None:
+        """Stash one layer's prefetch profiling sample for the main thread.
+
+        EAGER worker only (callers gate on record_profiling, which is
+        cache_profile_timing-gated). The main thread pops this in
+        _update_weights once it knows the ground-truth routed set, computes the
+        accuracy fractions, and folds compute/h2d ms + the fractions into the
+        _t_* summary. Keyed by the TARGET layer (next_idx). Guarded by
+        _prefetch_state_lock for the cross-thread handoff. Last-writer-wins:
+        each step overwrites the prior sample for this layer, and the main
+        thread pops it, so the dict stays bounded by num_layers.
+        """
+        with self._prefetch_state_lock:
+            self._prefetch_profile_pending[next_idx] = {
+                "predicted": set(predicted),
+                "already_there": set(already_there),
+                "need_to_load": set(need_to_load),
+                "compute_ms": compute_ms,
+                "h2d_ms": h2d_ms,
+            }
 
     def trigger_next_layer_prefetch(self, layer,
                                     hidden_states: torch.Tensor):
@@ -1458,6 +1544,55 @@ class ExpertOffloadManager:
         """avg, median, min, max of a non-empty list."""
         return (sum(values) / len(values), statistics.median(values),
                 min(values), max(values))
+
+    def _record_prefetch_stats(self, layer_idx: int, needed: set[int]) -> None:
+        """Harvest this layer's prefetch profiling sample into the step (EAGER).
+
+        Computes the three prefetch accuracy fractions against the ground-truth
+        routed set `needed` (= G) and folds compute/h2d ms + the fractions into
+        the current step's _t_step dict — same alignment and timing as the
+        "upload" metric (both recorded inside _update_weights), so they land in
+        the same decode step.
+
+        No-op when profiling is off, the cache policy is absent, the summary
+        already printed, or there is no sample for this layer (layer 0 is never
+        a prefetch target; graph mode never populated the stash). The gate
+        matches _record_layer_time exactly. All denominators are guarded so an
+        empty set yields 0.0 — never NaN/Inf.
+        """
+        if (not self._profile_timing or self.cache_policy is None
+                or self._seq_stats_done):
+            return
+        with self._prefetch_state_lock:
+            entry = self._prefetch_profile_pending.pop(layer_idx, None)
+        if entry is None:
+            return
+
+        predicted = entry["predicted"]
+        # Denominator is len(P), the deduped predicted set — general for
+        # batch > 1, unlike the hardcoded "/ 6" in the [PREFETCH-W] debug log.
+        n_pred = len(predicted)
+        need_to_load = entry["need_to_load"]
+        n_ntl = len(need_to_load)
+
+        # 1) Prediction accuracy (precision): of what we predicted, how much is
+        #    actually routed this step.
+        pred_acc = len(predicted & needed) / n_pred if n_pred else 0.0
+        # 2) Predicted experts already resident in the LRC cache (overlap of the
+        #    two mechanisms): high => LRC already covered the prediction;
+        #    low => prefetch and LRC complement each other.
+        pf_in_lrc = len(entry["already_there"]) / n_pred if n_pred else 0.0
+        # 3) Usefulness of the experts prefetch actually loads (the "miss" set):
+        #    of those, how many are truly needed. When need_to_load is empty no
+        #    transfer happened this step → 0.0 (kept in the average so no-op
+        #    steps are visible).
+        pf_useful = len(need_to_load & needed) / n_ntl if n_ntl else 0.0
+
+        self._t_step["pf_compute"][layer_idx] = entry["compute_ms"]
+        self._t_step["pf_h2d"][layer_idx] = entry["h2d_ms"]
+        self._t_step["pred_acc"][layer_idx] = pred_acc
+        self._t_step["pf_in_lrc"][layer_idx] = pf_in_lrc
+        self._t_step["pf_useful"][layer_idx] = pf_useful
 
     def _record_cache_stats(
         self,
@@ -1709,7 +1844,9 @@ class ExpertOffloadManager:
         if self._profile_timing and self._t_sum_stepcnt > 0 and any(self._t_sum_win[mt] for mt in self._t_metrics):
             ns = self._t_sum_stepcnt
             lines += [" Per-layer timing (ms), decode path  [eager; relative breakdown, not absolute latency]"]
-            for mt in self._t_metrics:
+            # CHANGE: iterate timing-only metrics so the fraction metrics aren't
+            # printed/labelled as ms (they get their own block below).
+            for mt in self._t_timing_metrics:
                 if not self._t_sum_win[mt]:
                     continue
                 step = [self._t_sum_step[mt][i] / ns for i in range(4)]
@@ -1722,19 +1859,51 @@ class ExpertOffloadManager:
                     "     over windows: avg=%.3f median=%.3f min=%.3f max=%.3f" % tuple(win),
                 ]
             # per-layer means: fixed-width columns aligned under their headers.
-            abbr = {"attn": "att", "router": "rtr", "upload": "upl", "compute": "cmp", "shared": "shr"}
-            all_layers = sorted({li for mt in self._t_metrics for li in self._t_sum_layer_sum[mt]})
+            # CHANGE: pf_compute/pf_h2d abbreviations added; iterate timing metrics.
+            abbr = {"attn": "att", "router": "rtr", "upload": "upl", "compute": "cmp",
+                    "shared": "shr", "pf_compute": "pfc", "pf_h2d": "pfh"}
+            all_layers = sorted({li for mt in self._t_timing_metrics for li in self._t_sum_layer_sum[mt]})
             if all_layers:
                 col = 9  # per-column width (right-aligned)
-                header = "     %-6s" % "layer" + "".join("%*s" % (col, abbr[mt]) for mt in self._t_metrics)
+                header = "     %-6s" % "layer" + "".join("%*s" % (col, abbr[mt]) for mt in self._t_timing_metrics)
                 lines += ["   per-layer mean (ms):", header]
                 for li in all_layers:
                     cells = ""
-                    for mt in self._t_metrics:
+                    for mt in self._t_timing_metrics:
                         s = self._t_sum_layer_sum[mt].get(li)
                         c = self._t_sum_layer_cnt[mt].get(li)
                         cells += ("%*.3f" % (col, s / c)) if c else ("%*s" % (col, "-"))
                     lines += ["     %-6s" % ("L%02d" % li) + cells]
+
+            # NEW: prefetch accuracy fractions (0..1), printed separately from
+            # the ms table. Same over-steps / over-windows aggregation; reuses
+            # ns (total measured steps) from above.
+            if any(self._t_sum_win[mt] for mt in self._t_rate_metrics):
+                lines += [" Prefetch accuracy (decode path)  [eager; fraction 0..1, prefetch targets layers 1..N-1]"]
+                for mt in self._t_rate_metrics:
+                    if not self._t_sum_win[mt]:
+                        continue
+                    step = [self._t_sum_step[mt][i] / ns for i in range(4)]
+                    nwin = len(self._t_sum_win[mt])
+                    win = [sum(w[i] for w in self._t_sum_win[mt]) / nwin for i in range(4)]
+                    lines += [
+                        "   %-44s" % (self._t_label[mt] + ":"),
+                        "     over steps  : avg=%.4f median=%.4f min=%.4f max=%.4f" % tuple(step),
+                        "     over windows: avg=%.4f median=%.4f min=%.4f max=%.4f" % tuple(win),
+                    ]
+                rate_abbr = {"pred_acc": "acc", "pf_in_lrc": "lrc", "pf_useful": "use"}
+                all_rlayers = sorted({li for mt in self._t_rate_metrics for li in self._t_sum_layer_sum[mt]})
+                if all_rlayers:
+                    col = 9
+                    header = "     %-6s" % "layer" + "".join("%*s" % (col, rate_abbr[mt]) for mt in self._t_rate_metrics)
+                    lines += ["   per-layer mean (fraction):", header]
+                    for li in all_rlayers:
+                        cells = ""
+                        for mt in self._t_rate_metrics:
+                            s = self._t_sum_layer_sum[mt].get(li)
+                            c = self._t_sum_layer_cnt[mt].get(li)
+                            cells += ("%*.4f" % (col, s / c)) if c else ("%*s" % (col, "-"))
+                        lines += ["     %-6s" % ("L%02d" % li) + cells]
 
         lines += [" Per-layer mean hit rate"] + pl_lines
         lines += [bar, ""]
@@ -1761,13 +1930,21 @@ class ExpertOffloadManager:
         ]
         if self._profile_timing and self._t_sum_stepcnt > 0:
             ns = self._t_sum_stepcnt
-            for mt in self._t_metrics:
+            # CHANGE: ms metrics use ms labels...
+            for mt in self._t_timing_metrics:
                 if not self._t_sum_win[mt]:
                     continue
                 step = [self._t_sum_step[mt][i] / ns for i in range(4)]
                 md += ["| %s ms total/step (mean) | %.3f |"
                        % (self._t_label[mt], self._t_sum_total[mt] / ns)]
                 md += ["| %s ms over steps (avg/med/min/max) | %.3f / %.3f / %.3f / %.3f |"
+                       % (self._t_label[mt], step[0], step[1], step[2], step[3])]
+            # NEW: fraction metrics get fraction rows (no "ms").
+            for mt in self._t_rate_metrics:
+                if not self._t_sum_win[mt]:
+                    continue
+                step = [self._t_sum_step[mt][i] / ns for i in range(4)]
+                md += ["| %s over steps (avg/med/min/max) | %.4f / %.4f / %.4f / %.4f |"
                        % (self._t_label[mt], step[0], step[1], step[2], step[3])]
         md += [""]
         logger.info("[EXPERT-OFFLOAD-FINAL-MD]\n%s", "\n".join(md))
