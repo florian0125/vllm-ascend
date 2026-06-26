@@ -18,6 +18,8 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
+from vllm_ascend.expert_offload.expert_predictor import make_predictor
+
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
 def get_subscribed_compute_streams() -> set:
@@ -226,6 +228,12 @@ class ExpertOffloadManager:
         self._prefetch_log2phy_h: torch.Tensor | None = None
         self._prefetch_log2phy_np = None
 
+        # construct the pluggable next-layer expert predictor selected by
+        # config (default "fate" == the original cross-layer-gate method).
+        self._predictor = make_predictor(
+            self.offload_config.expert_predictor, mgr=self
+        )
+
     # ------------------------------------------------------------------ #
     #  Lifecycle: called during model init and after weight loading       #
     # ------------------------------------------------------------------ #
@@ -364,7 +372,7 @@ class ExpertOffloadManager:
         self.create_prefill_pool()
         t6 = time.perf_counter()
         if self.offload_config.expert_prefetch_enabled:
-            self.register_gate_weights(model)
+            self._predictor.register_from_model(model)
             # Pinned staging buffers for graph-mode host-callback prefetch.
             # The callback runs on the compute stream's host thread during
             # graph replay, where blocking .cpu() on a live graph tensor would
@@ -1050,22 +1058,11 @@ class ExpertOffloadManager:
             Set of predicted expert IDs, or None if prediction is not
             possible (e.g. last layer, no gate weight).
         """
-        next_idx = layer_idx + 1
-        if next_idx >= len(self.moe_layers):
-            return None  # last layer — nothing to prefetch
-
-        if next_idx >= len(self._gate_weights_cpu):
-            return None
-        if self._gate_weights_cpu[next_idx] is None:
-            return None
-
-        # Move hidden_states to CPU for prediction (tiny in decode: 1-8 tokens).
-        # This runs only on the background prefetch thread (_prefetch_worker),
-        # a standalone thread after compute_event.synchronize(), so the .cpu()
-        # is safe.  The graph-mode path uses _predict_next_layer_experts_cpu
-        # over pre-staged pinned memory and never touches a live graph tensor.
-        hs_cpu = hidden_states.float().cpu()
-        return self._predict_next_layer_experts_cpu(layer_idx, hs_cpu)
+        # CHANGE: delegate to the pluggable predictor (default FATEPredictor).
+        # The FATE implementation is identical to the previous body (early-out
+        # before .cpu(), then CPU linear+softmax+topk) — see
+        # expert_predictor.py. Callers (the prefetch worker) are unchanged.
+        return self._predictor.predict_from_device(layer_idx, hidden_states)
 
     def _predict_next_layer_experts_cpu(
         self,
@@ -1079,23 +1076,11 @@ class ExpertOffloadManager:
         Used by the graph-mode host callback over the pre-staged pinned
         buffer (_prefetch_hs_h).
         """
-        next_idx = layer_idx + 1
-        if next_idx >= len(self.moe_layers):
-            return None  # last layer — nothing to prefetch
-
-        if next_idx >= len(self._gate_weights_cpu):
-            return None
-        gate_w = self._gate_weights_cpu[next_idx]
-        if gate_w is None:
-            return None
-
-        # hs_cpu is already fp32 (staged that way); gate_w is fp32 on CPU.
-        router_logits = F.linear(hs_cpu, gate_w)  # [num_tokens, n_experts]
-
-        # Simplified routing: softmax + topk (approximation)
-        probs = router_logits.softmax(dim=-1)
-        _, topk_ids = probs.topk(self.topk, dim=-1)
-        return set(topk_ids.flatten().tolist())
+        # CHANGE: delegate to the pluggable predictor (default FATEPredictor).
+        # Behavior is identical to the previous body. The graph-mode host
+        # callback (_do_prefetch_host_callback) is unchanged — it still calls
+        # this method over the pre-staged pinned buffer.
+        return self._predictor.predict_from_host(layer_idx, hs_cpu)
 
     def predict_next_layer_experts_npu(
         self,

@@ -796,6 +796,8 @@ class ExpertOffloadConfig:
         "seq_stats_warmup_seqs": 0,
         "seq_stats_num_seqs": 0,
         "cache_profile_timing": False,
+        # which next-layer expert predictor to use for prefetch.
+        "expert_predictor": "fate",
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -866,6 +868,8 @@ class ExpertOffloadConfig:
                 raise ValueError(f"{key} must >= 0")
         if not isinstance(self.config["cache_profile_timing"], bool):
             raise TypeError("cache_profile_timing must be a boolean")
+        if not isinstance(self.config["expert_predictor"], str):
+            raise TypeError("expert_predictor must be a string")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

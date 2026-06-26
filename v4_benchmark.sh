@@ -59,7 +59,20 @@ WPREFETCH="${WPREFETCH:-0}"                          # 1 = L2 weight prefetch (n
 #   PREFETCH=0 -> omit it / false  (baseline for an A/B against prefetch=on)
 # Needs CACHE_POLICY=1 (LRC supplies choose_victim) and the v5.0 build with the
 # prefetch feature. Decode-only: requires MAX_NUM_SEQS <= offload_threshold.
-PREFETCH="${PREFETCH:-0}"                            # 1 = enable proactive expert prefetch
+PREFETCH="${PREFETCH:-1}"                            # 1 = enable proactive expert prefetch
+
+# NEW: PREDICTOR — which next-layer expert predictor the prefetch path uses,
+# i.e. the expert_offload_config "expert_predictor" enum. Default is the
+# cross-layer-gate FATE method.
+#   PREDICTOR=""      -> omit the key; engine uses its default ("fate").
+#   PREDICTOR=fate    -> explicit FATE (same behavior, key emitted).
+#   PREDICTOR=<name>  -> any other registered predictor (e.g. "nn").
+# Only takes effect when PREFETCH=1 (the predictor is consumed only by the
+# prefetch path). Left empty by default so PREFETCH=0 baselines AND any build
+# that predates the predictor-enum patch (which would reject an unknown
+# "expert_predictor" key) start unchanged. Set a non-empty value only on a
+# build that has the predictor-enum refactor applied.
+PREDICTOR="${PREDICTOR:-}"                           # expert_predictor enum value; empty = engine default (fate)
 
 # NEW: end-of-test hit-rate summary ([EXPERT-OFFLOAD-FINAL]). Requires the
 # seq-stats patch on the build AND CACHE_POLICY=1. Serve window: warmup=0,
@@ -145,7 +158,18 @@ build_additional_config() {
     # NEW: proactive expert prefetch key. Appended only when PREFETCH=1 so a
     # baseline run (PREFETCH=0) reproduces the prefetch-off JSON.
     local prefetch_key=""
-    [[ "${PREFETCH}" == "1" ]] && prefetch_key=",\"expert_prefetch_enabled\":true"
+    # NEW: expert_predictor enum key. Selects which next-layer predictor the
+    # prefetch path uses (default FATE). Emitted ONLY when PREFETCH=1 (the
+    # predictor is only consumed by the prefetch path) AND PREDICTOR is set to
+    # a non-empty value, so: (a) a PREFETCH=0 baseline keeps the prefetch-off
+    # JSON, and (b) builds without the predictor-enum patch (which would reject
+    # an unknown "expert_predictor" key) still start as long as PREDICTOR is
+    # left empty. Empty PREDICTOR -> engine default ("fate").
+    local predictor_key=""
+    if [[ "${PREFETCH}" == "1" ]]; then
+      prefetch_key=",\"expert_prefetch_enabled\":true"
+      [[ -n "${PREDICTOR}" ]] && predictor_key=",\"expert_predictor\":\"${PREDICTOR}\""
+    fi
     # seq-stats keys appended only when SEQ_STATS=1, so SEQ_STATS=0 reproducesa
     # the original V4-command JSON byte-for-byte (for unpatched builds).
     local seq_keys=""
@@ -153,7 +177,7 @@ build_additional_config() {
       seq_keys=",\"seq_stats_warmup_seqs\":${SEQ_WARMUP},\"seq_stats_num_seqs\":${SEQ_NUM}"
       [[ "${TIMING}" == "1" ]] && seq_keys="${seq_keys},\"cache_profile_timing\":true"
     fi
-    parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${prefetch_key},\"moe_offload_debug\":$(bool "${CACHE_DEBUG}")${seq_keys}}" )
+    parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${prefetch_key}${predictor_key},\"moe_offload_debug\":$(bool "${CACHE_DEBUG}")${seq_keys}}" )
   fi
   [[ "${WPREFETCH}" == "1" ]] && parts+=( "\"weight_prefetch_config\":{\"enabled\":true}" )
   [[ ${#parts[@]} -eq 0 ]] && return
@@ -215,8 +239,10 @@ print_summary() {
   fi
   # CHANGE: disambiguate the two prefetch features — expert_prefetch (PREFETCH,
   # the v5.0 MoE feature) vs wprefetch (WPREFETCH, the L2 weight prefetch).
+  # CHANGE: also show predictor= (the expert_predictor enum); empty -> the
+  # engine default "fate".
   echo "  offload=${OFFLOAD} device_experts=${NUM_DEVICE_EXPERTS} device_layers=${NUM_DEVICE_LAYERS}"\
-       "lrc=${CACHE_POLICY} expert_prefetch=${PREFETCH} dbg=${CACHE_DEBUG} cpu_bind=${CPU_BINDING} wprefetch=${WPREFETCH}"
+       "lrc=${CACHE_POLICY} expert_prefetch=${PREFETCH} predictor=${PREDICTOR:-fate(default)} dbg=${CACHE_DEBUG} cpu_bind=${CPU_BINDING} wprefetch=${WPREFETCH}"
   if [[ "${OFFLOAD}" == "1" && "${SEQ_STATS}" == "1" ]]; then
     echo "  seq_stats: warmup_seqs=${SEQ_WARMUP} num_seqs=${SEQ_NUM} timing=${TIMING} (grep [EXPERT-OFFLOAD-FINAL] in the server log)"
   fi
@@ -235,6 +261,10 @@ print_summary() {
     fi
     if [[ "${PREFETCH}" == "1" && "${CACHE_POLICY}" != "1" ]]; then
       echo "  warn: PREFETCH=1 but CACHE_POLICY=0 — prefetch falls back to arbitrary eviction (no LRC brain)."
+    fi
+    # NEW: a predictor choice only matters when prefetch is on; flag the no-op.
+    if [[ -n "${PREDICTOR}" && "${PREFETCH}" != "1" ]]; then
+      echo "  warn: PREDICTOR='${PREDICTOR}' set but PREFETCH=0 — the predictor is only used by the prefetch path; the expert_predictor key is omitted."
     fi
   fi
 }
@@ -316,6 +346,12 @@ run_serve
 #                           true — the v5.0 proactive next-layer prefetch you
 #                           want to test. PREFETCH=0 for the A/B baseline.
 #                           Needs CACHE_POLICY=1 and a build with the feature.
+#    * PREDICTOR          : selects the expert_offload_config "expert_predictor"
+#                           enum (the prediction method behind prefetch). Empty
+#                           (default) -> engine default "fate"; set PREDICTOR=nn
+#                           etc. to swap. Emitted only when PREFETCH=1 and
+#                           non-empty, so baselines / pre-enum builds are
+#                           unchanged.
 #    * device_experts     : default raised 12 -> 24 to match your V4 command and
 #                           give prefetch/LRC slack (threshold 24/8 = 3).
 #    * seq-stats summary  : SEQ_STATS=1 adds seq_stats_warmup_seqs/num_seqs
@@ -331,6 +367,9 @@ run_serve
 #  BUILD PREREQUISITES (the V4 checkout must have these or the keys are rejected
 #  / the logs won't appear):
 #    * expert_prefetch_enabled : present on v5.0 (the prefetch branch).
+#    * expert_predictor : the pluggable-predictor (enum) refactor. Required ONLY
+#      if you set PREDICTOR to a non-empty value. Leave PREDICTOR empty on builds
+#      without it (the key is then omitted and the engine default "fate" applies).
 #    * seq_stats_* / cache_profile_timing : the summary + timing patches (apply
 #      the consolidated v8 + v6/v7 guides to the V4 checkout). If absent, set
 #      SEQ_STATS=0 TIMING=0 — you then only get the upstream [EXPERT-OFFLOAD-CACHE]
