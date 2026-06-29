@@ -1,129 +1,72 @@
-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-# This file is a part of the vllm-ascend project.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Pluggable next-layer expert predictors for proactive prefetch.
+"""Pluggable next-layer expert predictors for the MoE offload manager.
 
-DESIGN CHOICE (why this file exists)
-------------------------------------
-Proactive prefetch has exactly one swappable decision: *which experts will the
-NEXT MoE layer need?*  Everything else — the background prefetch worker, the
-H2D copy loop, LRC eviction (choose_victim), the log2phy update, the completion
-events, and the graph-mode staging — is mechanism that does not care HOW the
-prediction was made.  So we isolate only the prediction behind this abstraction
-and leave all that mechanism untouched.
+This module owns the *shared* predictor machinery only:
+  * the ``ExpertPredictor`` base class and the output contract,
+  * a string-keyed registry (``register_predictor`` / ``make_predictor`` /
+    ``valid_predictor_names``),
+  * the default ``FATEPredictor`` (cross-layer gate),
+  * the generic ``LearnedNPUPredictor`` base for trained, on-NPU predictors,
+    plus the per-architecture heads (``_HEAD_BUILDERS``) and the driver context
+    (``AIPredictCtx``).
+
+Concrete *learned / AI* predictors do NOT live here. Each one is a single file
+in the ``vllm_ascend.ai_predictors`` package and registers itself with
+``@register_predictor("<name>")``. That package is imported lazily (see
+``_ensure_predictors_loaded``) so adding a predictor never touches this file and
+never creates an import cycle. See the worked example below ``LearnedNPUPredictor``.
 
 The default predictor implements the "Fate" cross-layer-gate method
 (arXiv:2502.12224): take the current layer's hidden states as a cheap proxy for
 the next layer's router input, run the next layer's gate, and top-k the result.
 
-HARD OUTPUT CONTRACT (do not break)
------------------------------------
-`predict_from_device` / `predict_from_host` MUST return `set[int] | None`:
+HARD OUTPUT CONTRACT (FATE-style predictors — do not break)
+-----------------------------------------------------------
+``predict_from_device`` / ``predict_from_host`` MUST return ``set[int] | None``:
   * a set of predicted next-layer expert ids, or
   * None to skip prefetch this step (last layer, or prediction impossible).
-The downstream `_do_prefetch` consumes a plain `set[int]`.  Returning a device
-tensor (or anything else) would force changes to the eviction/copy path, which
-must stay untouched.  A predictor that computes on NPU must do its own
-`.tolist()` / `set(...)` at the boundary and return a CPU set.
+The downstream ``_do_prefetch`` consumes a plain ``set[int]``. A predictor that
+computes on NPU must do its own ``.tolist()`` / ``set(...)`` at the boundary and
+return a CPU set. (Learned NPU predictors are driven differently — see below —
+and leave these two methods inert.)
 
-HOW TO ADD A NEW PREDICTOR (future integration guide)
------------------------------------------------------
-1. Add a value to `ExpertPredictorType` (e.g. `NN = "nn"`).
-2. Create a new file anywhere in the tree (e.g.
-   `vllm_ascend/expert_offload/predictors_nn.py`), subclass `ExpertPredictor`,
-   implement `predict_from_device` and `predict_from_host`, and decorate the
-   class with `@register_predictor(ExpertPredictorType.NN)`.
-3. Make sure that module is imported once so the decorator runs (registration
-   is import-time).  Either add `from . import predictors_nn  # noqa: F401`
-   at the bottom of THIS file, or import it where the manager is set up.
-4. Select it via config: `expert_offload_config.expert_predictor = "nn"`.
+TWO PREDICTOR FAMILIES
+----------------------
+1. FATE-style (``ExpertPredictor`` subclass): implements
+   ``predict_from_device`` / ``predict_from_host``; driven by the manager's
+   ``trigger_next_layer_prefetch`` worker. ``FATEPredictor`` is the example.
+2. Learned on-NPU (``LearnedNPUPredictor`` subclass, in ``ai_predictors/``):
+   weights live on HBM; prediction runs on the prefetch stream from tensors the
+   model-forward hooks capture (``AIPredictCtx``). Flagged by
+   ``uses_model_forward_driver = True`` so the manager runs the AI driver and
+   skips the FATE trigger; ``predict_from_device/host`` stay inert.
 
-What a predictor may read (via `self.mgr`, the ExpertOffloadManager back-ref):
-  * `self.mgr.moe_layers`            — list of MoE layers (and its length).
-  * `self.mgr.topk`                  — experts per token.
-  * `self.mgr._gate_weights_cpu`     — fp32 CPU gate weights per layer (FATE).
-  * `self.mgr._gate_weights_npu`     — fp32 NPU gate weights per layer (on-device variants).
-  * `self.mgr.cache_policy.layer_states[idx]` — recent routing history / freq /
-    ema, for activation-path or temporal predictors.
-  * `self.mgr._npu_device`           — device for NPU-side predictors.
-WEIGHT LOADING / PLACEMENT (per-predictor — this is the crux of register_from_model)
-------------------------------------------------------------------------------------
-`register_from_model(model)` is the predictor-agnostic load-time hook, called
-once after the model's weights are loaded (from the manager's finalize path —
-see Group 4). Each predictor decides WHAT parameters it needs and WHERE they
-live; placement is a per-predictor decision, never a manager-wide assumption:
-  * FATE keeps fp32 gate weights on CPU (its prediction runs on CPU). Its
-    register_from_model delegates to the manager's FATE-specific
-    register_gate_weights() helper, which populates self.mgr._gate_weights_cpu
-    (+ an NPU mirror). A NON-FATE predictor does NOT trigger this, so switching
-    away from FATE means no CPU gate registration happens at all.
-  * An AI/NN predictor should load its OWN network weights onto the NPU (HBM),
-    NOT CPU, since its prediction runs on-device. Resolve the device from the
-    model (e.g. next(model.parameters()).device) or self.mgr._npu_device, move
-    the net with .to(dev), and keep it on the predictor instance. It must still
-    return a CPU set[int] (hard contract) — do the .tolist()/set() at the
-    boundary. Skeleton (illustrative, NOT enabled):
+What a predictor may read (via ``self.mgr``, the manager back-reference):
+  * ``self.mgr.moe_layers``        — list of MoE layers (and its length).
+  * ``self.mgr.topk``              — experts per token.
+  * ``self.mgr._gate_weights_cpu`` — fp32 CPU gate weights per layer (FATE).
+  * ``self.mgr.offload_config``    — e.g. ``expert_predictor_ckpt`` for learned nets.
+  * ``self.mgr._npu_device``       — device for NPU-side predictors.
 
-      # in a new file, e.g. vllm_ascend/expert_offload/predictors_nn.py
-      # @register_predictor(ExpertPredictorType.NN)
-      # class NNPredictor(ExpertPredictor):
-      #     def register_from_model(self, model):
-      #         dev = next(model.parameters()).device       # NPU device (HBM)
-      #         self.net = MyPredictorNet(...).to(dev).eval()  # weights in HBM
-      #         # optionally torch.load(ckpt, map_location=dev) -> load_state_dict
-      #     def predict_from_device(self, layer_idx, hidden_states):
-      #         next_idx = layer_idx + 1
-      #         if next_idx >= len(self.mgr.moe_layers):
-      #             return None
-      #         with torch.no_grad():                        # runs on NPU/HBM
-      #             logits = self.net(hidden_states, layer_idx)
-      #             ids = logits.topk(self.mgr.topk, dim=-1).indices
-      #         return set(ids.flatten().tolist())           # hard contract: CPU set
-      #     def predict_from_host(self, layer_idx, hs_cpu):
-      #         # graph mode: move the staged CPU tensor to HBM, reuse on-device path
-      #         dev = next(self.net.parameters()).device
-      #         return self.predict_from_device(layer_idx, hs_cpu.to(dev))
-
-CAVEATS for future predictors
------------------------------
-  * Graph mode: `trigger_next_layer_prefetch` currently stages ONLY
-    `hidden_states` into a pinned buffer (because that is what FATE needs), and
-    the graph host callback then calls `predict_from_host` over it.  A predictor
-    that needs different staged inputs (e.g. routing tensors) will work in eager
-    mode out of the box, but for graph mode it needs an additional staging hook
-    in `trigger_next_layer_prefetch` (not provided here — extend when needed).
-  * NPU-side prediction may run on the compute stream OR a separate stream —
-    this is a performance trade-off, not a correctness requirement.  Running on
-    the compute stream contends with the main forward pass (the same effect we
-    measured for prefetch H2D vs. attention), so prefer a dedicated / the
-    prefetch stream if that contention costs more than the prediction saves;
-    either is allowed.  Regardless of stream choice, convert the result to a
-    CPU set before returning (the hard output contract above).
-  * Thread-safety: `predict_*` runs on the prefetch worker thread (eager) or the
-    graph host-callback thread (graph) — never the main thread.  FATE is
-    stateless so this is safe; a STATEFUL predictor must guard its own state and
-    must not assume which thread it is on.
+CAVEATS (FATE-style predictors)
+-------------------------------
+  * Graph mode stages only ``hidden_states`` for ``predict_from_host``; a
+    predictor needing other staged inputs works in eager mode but needs an extra
+    staging hook for graph mode.
+  * ``predict_*`` runs on the prefetch worker / graph host-callback thread, never
+    the main thread; a STATEFUL predictor must guard its own state.
 """
 
 from __future__ import annotations
 
+import importlib
 from abc import ABC, abstractmethod
-from enum import Enum
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
+
+from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     # Type-only import: avoids any runtime import cycle with the manager.
@@ -131,20 +74,28 @@ if TYPE_CHECKING:
         ExpertOffloadManager,
     )
 
+logger = init_logger(__name__)
 
-class ExpertPredictorType(Enum):
-    """Selectable predictor strategies. The config string maps to a member."""
+# Package holding the concrete learned/AI predictors (one module per predictor).
+# Imported lazily by _ensure_predictors_loaded() — NEVER at module import time —
+# because those modules import base classes from THIS module.
+_AI_PREDICTORS_PACKAGE = "vllm_ascend.ai_predictors"
 
-    FATE = "fate"  # cross-layer gate (arXiv:2502.12224) — the default.
 
-
+# ---------------------------------------------------------------------------
+# Base class + registry
+# ---------------------------------------------------------------------------
 class ExpertPredictor(ABC):
     """Base class for next-layer expert predictors.
 
     See the module docstring for the output contract and the guide to adding
     new predictors. Subclasses get a read-only back-reference to the owning
-    ExpertOffloadManager as `self.mgr`.
+    ExpertOffloadManager as ``self.mgr``.
     """
+
+    # Learned predictors set this True so the manager runs the model-forward AI
+    # driver (and gates the FATE trigger off). FATE-style predictors leave it False.
+    uses_model_forward_driver = False
 
     def __init__(self, mgr: "ExpertOffloadManager") -> None:
         self.mgr = mgr
@@ -156,7 +107,7 @@ class ExpertPredictor(ABC):
         """Predict next layer's experts from an on-device hidden_states tensor.
 
         Called on the prefetch worker thread (eager mode) after the current
-        layer's GMM has completed, so a blocking .cpu() here is safe.
+        layer's GMM has completed, so a blocking ``.cpu()`` here is safe.
         """
         raise NotImplementedError
 
@@ -174,64 +125,101 @@ class ExpertPredictor(ABC):
     def register_from_model(self, model) -> None:
         """Optional hook: snapshot parameters this predictor needs at weight-load
         time. Default is a no-op (FATE reads gate weights owned by the manager).
-        Wired in Group 4 of the implementation guide.
+        Called once from the manager's finalize path.
         """
         return None
 
 
-# enum member -> predictor class. Populated by @register_predictor at import.
-_PREDICTOR_REGISTRY: dict[ExpertPredictorType, type[ExpertPredictor]] = {}
+# predictor name (the `expert_predictor` config string) -> predictor class.
+# Populated by @register_predictor at import. FATE (below) registers eagerly;
+# learned predictors register when the ai_predictors package is lazily imported.
+_PREDICTOR_REGISTRY: dict[str, type[ExpertPredictor]] = {}
+
+_ai_predictors_loaded = False
 
 
-def register_predictor(ptype: ExpertPredictorType):
-    """Class decorator: register a predictor implementation for `ptype`."""
+def register_predictor(name: str):
+    """Class decorator: register a predictor implementation under config `name`.
+
+    `name` is exactly the string put in the ``expert_predictor`` config. Adding a
+    predictor is just this decorator on a new class in ``ai_predictors/`` — no
+    central enum to edit.
+    """
 
     def _decorator(cls: type[ExpertPredictor]) -> type[ExpertPredictor]:
-        _PREDICTOR_REGISTRY[ptype] = cls
+        existing = _PREDICTOR_REGISTRY.get(name)
+        if existing is not None and existing is not cls:
+            raise ValueError(
+                f"duplicate expert_predictor name {name!r}: "
+                f"{existing.__name__} vs {cls.__name__}")
+        _PREDICTOR_REGISTRY[name] = cls
         return cls
 
     return _decorator
 
 
+def _ensure_predictors_loaded() -> None:
+    """Import the ai_predictors package once so every concrete predictor's
+    ``@register_predictor`` runs. Lazy (not at module import) to avoid a cycle:
+    those modules import this module's base classes. Idempotent."""
+    global _ai_predictors_loaded
+    if _ai_predictors_loaded:
+        return
+    try:
+        importlib.import_module(_AI_PREDICTORS_PACKAGE)
+    except ModuleNotFoundError as exc:
+        # Only swallow "the package itself is absent" (FATE-only deployment).
+        # A genuine missing import inside a predictor module must propagate.
+        if exc.name != _AI_PREDICTORS_PACKAGE:
+            raise
+        logger.debug("[expert-predictor] %s not present; built-in predictors only",
+                     _AI_PREDICTORS_PACKAGE)
+    _ai_predictors_loaded = True
+
+
 def make_predictor(name: str, mgr: "ExpertOffloadManager") -> ExpertPredictor:
     """Construct the predictor selected by config string `name`.
 
-    Raises ValueError on an unknown name or an unregistered (but valid) type,
-    so a config typo fails fast at manager construction.
+    Raises ValueError on an unknown name so a config typo fails fast at manager
+    construction. Triggers lazy registration of the ai_predictors package first.
     """
-    try:
-        ptype = ExpertPredictorType(name)
-    except ValueError:
-        valid = ", ".join(repr(t.value) for t in ExpertPredictorType)
-        raise ValueError(
-            f"Unknown expert_predictor {name!r}; valid values: {valid}"
-        )
-    cls = _PREDICTOR_REGISTRY.get(ptype)
+    _ensure_predictors_loaded()
+    cls = _PREDICTOR_REGISTRY.get(name)
     if cls is None:
-        raise ValueError(f"No predictor registered for {ptype}")
+        valid = ", ".join(repr(n) for n in valid_predictor_names())
+        raise ValueError(
+            f"Unknown expert_predictor {name!r}; valid values: {valid}")
     return cls(mgr)
 
 
-@register_predictor(ExpertPredictorType.FATE)
+def valid_predictor_names() -> list[str]:
+    """The registered predictor names accepted by the ``expert_predictor`` config.
+    Single source of truth for config validation + its error message — register a
+    predictor with ``@register_predictor`` and it shows up here automatically."""
+    _ensure_predictors_loaded()
+    return sorted(_PREDICTOR_REGISTRY)
+
+
+# ---------------------------------------------------------------------------
+# Default predictor: FATE cross-layer gate
+# ---------------------------------------------------------------------------
+@register_predictor("fate")
 class FATEPredictor(ExpertPredictor):
     """Cross-layer-gate predictor (Fate, arXiv:2502.12224) — the default.
 
-    Behavior is identical to the original ExpertOffloadManager methods
-    predict_next_layer_experts() / _predict_next_layer_experts_cpu(): use the
-    current layer's hidden_states as an approximation of the next layer's input,
-    run the next layer's gate, and apply a simplified softmax + top-k (instead
-    of the full grouped_topk) for speed. Misses are handled by the reactive
-    fallback in update_weights(). Reads gate weights / topk / moe_layers from
-    the manager (`self.mgr`); ownership of those stays on the manager so this
-    refactor is behavior-preserving and minimal.
+    Uses the current layer's hidden_states as an approximation of the next
+    layer's input, runs the next layer's gate, and applies a simplified
+    softmax + top-k (instead of the full grouped_topk) for speed. Misses are
+    handled by the reactive fallback in ``update_weights()``. Reads gate weights /
+    topk / moe_layers from the manager; ownership of those stays on the manager so
+    this stays behavior-preserving and minimal.
     """
 
     def predict_from_device(
         self, layer_idx: int, hidden_states: torch.Tensor
     ) -> set[int] | None:
-        # NEW: this is the body of the original predict_next_layer_experts(),
-        # relocated verbatim. Early-out BEFORE the .cpu() (last layer / missing
-        # gate) is preserved so the last layer never pays an unnecessary D2H.
+        # Early-out BEFORE the .cpu() (last layer / missing gate) so the last
+        # layer never pays an unnecessary D2H.
         next_idx = layer_idx + 1
         if next_idx >= len(self.mgr.moe_layers):
             return None  # last layer — nothing to prefetch
@@ -245,7 +233,6 @@ class FATEPredictor(ExpertPredictor):
     def predict_from_host(
         self, layer_idx: int, hs_cpu: torch.Tensor
     ) -> set[int] | None:
-        # NEW: body of the original _predict_next_layer_experts_cpu(), verbatim.
         next_idx = layer_idx + 1
         if next_idx >= len(self.mgr.moe_layers):
             return None  # last layer — nothing to prefetch
@@ -263,14 +250,201 @@ class FATEPredictor(ExpertPredictor):
         return set(topk_ids.flatten().tolist())
 
     def register_from_model(self, model) -> None:
-        # NEW: FATE's parameters are the per-layer gate weights, kept on CPU
-        # (its prediction runs on CPU). This delegates to the manager's existing
-        # FATE-specific helper register_gate_weights(), which populates
-        # self.mgr._gate_weights_cpu (+ an NPU mirror) that predict_* read above.
-        # IMPORTANT: this CPU gate registration only runs because FATE is the
-        # active predictor — a different predictor's register_from_model would
-        # load its own weights (e.g. an NN onto HBM) and would NOT call this, so
-        # switching predictors no longer forces CPU gate registration. The
-        # manager helper is left in place (not moved here) to keep the diff
-        # minimal; it could be relocated into this class later.
+        # FATE's parameters are the per-layer gate weights, kept on CPU (its
+        # prediction runs on CPU). Delegates to the manager's FATE-specific helper
+        # register_gate_weights(), which populates self.mgr._gate_weights_cpu (+ an
+        # NPU mirror) that predict_* read above. This CPU gate registration only
+        # runs because FATE is active — a different predictor's register_from_model
+        # loads its own weights (e.g. an NN onto HBM) and never calls this.
         self.mgr.register_gate_weights(model)
+
+
+# ---------------------------------------------------------------------------
+# Learned-predictor infrastructure (shared by every ai_predictors/ module)
+# ---------------------------------------------------------------------------
+class _PredictorHead:
+    """Per-layer forward for ONE trained architecture. Owns its params (fp32,
+    HBM). Params carry a leading L dim; forward() slices head_idx."""
+
+    def load(self, params: dict, dev, dtype) -> None:
+        raise NotImplementedError
+
+    def forward(self, head_idx: int, x_n: torch.Tensor) -> torch.Tensor:
+        """x_n: [n, in_dim] (z-scored). Returns logits [n, E]."""
+        raise NotImplementedError
+
+
+class _LowRankHead(_PredictorHead):
+    """LowRankProbe: in -> r -> width -> E, LN + GELU (dropout is eval no-op).
+    params: Wd[L,in,r], W1[L,r,w], b1[L,w], Wo[L,w,E], bo[L,E]."""
+
+    def load(self, params, dev, dtype):
+        g = lambda k: params[k].to(device=dev, dtype=dtype).contiguous()
+        self.Wd = g("Wd"); self.W1 = g("W1"); self.b1 = g("b1")
+        self.Wo = g("Wo"); self.bo = g("bo")
+        self.width = self.W1.shape[-1]
+
+    def forward(self, head_idx, x_n):
+        z = x_n @ self.Wd[head_idx]                          # [n, r]
+        h = z @ self.W1[head_idx] + self.b1[head_idx]         # [n, w]
+        h = F.layer_norm(h, (self.width,))
+        h = F.gelu(h)
+        return h @ self.Wo[head_idx] + self.bo[head_idx]      # [n, E]
+
+
+# arch name (checkpoint meta["arch"]) -> head class. Add new archs HERE only.
+_HEAD_BUILDERS: dict[str, type[_PredictorHead]] = {
+    "lowrank": _LowRankHead,
+    # "mlp": _MLPHead, "resid": _ResidHead, "twotower": _TwoTowerHead, ...
+}
+
+
+def _build_head(arch: str) -> _PredictorHead:
+    if arch not in _HEAD_BUILDERS:
+        raise ValueError(
+            f"unknown predictor arch {arch!r}; have {list(_HEAD_BUILDERS)}")
+    return _HEAD_BUILDERS[arch]()
+
+
+@dataclass
+class AIPredictCtx:
+    """Tensors the model-forward driver captures and passes to a learned
+    predictor. Filled per the predictor's ``INPUT_SPEC``; unused fields stay None.
+    Add a field here (+ one capture in the manager's ``ai_predict_start``) when a
+    composition needs more than pre_attn[ℓ] + router_input[ℓ-1]."""
+
+    layer_idx: int                                  # predictor head index
+    n_tokens: int
+    pre_attn: torch.Tensor | None = None            # pre_attn[ℓ]        [n, H]
+    router_input_prev: torch.Tensor | None = None   # router_input[ℓ-1] [n, H] | None@head0
+
+
+class LearnedNPUPredictor(ExpertPredictor):
+    """Generic base for trained predictors that run on the NPU (weights on HBM).
+
+    Owns what every learned predictor shares: loading {params, mu, sd, meta}
+    onto HBM, selecting the per-arch head (meta["arch"] -> _HEAD_BUILDERS), input
+    z-scoring, and the MoE-index -> head-index offset mapping. A subclass defines
+    ONLY the input composition: ``IN_FEATURES``, ``INPUT_SPEC`` (which
+    ``AIPredictCtx`` fields it needs, so the driver knows what to capture), and
+    ``assemble()`` (the exact training concat order). Learned predictors are
+    driven by the model-forward hooks, not the FATE trigger — hence
+    ``uses_model_forward_driver = True`` and predict_from_device/host are inert.
+    """
+
+    IN_FEATURES: int = 1                       # H-blocks in the concatenated input
+    INPUT_SPEC: frozenset[str] = frozenset()   # AIPredictCtx fields consumed
+    uses_model_forward_driver = True           # manager flag: run the AI driver
+
+    def __init__(self, mgr):
+        super().__init__(mgr)
+        self.ready = False
+        self.L = self.E = self.in_dim = self.H = 0
+        self.top_k = 0
+        self._dev = None
+        self._head: _PredictorHead | None = None
+        self.mu = self.sd = None
+        self.layer_offset = 0          # leading MoE layers this checkpoint doesn't cover
+
+    @property
+    def input_spec(self) -> frozenset:
+        return self.INPUT_SPEC
+
+    def register_from_model(self, model) -> None:
+        ckpt_path = getattr(self.mgr.offload_config, "expert_predictor_ckpt", None)
+        if not ckpt_path:
+            raise ValueError(f"{type(self).__name__} requires expert_predictor_ckpt")
+        dev = next(model.parameters()).device
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        meta = ckpt["meta"]
+        self.L = int(meta["L"]); self.E = int(meta["E"])
+        self.in_dim = int(meta["in_dim"]); self.top_k = int(meta["top_k"])
+        if self.in_dim % self.IN_FEATURES != 0:
+            raise ValueError(
+                f"{type(self).__name__}: in_dim={self.in_dim} not divisible by "
+                f"IN_FEATURES={self.IN_FEATURES} — wrong checkpoint for this composition?")
+        self.H = self.in_dim // self.IN_FEATURES
+        self._dev = dev
+        self._head = _build_head(meta["arch"])
+        self._head.load(ckpt["params"], dev, torch.float32)
+        self.mu = ckpt["mu"].to(device=dev, dtype=torch.float32)   # [1, L, in_dim]
+        self.sd = ckpt["sd"].to(device=dev, dtype=torch.float32)
+        # The checkpoint covers the LAST L MoE layers (front dense/"hash" layers
+        # were dropped from the training dump). The model may have MORE MoE layers
+        # than L (e.g. 43 vs 40), so map the manager's MoE index -> head via this
+        # offset; the leading `layer_offset` layers get no AI prefetch.
+        n_moe = len(self.mgr.moe_layers)
+        self.layer_offset = n_moe - self.L
+        if self.layer_offset < 0:
+            raise ValueError(
+                f"{type(self).__name__}: checkpoint L={self.L} exceeds model MoE "
+                f"layers {n_moe}")
+        self.ready = True
+        logger.info("[AI-PRED] %s arch=%s in_dim=%d (H=%d) L=%d E=%d top_k=%d "
+                    "covers MoE layers [%d,%d) on %s",
+                    type(self).__name__, meta["arch"], self.in_dim, self.H,
+                    self.L, self.E, self.top_k, self.layer_offset, n_moe, dev)
+
+    def head_index(self, moe_idx: int) -> int | None:
+        """Manager MoE-layer index -> this predictor's head index, or None if the
+        layer isn't covered (the leading ``layer_offset`` dense/hash layers)."""
+        head = moe_idx - self.layer_offset
+        return head if 0 <= head < self.L else None
+
+    def predict_logits_npu(self, head_idx: int, ctx: AIPredictCtx) -> torch.Tensor:
+        # head_idx is the predictor's own layer index (0..L-1), already mapped
+        # from the manager's MoE index by the driver via head_index().
+        x = self.assemble(head_idx, ctx)                       # [n, in_dim]
+        x_n = (x - self.mu[0, head_idx]) / self.sd[0, head_idx]
+        return self._head.forward(head_idx, x_n)               # [n, E]
+
+    @abstractmethod
+    def assemble(self, layer_idx: int, ctx: AIPredictCtx) -> torch.Tensor:
+        """Build the (pre-z-score) input x [n, in_dim] from ctx, in the EXACT
+        order the checkpoint was trained with."""
+
+    def predict_from_device(self, layer_idx, hidden_states):   # inert (not FATE)
+        return None
+
+    def predict_from_host(self, layer_idx, hs_cpu):            # inert (not FATE)
+        return None
+
+
+# ===========================================================================
+# HOW TO ADD A NEW AI PREDICTOR  (keep concrete predictors in the
+# vllm_ascend/ai_predictors/ package — ONE FILE PER PREDICTOR, never here)
+# ===========================================================================
+# 1. Drop a new file in vllm_ascend/ai_predictors/, e.g. mode3_triplet.py. The
+#    package __init__ auto-imports every module in the folder, so the
+#    @register_predictor decorator runs with NO other edit (no central enum).
+# 2. Subclass LearnedNPUPredictor and define ONLY the input composition:
+#       IN_FEATURES  — number of H-blocks concatenated into the input,
+#       INPUT_SPEC   — which AIPredictCtx fields the driver must capture,
+#       assemble()   — the exact training concat order -> [n, in_dim].
+#    Everything else (ckpt load to HBM, head dispatch, z-scoring, the
+#    layer-offset mapping, the on-NPU driver) is inherited.
+# 3. Select it at runtime: expert_predictor = "<your name>"  (+ the checkpoint
+#    path in expert_predictor_ckpt). valid_predictor_names() lists it for free.
+#
+#    # vllm_ascend/ai_predictors/mode3_triplet.py
+#    import torch
+#    from vllm_ascend.expert_offload.expert_predictor import (
+#        AIPredictCtx, LearnedNPUPredictor, register_predictor,
+#    )
+#
+#    @register_predictor("mode3_triplet")
+#    class Mode3TripletPredictor(LearnedNPUPredictor):
+#        IN_FEATURES = 3
+#        INPUT_SPEC = frozenset({"pre_attn", "router_input_prev"})  # + any new fields
+#        def assemble(self, layer_idx, ctx):
+#            ...                          # cat in the trained order -> [n, in_dim]
+#
+#  * Need a tensor beyond pre_attn[ℓ] / router_input[ℓ-1]?  Add ONE field to
+#    AIPredictCtx (above) and ONE capture in the manager's ai_predict_start, then
+#    name it in INPUT_SPEC so the driver fills it.
+#  * Need new head math (checkpoint meta["arch"] != "lowrank")?  Add a
+#    _PredictorHead subclass + one line in _HEAD_BUILDERS — no predictor change.
+#  * FATE-style (CPU, gate-based) predictors instead subclass ExpertPredictor and
+#    implement predict_from_device/host (see FATEPredictor); they may also live in
+#    ai_predictors/ and register the same way.
+# ===========================================================================

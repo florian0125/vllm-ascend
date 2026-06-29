@@ -3,6 +3,7 @@
 import queue
 import threading
 import time
+import os
 
 import atexit
 import statistics
@@ -18,7 +19,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
-from vllm_ascend.expert_offload.expert_predictor import make_predictor
+from vllm_ascend.expert_offload.expert_predictor import make_predictor, AIPredictCtx
 
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
@@ -181,6 +182,12 @@ class ExpertOffloadManager:
         self._t_sum_layer_cnt = {m: {} for m in self._t_metrics}
         self._t_sum_stepcnt = 0
 
+        self._dump_csv = os.environ.get("CSV", "0") not in ("0", "", "false", "False")
+        self._csv_path = os.environ.get(
+            "CSV_PATH",
+            "prefetch_summary_%s.csv" % self._run_meta.get("model", "run"))
+        self._csv_written = False
+
         atexit.register(self._dump_final_stats_at_exit)
 
         ExpertOffloadManager._instance = self
@@ -233,6 +240,11 @@ class ExpertOffloadManager:
         self._predictor = make_predictor(
             self.offload_config.expert_predictor, mgr=self
         )
+        # AI driver state. Active for any learned predictor
+        self._ai_active = getattr(self._predictor, "uses_model_forward_driver", False)
+        self._ai_pa_buf = None             # [max_tokens, H] fp32 — pre_attn[ℓ]
+        self._ai_ri_buf = [None, None]     # 2x [max_tokens, H] fp32 — router ping-pong
+        self._ai_pending: dict[int, dict] = {}
 
     # ------------------------------------------------------------------ #
     #  Lifecycle: called during model init and after weight loading       #
@@ -387,6 +399,20 @@ class ExpertOffloadManager:
                 self.num_total_experts, dtype=torch.int32,
                 device='cpu', pin_memory=True)
             self._prefetch_log2phy_np = self._prefetch_log2phy_h.numpy()
+
+            # Allocate AI driver buffers per the active predictor's input_spec.
+            # hidden_dim was computed just above (line 382).
+            if self._ai_active:
+                spec = self._predictor.input_spec
+                mt = self.offload_threshold
+                if "pre_attn" in spec:
+                    self._ai_pa_buf = torch.zeros(
+                        [mt, hidden_dim], dtype=torch.float32, device="npu")
+                if "router_input_prev" in spec:
+                    self._ai_ri_buf = [
+                        torch.zeros([mt, hidden_dim], dtype=torch.float32, device="npu"),
+                        torch.zeros([mt, hidden_dim], dtype=torch.float32, device="npu"),
+                    ]
         t7 = time.perf_counter()
         logger.info(
             "[OFFLOAD] finalize breakdown: process_weights=%.1fs "
@@ -1413,6 +1439,127 @@ class ExpertOffloadManager:
                 "h2d_ms": h2d_ms,
             }
 
+    def _ai_layer_index(self, experts) -> int:
+        return self.moe_layers.index(experts)
+     
+    def ai_predict_start(self, experts, pre_attn):
+        """Before attention: predict THIS layer's experts on the prefetch stream
+        (no host block) and open the prefetch handshake. Eager + decode only.
+    
+        When profiling is on, bracket the on-NPU predict with timing events so
+        ai_prefetch_finish can fold the predictor's NPU time into pf_compute."""
+        if not self._ai_active or _EXTRA_CTX.capturing:
+            return None
+        predictor = self._predictor
+        if not getattr(predictor, "ready", False):
+            return None
+        n = pre_attn.shape[0]
+        if n > self.offload_threshold:                 # prefill / large batch
+            return None
+        moe_idx = self._ai_layer_index(experts)
+        head_idx = predictor.head_index(moe_idx)       # map MoE index -> head
+        if head_idx is None:                           # leading hash/dense layer: no AI prefetch
+            return None
+        spec = predictor.input_spec
+    
+        pa = None
+        if "pre_attn" in spec:
+            pa = self._ai_pa_buf[:n]
+            pa.copy_(pre_attn.to(torch.float32))
+        # One event after the copy orders this copy AND the prior router_input save
+        # (same compute stream) before the prefetch-stream reads.
+        copy_event = torch_npu.npu.current_stream().record_event()
+    
+        router_prev = None
+        if "router_input_prev" in spec and head_idx > 0:   # head 0 uses zeros
+            router_prev = self._ai_ri_buf[(moe_idx - 1) % 2][:n]
+    
+        # Mirror the FATE worker's profiling gate exactly (profiling + cache policy +
+        # summary not yet printed) so the stash can never grow without a consumer.
+        _record_profiling = (self._profile_timing and self.cache_policy is not None
+                            and not self._seq_stats_done)
+        # NEW: NPU timing events bracketing the predict (the pf_compute source for
+        # the learned predictor). Only created when profiling — zero overhead off.
+        predict_ev0 = predict_ev1 = None
+        if _record_profiling:
+            predict_ev0 = torch_npu.npu.Event(enable_timing=True)
+            predict_ev1 = torch_npu.npu.Event(enable_timing=True)
+    
+        self._prefetch_layer_done[moe_idx] = threading.Event()
+        ctx = AIPredictCtx(layer_idx=head_idx, n_tokens=n,
+                        pre_attn=pa, router_input_prev=router_prev)
+    
+        with torch_npu.npu.stream(self._prefetch_stream):
+            self._prefetch_stream.wait_event(copy_event)
+            if predict_ev0 is not None:
+                predict_ev0.record()
+            logits = predictor.predict_logits_npu(head_idx, ctx)      # [n, E]
+            topk_ids = logits.topk(predictor.top_k, dim=-1).indices    # [n, k]
+            if predict_ev1 is not None:
+                predict_ev1.record()
+        self._ai_pending[moe_idx] = {"moe_idx": moe_idx, "topk_ids": topk_ids,
+                                    "predict_ev0": predict_ev0,
+                                    "predict_ev1": predict_ev1}
+        return self._ai_pending[moe_idx]
+    
+    def ai_prefetch_finish(self, ctx):
+        """After the attention CALL is issued: D2H topk (hidden behind attention),
+        reuse _do_prefetch for eviction + H2D, record the handshake update_weights
+        waits on. Folds the predictor's NPU compute time into pf_compute. Eager only."""
+        if ctx is None:
+            return
+        moe_idx = ctx["moe_idx"]
+        # .tolist() blocks until the predict finishes -> by the line after, the
+        # predict's NPU timing events are complete and elapsed_time() won't block.
+        predicted = set(int(e) for e in ctx["topk_ids"].flatten().tolist())
+    
+        compute_ms = 0.0
+        ev0 = ctx.get("predict_ev0")
+        ev1 = ctx.get("predict_ev1")
+        if ev0 is not None and ev1 is not None:
+            # NPU time of the predict (runs on _prefetch_stream, overlapping attn).
+            compute_ms = ev0.elapsed_time(ev1)
+    
+        _record_profiling = (self._profile_timing and self.cache_policy is not None
+                            and not self._seq_stats_done)
+    
+        next_layer = self.moe_layers[moe_idx]
+        log2phy_np = next_layer.log2phy.cpu().numpy()
+        # _do_prefetch stashes {predicted, ..., compute_ms, h2d_ms}; the main thread
+        # folds compute_ms into the pf_compute metric in _update_weights — the SAME
+        # path FATE uses, so FATE (CPU ms) and the learned predictor (NPU ms) share
+        # the metric.
+        event = self._do_prefetch(
+            moe_idx, predicted, log2phy_np,
+            use_sleep=False, record_profiling=_record_profiling,
+            compute_ms=compute_ms,
+        )
+        with self._prefetch_state_lock:
+            if event is not None:
+                self._prefetch_layer_npu_event[moe_idx] = event
+        done = self._prefetch_layer_done.get(moe_idx)
+        if done is not None:
+            done.set()
+        self._ai_pending.pop(moe_idx, None)
+
+    def ai_save_router_input(self, experts, router_input: torch.Tensor):
+        """Post-attention: copy this layer's gate input into ping-pong slot ℓ%2
+        for ℓ+1's predict. Only when the active predictor consumes it. Eager +
+        decode only."""
+        if not self._ai_active or _EXTRA_CTX.capturing:
+            return
+        if "router_input_prev" not in self._predictor.input_spec:
+            return
+        if not getattr(self._predictor, "ready", False):
+            return
+        n = router_input.shape[0]
+        if n > self.offload_threshold:
+            return
+        moe_idx = self._ai_layer_index(experts)
+        if self._predictor.head_index(moe_idx) is None:   # <-- NEW: don't save for leading layers
+            return
+        self._ai_ri_buf[moe_idx % 2][:n].copy_(router_input.to(torch.float32))
+
     def trigger_next_layer_prefetch(self, layer,
                                     hidden_states: torch.Tensor):
         """在 GMM kernel 提交后触发下一层专家预加载。
@@ -1429,7 +1576,8 @@ class ExpertOffloadManager:
         """
         if not self.offload_config.expert_prefetch_enabled:
             return
-
+        if self._ai_active:
+            return
         try:
             layer_idx = self.moe_layers.index(layer)
         except ValueError:
@@ -1902,8 +2050,8 @@ class ExpertOffloadManager:
             "| model | %s |" % meta.get("model", "?"),
             "| device_experts / routed | %d / %s |"
                 % (self.num_device_experts, self.num_total_experts),
-            "| prefetch | %s |"
-                % ("on" if getattr(self.offload_config, "expert_prefetch_enabled", False) else "off"),
+            "| prefetch | %s | %s"
+                % ("on" if getattr(self.offload_config, "expert_prefetch_enabled", False) else "off", getattr(self.offload_config, "expert_predictor")),
             "| max_num_seqs / top_k / threshold | %s / %d / %d |"
                 % (meta.get("max_num_seqs", "?"), self.topk, self.offload_threshold),
             "| requests / decode_steps / gen_tokens | %d / %d / %d |"
@@ -1933,6 +2081,81 @@ class ExpertOffloadManager:
                        % (self._t_label[mt], step[0], step[1], step[2], step[3])]
         md += [""]
         logger.info("[EXPERT-OFFLOAD-FINAL-MD]\n%s", "\n".join(md))
+
+        # export the per-layer aggregates to CSV (no-op unless CSV=1)
+        self._dump_summary_csv()
+
+    def _dump_summary_csv(self) -> None:
+        """NEW (user request): export the per-layer summary aggregates to CSV,
+        one row per MoE layer (layer 0 .. len(moe_layers)-1). Enabled by CSV=1;
+        path from CSV_PATH. Called once at the very end of _print_summary_stats,
+        after both summary blocks are logged, so the file reflects the final
+        numbers.
+
+        Columns (every metric paired with its per-layer sample count <m>_n):
+          layer
+          hit_rate            final cache hit when compute reaches the layer
+                              (routed experts resident / needed) — from
+                              _summary_layer_rate_{sum,cnt}
+          <m>_ms  for m in _t_timing_metrics:
+            attn_ms router_ms upload_ms compute_ms shared_ms pf_compute_ms pf_h2d_ms
+              attn/router/compute/shared = per-layer inference timings;
+              upload   = cache-miss on-demand upload (H2D);
+              pf_compute = prefetch predict; pf_h2d = prefetch upload (H2D)
+          <m>     for m in _t_rate_metrics (fractions 0..1):
+            pred_acc   prefetch prediction accuracy   |P&G|/|P|
+            pf_in_lrc  predicted already resident      |hit|/|P|
+            pf_useful  prefetched-expert usefulness    |miss&G|/|miss|
+        All means are over the measured decode steps (same aggregates the
+        printed per-layer tables use). A layer with no samples for a metric
+        (e.g. the leading no-prefetch layers have no pf_*/pred_* data) gets a
+        blank cell — pandas/numpy read it as NaN — and 0 in that metric's _n
+        column. Header is built from the metric tuples, so any metric added to
+        _t_timing_metrics / _t_rate_metrics shows up here automatically.
+        """
+        if not self._dump_csv or self._csv_written:
+            return
+        import csv  # NEW: stdlib, only used here.
+
+        n_layers = len(self.moe_layers)
+        timing = list(self._t_timing_metrics)   # attn,router,upload,compute,shared,pf_compute,pf_h2d
+        rates = list(self._t_rate_metrics)       # pred_acc,pf_in_lrc,pf_useful
+
+        header = ["layer", "hit_rate", "hit_rate_n"]
+        for m in timing:
+            header += ["%s_ms" % m, "%s_n" % m]
+        for m in rates:
+            header += [m, "%s_n" % m]
+
+        def _mean_n(sum_d, cnt_d, lidx):
+            # blank mean (-> NaN) + 0 count when this layer has no samples.
+            c = cnt_d.get(lidx, 0)
+            return (("%.6f" % (sum_d.get(lidx, 0.0) / c)) if c else ""), c
+
+        try:
+            with open(self._csv_path, "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(header)
+                for li in range(n_layers):
+                    hr, hr_n = _mean_n(self._summary_layer_rate_sum,
+                                       self._summary_layer_rate_cnt, li)
+                    rowvals = [li, hr, hr_n]
+                    for m in timing:
+                        v, c = _mean_n(self._t_sum_layer_sum[m],
+                                       self._t_sum_layer_cnt[m], li)
+                        rowvals += [v, c]
+                    for m in rates:
+                        v, c = _mean_n(self._t_sum_layer_sum[m],
+                                       self._t_sum_layer_cnt[m], li)
+                        rowvals += [v, c]
+                    w.writerow(rowvals)
+            self._csv_written = True
+            logger.info("[EXPERT-OFFLOAD-CSV] wrote %d per-layer rows -> %s",
+                        n_layers, self._csv_path)
+        except Exception as e:
+            # Don't let a CSV/file error take down teardown or the atexit path.
+            logger.warning("[EXPERT-OFFLOAD-CSV] failed to write %s: %s",
+                           self._csv_path, e)
 
     def _dump_final_stats_at_exit(self):
         """atexit backstop: print the summary at engine teardown.

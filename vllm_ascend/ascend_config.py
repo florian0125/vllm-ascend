@@ -798,6 +798,9 @@ class ExpertOffloadConfig:
         "cache_profile_timing": False,
         # which next-layer expert predictor to use for prefetch.
         "expert_predictor": "fate",
+        # path to the learned-predictor checkpoint (.pt). Required
+        # only for learned predictors (e.g. mode2_pa_prevhs); ignored for fate.
+        "expert_predictor_ckpt": None,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -870,6 +873,20 @@ class ExpertOffloadConfig:
             raise TypeError("cache_profile_timing must be a boolean")
         if not isinstance(self.config["expert_predictor"], str):
             raise TypeError("expert_predictor must be a string")
+            
+        from vllm_ascend.expert_offload.expert_predictor import valid_predictor_names
+        _valid_preds = valid_predictor_names()           # e.g. ['fate', 'mode2_pa_prevhs']
+        if self.config["expert_predictor"] not in _valid_preds:
+            raise ValueError(
+                f"expert_predictor must be one of {_valid_preds}; "
+                f"got {self.config['expert_predictor']!r}"
+            )
+        # checkpoint path must be a string when set (learned predictors require it;
+        # the predictor's register_from_model raises clearly if it is missing).
+        if self.config["expert_predictor_ckpt"] is not None and not isinstance(
+            self.config["expert_predictor_ckpt"], str
+        ):
+            raise TypeError("expert_predictor_ckpt must be a string or null")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

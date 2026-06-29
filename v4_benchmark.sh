@@ -72,7 +72,12 @@ PREFETCH="${PREFETCH:-1}"                            # 1 = enable proactive expe
 # that predates the predictor-enum patch (which would reject an unknown
 # "expert_predictor" key) start unchanged. Set a non-empty value only on a
 # build that has the predictor-enum refactor applied.
-PREDICTOR="${PREDICTOR:-}"                           # expert_predictor enum value; empty = engine default (fate)
+PREDICTOR="${PREDICTOR:-fate}"                                     # existing
+
+# Checkpoint for learned predictors (e.g. mode2_pa_prevhs). Emitted into the
+# config as "expert_predictor_ckpt". Default = mode2_pa_prevhs lowrank w=2048.
+# PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/keyi/code/moe_offload/hq_v5/mode2_pa/learned_predictor_study_mode2_pa.html.ckpts_260619/pa+prevhs_prompt_std_dist_lowrank_w=2048.pt}"
+PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/keyi/code/moe_offload/hq_v5/mode2_pa/learned_predictor_study_mode2_pa.html.ckpts_260624_dump_2000/pa+prevhs_prompt_std_dist_lowrank_w=2048.pt}"
 
 # NEW: end-of-test hit-rate summary ([EXPERT-OFFLOAD-FINAL]). Requires the
 # seq-stats patch on the build AND CACHE_POLICY=1. Serve window: warmup=0,
@@ -82,6 +87,10 @@ PREDICTOR="${PREDICTOR:-}"                           # expert_predictor enum val
 #    engine won't start -> set SEQ_STATS=0 to reproduce the original V4 JSON.
 SEQ_STATS="${SEQ_STATS:-1}"                          # 1 = pass seq_stats_* keys
 TIMING="${TIMING:-0}"                                # 1 = per-layer compute/upload timing (eager only)
+
+CSV="${CSV:-1}"
+CSV_PATH=/home/keyi/code/moe_offload/hq_v5/vllm-ascend/bench_csvs
+
 SEQ_WARMUP="${SEQ_WARMUP:-0}"
 SEQ_NUM="${SEQ_NUM:-${NUM}}"
 
@@ -169,6 +178,9 @@ build_additional_config() {
     if [[ "${PREFETCH}" == "1" ]]; then
       prefetch_key=",\"expert_prefetch_enabled\":true"
       [[ -n "${PREDICTOR}" ]] && predictor_key=",\"expert_predictor\":\"${PREDICTOR}\""
+
+      [[ -n "${PREDICTOR}" && "${PREDICTOR}" != "fate" && -n "${PREDICTOR_CKPT}" ]] && \
+        predictor_key="${predictor_key},\"expert_predictor_ckpt\":\"${PREDICTOR_CKPT}\""
     fi
     # seq-stats keys appended only when SEQ_STATS=1, so SEQ_STATS=0 reproducesa
     # the original V4-command JSON byte-for-byte (for unpatched builds).
@@ -271,6 +283,7 @@ print_summary() {
  
 run_serve() {
   mkdir -p ./bench_results
+  mkdir -p ./bench_csvs
   local log="./bench_results/server_v4_$(date +%Y%m%d_%H%M%S).log"
   local serve_cmd=( vllm serve "${MODEL}"
                     --host 0.0.0.0 --port "${PORT}"

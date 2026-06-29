@@ -860,6 +860,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hidden_states = self.input_layernorm(hidden_states)
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
+
+        _ai_ctx = None
+        if has_expert_offload_manager() and hasattr(self.mlp, "experts"):
+            _aim = get_expert_offload_manager()
+            if getattr(_aim, "_ai_active", False):
+                _ai_ctx = _aim.ai_predict_start(self.mlp.experts, hidden_states)
         
         # v10: per-layer attention timing (MoE layers only, decode path, eager).
         _atmgr = None
@@ -875,10 +881,19 @@ class DeepseekV2DecoderLayer(nn.Module):
             torch_npu.npu.current_stream().synchronize()
             _atmgr.record_attention_time(self.mlp.experts, (time.perf_counter() - _t_attn) * 1000.0)
 
+        if _ai_ctx is not None:
+            _aim.ai_prefetch_finish(_ai_ctx)
+
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         hidden_states = self.post_attention_layernorm(hidden_states)
+
+        if has_expert_offload_manager() and hasattr(self.mlp, "experts"):
+            _rim = get_expert_offload_manager()
+            if getattr(_rim, "_ai_active", False):
+                _rim.ai_save_router_input(self.mlp.experts, hidden_states)
+                
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
