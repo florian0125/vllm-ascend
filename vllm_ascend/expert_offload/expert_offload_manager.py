@@ -4,6 +4,7 @@ import queue
 import threading
 import time
 import os
+import datetime
 
 import atexit
 import statistics
@@ -56,6 +57,9 @@ class ExpertOffloadManager:
         self.num_device_experts = self.offload_config.num_device_experts
         self.topk = vllm_config.model_config.hf_config.num_experts_per_tok
         self.offload_threshold = self.num_device_experts // self.topk
+
+        self._num_hash_layers = getattr(
+            vllm_config.model_config.hf_config, "num_hash_layers", 0)
 
         self._run_meta: dict = {}
         try:
@@ -183,9 +187,12 @@ class ExpertOffloadManager:
         self._t_sum_stepcnt = 0
 
         self._dump_csv = os.environ.get("CSV", "0") not in ("0", "", "false", "False")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self._csv_path = os.environ.get(
             "CSV_PATH",
-            "prefetch_summary_%s.csv" % self._run_meta.get("model", "run"))
+            "./bench_csvs"
+        )
+        self._csv_path = os.path.join(self._csv_path, "prefetch_summary_%s_%s.csv" % (getattr(self.offload_config, "expert_predictor"), timestamp))
         self._csv_written = False
 
         atexit.register(self._dump_final_stats_at_exit)
@@ -1814,9 +1821,16 @@ class ExpertOffloadManager:
         rates_by_layer = self._seq_token_layer_hits
         if not rates_by_layer:
             return
-        rates = list(rates_by_layer.values())
-        self._seq_token_stats.append(self._stats4(rates))
-        self._seq_token_batch.append(self._pending_token_batch)
+        # CHANGE: cross-layer summary stats (avg/median/min/max + per-step total)
+        # are computed over MoE layers only — drop the leading num_hash_layers
+        # "hash" layers (layer_idx < self._num_hash_layers). The per-layer loops
+        # below still record ALL layers, so the per-layer tables / CSV are
+        # unaffected. nh==0 (no field) reproduces the old behavior exactly.
+        nh = self._num_hash_layers
+        rates = [r for li, r in rates_by_layer.items() if li >= nh]
+        if rates:  # guard: empty only in the degenerate all-hash-layer case
+            self._seq_token_stats.append(self._stats4(rates))
+            self._seq_token_batch.append(self._pending_token_batch)
         for lidx, rate in rates_by_layer.items():
             self._seq_layer_rates.setdefault(lidx, []).append(rate)
         # Fold every timing metric present this step.
@@ -1825,9 +1839,12 @@ class ExpertOffloadManager:
                 d = self._t_step[m]
                 if not d:
                     continue
-                vals = list(d.values())
-                self._t_seq_stats[m].append(self._stats4(vals))
-                self._t_seq_total[m].append(sum(vals))
+                # CHANGE: exclude hash layers from the cross-layer reduction AND
+                # the per-step total (shared filtered list).
+                vals = [v for li, v in d.items() if li >= nh]
+                if vals:
+                    self._t_seq_stats[m].append(self._stats4(vals))
+                    self._t_seq_total[m].append(sum(vals))
                 for lidx, v in d.items():
                     self._t_seq_layer[m].setdefault(lidx, []).append(v)
             self._t_step = {m: {} for m in self._t_metrics}
@@ -2086,74 +2103,65 @@ class ExpertOffloadManager:
         self._dump_summary_csv()
 
     def _dump_summary_csv(self) -> None:
-        """NEW (user request): export the per-layer summary aggregates to CSV,
-        one row per MoE layer (layer 0 .. len(moe_layers)-1). Enabled by CSV=1;
-        path from CSV_PATH. Called once at the very end of _print_summary_stats,
-        after both summary blocks are logged, so the file reflects the final
-        numbers.
-
-        Columns (every metric paired with its per-layer sample count <m>_n):
-          layer
-          hit_rate            final cache hit when compute reaches the layer
-                              (routed experts resident / needed) — from
-                              _summary_layer_rate_{sum,cnt}
-          <m>_ms  for m in _t_timing_metrics:
-            attn_ms router_ms upload_ms compute_ms shared_ms pf_compute_ms pf_h2d_ms
-              attn/router/compute/shared = per-layer inference timings;
-              upload   = cache-miss on-demand upload (H2D);
-              pf_compute = prefetch predict; pf_h2d = prefetch upload (H2D)
-          <m>     for m in _t_rate_metrics (fractions 0..1):
-            pred_acc   prefetch prediction accuracy   |P&G|/|P|
-            pf_in_lrc  predicted already resident      |hit|/|P|
-            pf_useful  prefetched-expert usefulness    |miss&G|/|miss|
-        All means are over the measured decode steps (same aggregates the
-        printed per-layer tables use). A layer with no samples for a metric
-        (e.g. the leading no-prefetch layers have no pf_*/pred_* data) gets a
-        blank cell — pandas/numpy read it as NaN — and 0 in that metric's _n
-        column. Header is built from the metric tuples, so any metric added to
-        _t_timing_metrics / _t_rate_metrics shows up here automatically.
+        """Export the per-layer summary aggregates to CSV, one row per MoE layer
+        (layer 0 .. len(moe_layers)-1). Enabled by CSV=1; path from CSV_PATH.
+        Called once at the end of _print_summary_stats.
+ 
+        Each value is that layer's MEAN over the measured decode steps (the same
+        per-layer means the printed summary tables show): hit_rate from
+        _summary_layer_rate_{sum,cnt}, the timing metrics (<m>_ms) and the rate
+        metrics (pred_acc/pf_in_lrc/pf_useful) from _t_sum_layer_{sum,cnt}[m]. A
+        layer with no samples for a metric (e.g. the leading hash layers have no
+        pf_*/pred_* data) gets a blank cell -> pandas/numpy read it as NaN. The
+        common sample size (measured decode steps) is logged once below, not
+        repeated as a column. Header is built from the metric tuples, so any
+        metric added to _t_timing_metrics / _t_rate_metrics shows up here
+        automatically.
+ 
+        NOTE: the timing/rate columns only carry data when cache_profile_timing
+        is also on; hit_rate is populated whenever cache stats were collected.
         """
         if not self._dump_csv or self._csv_written:
             return
-        import csv  # NEW: stdlib, only used here.
-
+        import csv  # stdlib, only used here.
+ 
         n_layers = len(self.moe_layers)
         timing = list(self._t_timing_metrics)   # attn,router,upload,compute,shared,pf_compute,pf_h2d
         rates = list(self._t_rate_metrics)       # pred_acc,pf_in_lrc,pf_useful
-
-        header = ["layer", "hit_rate", "hit_rate_n"]
-        for m in timing:
-            header += ["%s_ms" % m, "%s_n" % m]
-        for m in rates:
-            header += [m, "%s_n" % m]
-
-        def _mean_n(sum_d, cnt_d, lidx):
-            # blank mean (-> NaN) + 0 count when this layer has no samples.
+ 
+        # One column per metric: hit_rate, then each timing metric as <m>_ms,
+        # then each rate metric (fraction). No per-metric count columns.
+        header = ["layer", "hit_rate"]
+        header += ["%s_ms" % m for m in timing]
+        header += list(rates)
+ 
+        def _mean(sum_d, cnt_d, lidx):
+            # blank (-> NaN) when this layer has no samples for the metric.
             c = cnt_d.get(lidx, 0)
-            return (("%.6f" % (sum_d.get(lidx, 0.0) / c)) if c else ""), c
-
+            return ("%.6f" % (sum_d.get(lidx, 0.0) / c)) if c else ""
+ 
+        # Representative sample size for the log line: measured decode steps.
+        n_steps = self._summary_step_cnt
+ 
         try:
             with open(self._csv_path, "w", newline="") as fh:
                 w = csv.writer(fh)
                 w.writerow(header)
                 for li in range(n_layers):
-                    hr, hr_n = _mean_n(self._summary_layer_rate_sum,
-                                       self._summary_layer_rate_cnt, li)
-                    rowvals = [li, hr, hr_n]
+                    row = [li, _mean(self._summary_layer_rate_sum,
+                                     self._summary_layer_rate_cnt, li)]
                     for m in timing:
-                        v, c = _mean_n(self._t_sum_layer_sum[m],
-                                       self._t_sum_layer_cnt[m], li)
-                        rowvals += [v, c]
+                        row.append(_mean(self._t_sum_layer_sum[m],
+                                         self._t_sum_layer_cnt[m], li))
                     for m in rates:
-                        v, c = _mean_n(self._t_sum_layer_sum[m],
-                                       self._t_sum_layer_cnt[m], li)
-                        rowvals += [v, c]
-                    w.writerow(rowvals)
+                        row.append(_mean(self._t_sum_layer_sum[m],
+                                         self._t_sum_layer_cnt[m], li))
+                    w.writerow(row)
             self._csv_written = True
-            logger.info("[EXPERT-OFFLOAD-CSV] wrote %d per-layer rows -> %s",
-                        n_layers, self._csv_path)
+            logger.info("[EXPERT-OFFLOAD-CSV] wrote %d per-layer rows "
+                        "(each value = mean over %d measured decode steps) -> %s",
+                        n_layers, n_steps, self._csv_path)
         except Exception as e:
-            # Don't let a CSV/file error take down teardown or the atexit path.
             logger.warning("[EXPERT-OFFLOAD-CSV] failed to write %s: %s",
                            self._csv_path, e)
 

@@ -48,7 +48,7 @@ NUM_DEVICE_EXPERTS="${NUM_DEVICE_EXPERTS:-24}"       # decode : resident experts
 NUM_DEVICE_LAYERS="${NUM_DEVICE_LAYERS:-1}"          # prefill: full-expert layers on NPU
 TOPK="${TOPK:-8}"                                    # model top_k; ONLY used for the threshold warning below
 CACHE_POLICY="${CACHE_POLICY:-1}"                    # 1 = LRC eviction policy
-CACHE_DEBUG="${CACHE_DEBUG:-1}"                      # your V4 command used true; set 0 for clean perf (seq-stats still summarizes)
+CACHE_DEBUG="${CACHE_DEBUG:-0}"                      # your V4 command used true; set 0 for clean perf (seq-stats still summarizes)
 CPU_BINDING="${CPU_BINDING:-0}"                      # enable_cpu_binding
 WPREFETCH="${WPREFETCH:-0}"                          # 1 = L2 weight prefetch (not in your command)
 
@@ -88,8 +88,8 @@ PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/keyi/code/moe_offload/hq_v5/mode2_pa/lea
 SEQ_STATS="${SEQ_STATS:-1}"                          # 1 = pass seq_stats_* keys
 TIMING="${TIMING:-0}"                                # 1 = per-layer compute/upload timing (eager only)
 
-CSV="${CSV:-1}"
-CSV_PATH=/home/keyi/code/moe_offload/hq_v5/vllm-ascend/bench_csvs
+export CSV="${CSV:-1}"
+export CSV_PATH=/home/keyi/code/moe_offload/hq_v5/vllm-ascend/bench_csvs/
 
 SEQ_WARMUP="${SEQ_WARMUP:-0}"
 SEQ_NUM="${SEQ_NUM:-${NUM}}"
