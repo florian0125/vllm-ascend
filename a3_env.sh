@@ -70,6 +70,8 @@ export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"  # reduce NPU mem fragm
 export VLLM_ASCEND_ENABLE_FUSED_MC2=0                 # safe off on single card (no comm to fuse)
 export VLLM_SERVER_DEV_MODE=1                         # extra dev endpoints (only affects `vllm serve`)
 export ASCEND_LAUNCH_BLOCKING=0                       # async NPU dispatch (set 1 only to debug)
+export VLLM_BATCH_INVARIANT=1                         # Enable batch invariance to get consistent results regardless of scheduling for online serve mode
+export VLLM_ENABLE_V1_MULTIPROCESSING=0               # Turn off multiprocessing to make the scheduling deterministic
 
 # CPU threading
 export OMP_PROC_BIND=false
