@@ -1218,7 +1218,7 @@ class ExpertOffloadManager:
 
             # Execute the prefetch (H2D copies)
             completion_event = self._do_prefetch(next_idx, predicted,
-                                                 log2phy_np,
+                                                 log2phy_np, use_sleep=False,
                                                  record_profiling=_record_profiling,
                                                  compute_ms=_compute_ms)
 
