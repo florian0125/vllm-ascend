@@ -257,6 +257,7 @@ class ExpertOffloadManager:
         )
         # AI driver state. Active for any learned predictor
         self._ai_active = getattr(self._predictor, "uses_model_forward_driver", False)
+        self._exact_select = self.offload_config.expert_predictor_exact_select
         self._ai_pa_buf = None             # [max_tokens, H] fp32 — pre_attn[ℓ]
         self._ai_ri_buf = [None, None]     # 2x [max_tokens, H] fp32 — router ping-pong
         self._ai_pending: dict[int, dict] = {}
@@ -1456,11 +1457,63 @@ class ExpertOffloadManager:
 
     def _ai_layer_index(self, experts) -> int:
         return self.moe_layers.index(experts)
+
+    def _ai_select_topk(self, experts, logits: torch.Tensor) -> torch.Tensor:
+        """Predicted router logits [n, E] -> predicted expert ids [n, top_k].
+
+        exact mode (self._exact_select, default): reproduce the selection V4-Flash
+        inference uses, so the predicted set matches what the real router would pick
+        from these logits. Mirrors experts_selector._native_select_experts (ids path)
+        / the fused moe_gating_top_k(norm_type=1, group_select_mode=1, bias_opt=bias):
+          1. score with the layer's scoring_func (sigmoid for V4),
+          2. ADD the gate's e_score_correction_bias to the SCORES (changes which
+             experts win, not the weights),
+          3. group-mask to the top `topk_group` of `num_expert_group` groups,
+          4. top_k on the masked scores.
+        Reuses the model's own _native_grouped_topk so the grouping can't drift from
+        inference (lazy import to avoid a manager<->experts_selector cycle). Ids only —
+        weights / renormalize / routed_scaling_factor don't affect prefetch.
+
+        approximation mode (not self._exact_select): plain top_k on the raw logits —
+        what FATE-style predictors do. (sigmoid is monotonic, so plain top_k already
+        equals "sigmoid then top_k"; the bias + group mask are what exact mode adds.)
+        """
+        top_k = self._predictor.top_k
+        if not self._exact_select:
+            return logits.topk(top_k, dim=-1).indices              # [n, k]
+
+        sf = getattr(experts, "scoring_func", "sigmoid")
+        if sf == "sigmoid":
+            scores = logits.sigmoid()
+        elif sf == "softmax":
+            scores = logits.softmax(dim=-1)
+        elif sf == "sqrtsoftplus":
+            scores = F.softplus(logits).sqrt()
+        else:
+            raise ValueError(f"[AI-PRED] unsupported scoring_func {sf!r}")
+
+        bias = getattr(experts, "e_score_correction_bias", None)
+        if bias is not None:
+            # bias added to SCORES (selection only); shape [E], broadcast over n.
+            scores = scores + bias.to(scores.dtype).unsqueeze(0)
+
+        n_group = getattr(experts, "num_expert_group", None) or 1
+        topk_group = getattr(experts, "topk_group", None) or 1
+        if getattr(experts, "use_grouped_topk", False) and n_group > 1:
+            # Exact group mask (max-per-group, keep top `topk_group` groups, zero the
+            # rest), reusing the model's function so it matches inference exactly.
+            from vllm_ascend.ops.fused_moe.experts_selector import _native_grouped_topk
+            scores = _native_grouped_topk(scores, n_group, topk_group)
+
+        # logger.info("ROUTE n_group=%s topk_group=%s scoring=%s", n_group, topk_group, sf)
+        # ROUTE n_group=1 topk_group=1 scoring=sqrtsoftplus
+
+        return scores.to(torch.float32).topk(top_k, dim=-1, sorted=False).indices  # [n, k]
      
     def ai_predict_start(self, experts, pre_attn):
         """Before attention: predict THIS layer's experts on the prefetch stream
         (no host block) and open the prefetch handshake. Eager + decode only.
-    
+
         When profiling is on, bracket the on-NPU predict with timing events so
         ai_prefetch_finish can fold the predictor's NPU time into pf_compute."""
         if not self._ai_active or _EXTRA_CTX.capturing:
@@ -1476,7 +1529,7 @@ class ExpertOffloadManager:
         if head_idx is None:                           # leading hash/dense layer: no AI prefetch
             return None
         spec = predictor.input_spec
-    
+
         pa = None
         if "pre_attn" in spec:
             pa = self._ai_pa_buf[:n]
@@ -1484,11 +1537,11 @@ class ExpertOffloadManager:
         # One event after the copy orders this copy AND the prior router_input save
         # (same compute stream) before the prefetch-stream reads.
         copy_event = torch_npu.npu.current_stream().record_event()
-    
+
         router_prev = None
         if "router_input_prev" in spec and head_idx > 0:   # head 0 uses zeros
             router_prev = self._ai_ri_buf[(moe_idx - 1) % 2][:n]
-    
+
         # Mirror the FATE worker's profiling gate exactly (profiling + cache policy +
         # summary not yet printed) so the stash can never grow without a consumer.
         _record_profiling = (self._profile_timing and self.cache_policy is not None
@@ -1499,17 +1552,23 @@ class ExpertOffloadManager:
         if _record_profiling:
             predict_ev0 = torch_npu.npu.Event(enable_timing=True)
             predict_ev1 = torch_npu.npu.Event(enable_timing=True)
-    
+
         self._prefetch_layer_done[moe_idx] = threading.Event()
         ctx = AIPredictCtx(layer_idx=head_idx, n_tokens=n,
                         pre_attn=pa, router_input_prev=router_prev)
-    
+
         with torch_npu.npu.stream(self._prefetch_stream):
             self._prefetch_stream.wait_event(copy_event)
             if predict_ev0 is not None:
                 predict_ev0.record()
             logits = predictor.predict_logits_npu(head_idx, ctx)      # [n, E]
-            topk_ids = logits.topk(predictor.top_k, dim=-1).indices    # [n, k]
+            # CHANGE: was `topk_ids = logits.topk(predictor.top_k, dim=-1).indices`.
+            # Route the predicted logits through the selection V4 inference actually
+            # uses (sigmoid + e_score_correction_bias on scores + grouped top_k) when
+            # expert_predictor_exact_select is on; plain top_k otherwise. Runs here on
+            # the prefetch stream inside the predict-timing bracket, so its (small) NPU
+            # cost is folded into pf_compute — no separate stage/sync.
+            topk_ids = self._ai_select_topk(experts, logits)          # [n, k]
             if predict_ev1 is not None:
                 predict_ev1.record()
         self._ai_pending[moe_idx] = {"moe_idx": moe_idx, "topk_ids": topk_ids,

@@ -800,6 +800,11 @@ class ExpertOffloadConfig:
         # path to the learned-predictor checkpoint (.pt). Required
         # only for learned predictors (e.g. mode2_pa_prevhs); ignored for fate.
         "expert_predictor_ckpt": None,
+        # NEW: learned (NN) predictor selection mode. True = reproduce V4-Flash
+        # inference selection on the predicted logits (sigmoid + e_score_correction_bias
+        # on scores + grouped top-k). False = cheap plain top_k on the raw logits.
+        # Ignored by FATE (FATE always uses its own CPU softmax+top_k approximation).
+        "expert_predictor_exact_select": True,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -869,6 +874,8 @@ class ExpertOffloadConfig:
             raise ValueError("seq_stats_num_seqs must >= 0")
         if not isinstance(self.config["cache_profile_timing"], bool):
             raise TypeError("cache_profile_timing must be a boolean")
+        if not isinstance(self.config["expert_predictor_exact_select"], bool):
+            raise TypeError("expert_predictor_exact_select must be a boolean")
         if not isinstance(self.config["expert_predictor"], str):
             raise TypeError("expert_predictor must be a string")
             
