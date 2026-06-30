@@ -351,10 +351,19 @@ class DeepseekV4MoE(nn.Module):
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
+            # (timed there — see fused_moe.shared_forward_impl).
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
         else:
             # router_logits: (num_tokens, n_experts)
-            router_logits = F.linear(hidden_states.float(), self.gate.weight)
+            # NEW (#2): external-router gate GEMM into the "router" stage. Only one of
+            # the two gate sites runs per layer; this is the fallback when the gate is
+            # NOT internal. nullcontext when no offload manager / not profiling.
+            _eom = get_expert_offload_manager() if has_expert_offload_manager() else None
+            _gctx = (_eom.time_stage("router", self.experts, hidden_states.shape[0],
+                                     accumulate=True)
+                     if _eom is not None else nullcontext())
+            with _gctx:
+                router_logits = F.linear(hidden_states.float(), self.gate.weight)
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
         fused_moe_out_is_tuple = isinstance(fused_moe_out, tuple)
@@ -856,24 +865,42 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        residual = hidden_states.clone()
-        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        hidden_states = self.input_layernorm(hidden_states)
+        # NEW (#2): one manager handle for all the timing/prefetch hooks below, plus a
+        # small local helper for the "hc" stage timer (nullcontext when there's no
+        # offload manager; time_stage itself no-ops off profiling/large-batch).
+        _eom = None
+        if has_expert_offload_manager() and hasattr(self.mlp, "experts"):
+            _eom = get_expert_offload_manager()
+        _n_tok = hidden_states.shape[0]
+
+        def _hc(post=False):
+            return (_eom.time_stage("hc", self.mlp.experts, _n_tok,
+                                    accumulate=True, post=post)
+                    if _eom is not None else nullcontext())
+
+        with _hc():  # NEW (#2): residual clone + hc_pre(attn) + input_layernorm
+            residual = hidden_states.clone()
+            hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+            hidden_states = self.input_layernorm(hidden_states)
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
 
         _ai_ctx = None
-        if has_expert_offload_manager() and hasattr(self.mlp, "experts"):
-            _aim = get_expert_offload_manager()
-            if getattr(_aim, "_ai_active", False):
-                _ai_ctx = _aim.ai_predict_start(self.mlp.experts, hidden_states)
-        
+        if _eom is not None and getattr(_eom, "_ai_active", False):
+            _ai_ctx = _eom.ai_predict_start(self.mlp.experts, hidden_states)
+
+        # NEW (#4): pure-isolation prerequisite. Drain the prefetch/load streams (and,
+        # for FATE, the background worker for this layer) so the stage timers below
+        # measure pure cost. Must run AFTER ai_predict_start (so the NN predict it
+        # launched is drained) and BEFORE the attention timer. No-op off profiling.
+        if _eom is not None:
+            _eom.quiesce_for_timing(self.mlp.experts, _n_tok)
+
         # v10: per-layer attention timing (MoE layers only, decode path, eager).
         _atmgr = None
-        if has_expert_offload_manager() and hasattr(self.mlp, "experts"):
-            _m = get_expert_offload_manager()
-            if (_m._profile_timing and not _EXTRA_CTX.capturing
-                    and hidden_states.shape[0] <= _m.offload_threshold):
-                _atmgr = _m
+        if _eom is not None:
+            if (_eom._profile_timing and not _EXTRA_CTX.capturing
+                    and _n_tok <= _eom.offload_threshold):
+                _atmgr = _eom
         if _atmgr is not None:
             torch_npu.npu.current_stream().synchronize(); _t_attn = time.perf_counter()
         hidden_states = self.self_attn(**attn_kwargs)
@@ -882,20 +909,24 @@ class DeepseekV2DecoderLayer(nn.Module):
             _atmgr.record_attention_time(self.mlp.experts, (time.perf_counter() - _t_attn) * 1000.0)
 
         if _ai_ctx is not None:
-            _aim.ai_prefetch_finish(_ai_ctx)
+            _eom.ai_prefetch_finish(_ai_ctx)
 
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        residual = hidden_states.clone()
-        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        with _hc():  # NEW (#2): hc_post(attn)
+            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        with _hc():  # NEW (#2): residual clone + hc_pre(ffn) + post_attention_layernorm
+            residual = hidden_states.clone()
+            hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
-        if has_expert_offload_manager() and hasattr(self.mlp, "experts"):
-            _rim = get_expert_offload_manager()
-            if getattr(_rim, "_ai_active", False):
-                _rim.ai_save_router_input(self.mlp.experts, hidden_states)
-                
+        if _eom is not None and getattr(_eom, "_ai_active", False):
+            _eom.ai_save_router_input(self.mlp.experts, hidden_states)
+
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        # NEW (#2): hc_post(ffn) runs AFTER mlp (i.e. after the cache-hit point), so
+        # record it post-hit directly into _t_step (post=True) for same-layer/same-step
+        # attribution.
+        with _hc(post=True):
+            hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual
 

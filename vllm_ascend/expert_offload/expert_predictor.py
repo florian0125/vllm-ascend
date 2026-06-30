@@ -242,6 +242,13 @@ class FATEPredictor(ExpertPredictor):
         if gate_w is None:
             return None
 
+        # NOTE (#7): INTENTIONAL SIMPLIFICATION. The model routes with grouped-topk
+        # (n_group/topk_group), the configured scoring_func, and e_score_correction_bias
+        # (see DeepseekV4MoE select_experts args). This predictor uses plain softmax+topk
+        # as a cheap proxy (FATE, arXiv:2502.12224). So pred_acc here is capped by BOTH
+        # the cross-layer hidden-state proxy AND this scorer mismatch — do not read a low
+        # FATE pred_acc as purely a proxy-quality signal. The learned (NN) predictor is
+        # trained against the true routed set and does not carry this mismatch.
         # hs_cpu is fp32 on CPU; gate_w is fp32 on CPU.
         router_logits = F.linear(hs_cpu, gate_w)  # [num_tokens, n_experts]
         # Simplified routing: softmax + topk (approximation).

@@ -793,7 +793,6 @@ class ExpertOffloadConfig:
         "moe_offload_debug": False,
         "expert_prefetch_enabled": False,
         # End-of-test hit-rate summary windowing
-        "seq_stats_warmup_seqs": 0,
         "seq_stats_num_seqs": 0,
         "cache_profile_timing": False,
         # which next-layer expert predictor to use for prefetch.
@@ -864,11 +863,10 @@ class ExpertOffloadConfig:
         if not isinstance(self.config["expert_prefetch_enabled"], bool):
             raise TypeError("expert_prefetch_enabled must be a boolean")
 
-        for key in ("seq_stats_warmup_seqs", "seq_stats_num_seqs"):
-            if not isinstance(self.config[key], int):
-                raise TypeError(f"{key} must be an integer")
-            if self.config[key] < 0:
-                raise ValueError(f"{key} must >= 0")
+        if not isinstance(self.config["seq_stats_num_seqs"], int):
+            raise TypeError("seq_stats_num_seqs must be an integer")
+        if self.config["seq_stats_num_seqs"] < 0:
+            raise ValueError("seq_stats_num_seqs must >= 0")
         if not isinstance(self.config["cache_profile_timing"], bool):
             raise TypeError("cache_profile_timing must be a boolean")
         if not isinstance(self.config["expert_predictor"], str):

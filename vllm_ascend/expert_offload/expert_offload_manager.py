@@ -5,6 +5,7 @@ import threading
 import time
 import os
 import datetime
+from contextlib import contextmanager, nullcontext  # time_stage is a contextmanager
 
 import atexit
 import statistics
@@ -140,9 +141,7 @@ class ExpertOffloadManager:
         self._seq_token_batch: list[int] = []                 # per step of current seq: batch size
         self._seq_layer_rates: dict[int, list[float]] = {}    # layer_idx -> per-step rates, current seq
         self._pending_token_batch: int = 0                    # batch size of the step in flight
-        self._seq_stats_warmup_seqs = self.offload_config.seq_stats_warmup_seqs
         self._seq_stats_num_seqs = self.offload_config.seq_stats_num_seqs
-        self._seq_warmup_remaining = self._seq_stats_warmup_seqs
         self._summary_seq_stats: list[tuple[float, float, float, float]] = []  # per measured window
         self._summary_step_sum: list[float] = [0.0, 0.0, 0.0, 0.0]
         self._summary_step_cnt: int = 0
@@ -158,15 +157,24 @@ class ExpertOffloadManager:
         # harvested into the step dict at the hit (after any close). Post-hook
         # metrics (upload, compute, shared) stash directly.
         self._profile_timing = self.offload_config.cache_profile_timing
-        self._t_timing_metrics = ("attn", "router", "upload", "compute", "shared",
-                                  "pf_compute", "pf_h2d")
+        self._t_timing_metrics = ("attn", "router", "hc", "lrc", "miss_load",
+                                  "compute", "shared", "pf_compute", "pf_h2d")
         self._t_rate_metrics = ("pred_acc", "pf_in_lrc", "pf_useful")
         self._t_metrics = self._t_timing_metrics + self._t_rate_metrics
-        self._t_prehook = ("attn", "router")
+        self._t_prehook = ("attn", "router", "hc", "lrc")
         self._t_label = {
-            "attn": "Attention", "router": "Router (select_experts)",
-            "upload": "Cache-miss upload (H2D)", "compute": "Routed experts (fused_experts)",
+            "attn": "Attention", "router": "Router (gate + select_experts)",
+            # CHANGE (#6): renamed; this is the on-demand miss path, which is
+            # evict-pick + scale/offset + weight H2D, not a pure transfer.
+            "miss_load": "Cache-miss on-demand load (evict+H2D)",
+            "compute": "Routed experts (fused_experts)",
             "shared": "Shared expert MLP",
+            # NEW (#2): structural hyperconnection ops (hc_pre/hc_post) + the two
+            # RMSNorms + residual clones around attention and the MoE.
+            "hc": "Hyperconnection + layernorm + residual",
+            # NEW (#3): LRC cache-policy observe() bookkeeping (the O(num_experts)
+            # EMA update per token).
+            "lrc": "LRC policy observe()",
             # NEW
             "pf_compute": "Prefetch predict (CPU)",
             "pf_h2d": "Prefetch upload (H2D)",
@@ -459,21 +467,6 @@ class ExpertOffloadManager:
                     w2_nz_storage[expert_id * self.w2_expert_size_bytes : (expert_id + 1) * self.w2_expert_size_bytes]
                 )
 
-    def register_gate_weights(self, model):
-        """Store fp32 CPU copies of gate.weight for each MoE layer.
-
-        Called from _finalize_offload() after all MoE layers are
-        registered.  The gate weights are used by predict_next_layer_experts()
-        to predict which experts the next layer will need.
-        """
-        from vllm_ascend.models.deepseek_v4 import DeepseekV4MoE
-        moe_wrappers = [m for m in model.modules()
-                        if isinstance(m, DeepseekV4MoE)]
-        for wrapper in moe_wrappers:
-            gate_cpu = wrapper.gate.weight.data.cpu().float().clone()
-            self._gate_weights_cpu.append(gate_cpu)
-        logger.info("[PREFETCH] registered gate weights for %d MoE layers",
-                    len(self._gate_weights_cpu))
 
     # ------------------------------------------------------------------ #
     #  Deferred weight-load pool                                          #
@@ -959,11 +952,20 @@ class ExpertOffloadManager:
         with torch_npu.npu.stream(self.load_stream):
             if self.cache_policy is not None:
                 router_scores = topk_weights_h.tolist() if topk_weights_h is not None else None
+                # NEW (#3): time observe() as the "lrc" stage. observe() is pure-CPU
+                # (the per-token EMA loop over num_experts + recent-window bookkeeping),
+                # so perf_counter around it is the pure cost — no device sync needed.
+                # Recorded into _t_pending (prehook): harvested at the hit just below,
+                # via _record_cache_stats -> _record_seq_layer_hit.
+                _time_lrc = (self._profile_timing and not self._seq_stats_done)
+                _tl0 = time.perf_counter() if _time_lrc else 0.0
                 needed = self.cache_policy.observe(
                     layer_idx,
                     topk_ids_h.tolist(),
                     router_scores=router_scores,
                 )
+                if _time_lrc:
+                    self._t_pending["lrc"][layer_idx] = (time.perf_counter() - _tl0) * 1000.0
             else:
                 needed = set(topk_ids_h.unique().tolist())
 
@@ -995,10 +997,14 @@ class ExpertOffloadManager:
                                 layer_idx, len(need_to_load), len(reusable_slots),
                                 sorted(need_to_load)[:20])
 
-            # start the upload timer just before the copy loop; read it after
+            # start the load timer just before the copy loop; read it after
             # the existing load_stream.synchronize() (no extra sync introduced).
-            _time_upload = self._profile_timing and self.cache_policy is not None
-            _tc0 = time.perf_counter() if _time_upload else 0.0
+            # CHANGE (#6): renamed local _time_upload -> _time_miss_load and the
+            # recorded metric "upload" -> "miss_load" (see __init__/labels). This
+            # measures the on-demand miss path = evict-pick + scale/offset + weight
+            # H2D, not a pure transfer.
+            _time_miss_load = self._profile_timing and self.cache_policy is not None
+            _tc0 = time.perf_counter() if _time_miss_load else 0.0
 
             n_copies = 0
             for eid in need_to_load:
@@ -1017,12 +1023,13 @@ class ExpertOffloadManager:
                     victim = None
 
                 if slot < 0:
-                    if self._debug:
-                        logger.info(
-                            "[UPDATE-W] l=%d NO SLOTS: %d experts could not be loaded, "
-                            "missed=%s",
-                            layer_idx, len(need_to_load) - n_copies,
-                            sorted(list(need_to_load))[n_copies:][:20])
+                    # CHANGE (#11): unconditional WARNING — see Group 2. This is the
+                    # silent mis-route path (unmapped expert -> clamp(min=0) -> expert 0).
+                    logger.warning(
+                        "[UPDATE-W] l=%d NO SLOTS: %d experts could not be loaded; "
+                        "their tokens will be MIS-ROUTED to expert 0. missed=%s",
+                        layer_idx, len(need_to_load) - n_copies,
+                        sorted(list(need_to_load))[n_copies:][:20])
                     break  # no free slots — should not happen in normal usage
                 # Copy weights from CPU to NPU
                 layer.w13_weight.data.untyped_storage()[slot * self.w13_expert_size_bytes : (slot + 1) * self.w13_expert_size_bytes].copy_(
@@ -1062,9 +1069,10 @@ class ExpertOffloadManager:
 
             self.load_stream.synchronize()
 
-            if _time_upload:
+            if _time_miss_load:
                 copy_ms = (time.perf_counter() - _tc0) * 1000.0 if n_copies else 0.0
-                self._t_step["upload"][layer_idx] = copy_ms
+                # CHANGE (#6): "upload" -> "miss_load".
+                self._t_step["miss_load"][layer_idx] = copy_ms
 
     # ------------------------------------------------------------------ #
     #  Next-layer expert prefetch                                          #
@@ -1798,10 +1806,93 @@ class ExpertOffloadManager:
 
     # Public call sites (thin wrappers, named for readability).
     def record_attention_time(self, layer, ms): self._record_layer_time("attn", layer, ms)
-    def record_router_time(self, layer, ms):    self._record_layer_time("router", layer, ms)
+    def record_router_time(self, layer, ms):    self._accumulate_pending("router", layer, ms)
     def record_compute_time(self, layer, ms):   self._record_layer_time("compute", layer, ms)
     def record_shared_time(self, layer, ms):    self._record_layer_time("shared", layer, ms)
-    # "upload" is recorded internally in _update_weights.
+    # "miss_load" is recorded internally in _update_weights.
+
+    # NEW (#2,#3,#6): router/gate now share one metric, so a pending value may be
+    # written by more than one call site (gate timer + select timer) before the
+    # hit harvests it. Accumulate instead of overwrite. Same gate as
+    # _record_layer_time (profiling + cache policy + summary not printed).
+    def _accumulate_pending(self, metric: str, layer, ms: float) -> None:
+        if (not self._profile_timing or self.cache_policy is None
+                or self._seq_stats_done):
+            return
+        try:
+            idx = self.moe_layers.index(layer)
+        except (ValueError, AttributeError):
+            return
+        self._t_pending[metric][idx] = self._t_pending[metric].get(idx, 0.0) + ms
+
+    # NEW (#2): gate GEMM time folds into the router stage. Called from the gate
+    # site (fused_moe.shared_forward_impl for is_internal_router, else
+    # DeepseekV4MoE.forward). Accumulates into the same pending slot select_experts
+    # writes to via record_router_time.
+    def record_gate_time(self, layer, ms):
+        self._accumulate_pending("router", layer, ms)
+
+    # NEW (#2,#4): pure-isolation stage timer. Drains the COMPUTE stream before and
+    # after the wrapped block so `metric` reflects the block's cost with nothing
+    # else running on that stream (combine with quiesce_for_timing, which drains
+    # the prefetch/load streams + the FATE worker, for full isolation). prehook
+    # metrics land in _t_pending (harvested at the cache hit); post=True writes
+    # _t_step directly (for ops that run after the hit, e.g. the FFN-side hc_post).
+    # accumulate=True adds to any existing value for this layer/step (several
+    # segments -> one metric). No-op off profiling / capture / large batch.
+    @contextmanager
+    def time_stage(self, metric: str, experts, n_tokens: int,
+                   accumulate: bool = False, post: bool = False):
+        if (not self._profile_timing or self.cache_policy is None
+                or self._seq_stats_done or _EXTRA_CTX.capturing
+                or n_tokens > self.offload_threshold):
+            yield
+            return
+        try:
+            idx = self.moe_layers.index(experts)
+        except (ValueError, AttributeError):
+            yield
+            return
+        torch_npu.npu.current_stream().synchronize()
+        _t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            torch_npu.npu.current_stream().synchronize()
+            ms = (time.perf_counter() - _t0) * 1000.0
+            d = self._t_step if post else self._t_pending
+            slot = d.setdefault(metric, {})
+            slot[idx] = (slot.get(idx, 0.0) + ms) if accumulate else ms
+
+    # NEW (#4): pure-isolation prerequisite. Before timing this layer's stages,
+    # drain everything that would otherwise run concurrently on another stream:
+    #   - FATE: this layer's prefetch runs on the background worker (triggered by
+    #     the PREVIOUS layer's compute). Wait for it to finish, then drain the
+    #     prefetch stream so the H2D + log2phy write-back are complete. We PEEK the
+    #     threading.Event (no clear/pop) — update_weights still consumes it later.
+    #   - NN: the predict was launched on the prefetch stream in ai_predict_start
+    #     (this layer, before attention). Draining the prefetch stream forces it to
+    #     complete; its NPU cost is still captured by the predict's own events.
+    # Also drain the on-demand load stream (idle here, cheap insurance). No-op off
+    # profiling / capture / large batch. Must run AFTER ai_predict_start and BEFORE
+    # the attention timer. NOTE: FATE's pf_h2d can still include contention with the
+    # PREVIOUS layer's epilogue (the worker H2D may begin before this drain); see
+    # the guide's "FATE pf_h2d" note.
+    def quiesce_for_timing(self, experts, n_tokens: int):
+        if (not self._profile_timing or self.cache_policy is None
+                or self._seq_stats_done or _EXTRA_CTX.capturing
+                or n_tokens > self.offload_threshold):
+            return
+        try:
+            layer_idx = self.moe_layers.index(experts)
+        except (ValueError, AttributeError):
+            return
+        if not self._ai_active:
+            done = self._prefetch_layer_done.get(layer_idx)
+            if done is not None:
+                done.wait()           # PEEK: do not clear/del; update_weights does
+        self._prefetch_stream.synchronize()
+        self.load_stream.synchronize()
 
     def _record_seq_layer_hit(self, layer_idx, num_hits, num_requested, num_tokens=1):
         if self._seq_stats_done or num_requested <= 0:
@@ -1853,9 +1944,8 @@ class ExpertOffloadManager:
     def flush_sequence_cache_stats(self, finished_reqs: int = 0):
         """Close out one window into the summary accumulators. SILENT.
 
-        Warmup windows are discarded; measured windows accumulate hit-rate and
-        timing stats; on reaching seq_stats_num_seqs the one-shot summary
-        prints. Idempotent.
+        Measured windows accumulate hit-rate and timing stats; on reaching
+        seq_stats_num_seqs the one-shot summary prints. Idempotent.
         """
         self._close_token_stats()
         token_stats = self._seq_token_stats
@@ -1873,16 +1963,9 @@ class ExpertOffloadManager:
         if self._seq_stats_done:
             _reset()
             return
-        if self._seq_warmup_remaining > 0:
-            self._seq_warmup_remaining -= 1
-            if self._debug_update_weights:
-                logger.info(
-                    "[EXPERT-OFFLOAD-FINAL] warmup window discarded "
-                    "(decode_steps=%d, warmup_remaining=%d)",
-                    len(token_stats), self._seq_warmup_remaining,
-                )
-            _reset()
-            return
+        # REMOVED (#10): the `if self._seq_warmup_remaining > 0:` warmup-discard
+        # branch. It referenced self._debug_update_weights, which is never defined
+        # (latent AttributeError if warmup>0), and warmup is unused (SEQ_WARMUP=0).
         n = len(token_stats)
         self._summary_seq_stats.append((
             sum(t[0] for t in token_stats) / n,
@@ -2010,8 +2093,9 @@ class ExpertOffloadManager:
                 ]
             # per-layer means: fixed-width columns aligned under their headers.
             # CHANGE: pf_compute/pf_h2d abbreviations added; iterate timing metrics.
-            abbr = {"attn": "att", "router": "rtr", "upload": "upl", "compute": "cmp",
-                    "shared": "shr", "pf_compute": "pfc", "pf_h2d": "pfh"}
+            abbr = {"attn": "att", "router": "rtr", "hc": "hc", "lrc": "lrc",
+                    "miss_load": "mld", "compute": "cmp", "shared": "shr",
+                    "pf_compute": "pfc", "pf_h2d": "pfh"}
             all_layers = sorted({li for mt in self._t_timing_metrics for li in self._t_sum_layer_sum[mt]})
             if all_layers:
                 col = 9  # per-column width (right-aligned)

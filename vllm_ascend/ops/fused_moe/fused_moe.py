@@ -1003,10 +1003,21 @@ class AscendFusedMoE(FusedMoE):
             # increase with extra hidden states. We also assume that all gate
             # linear is unquantized so that we the weight is pre-casted in
             # process_weights_after_loading of AscendUnquantizedLinearMethod.
-            hidden_states_fp32 = hidden_states.float()
-            before_routed_experts = torch.npu.current_stream().record_event()
-            router_logits = F.linear(hidden_states_fp32, gate.weight_fp32)
-            after_routed_experts = torch.npu.current_stream().record_event()
+            # NEW (#2): time the gate GEMM into the "router" stage (pure-isolation via
+            # time_stage). Prefetch is already drained for this layer by
+            # quiesce_for_timing, so this measures the gate alone. accumulate=True so it
+            # adds to select_experts' contribution (recorded later in w8a8 apply).
+            _eom = get_expert_offload_manager() if (
+                getattr(self, "enable_expert_offload", False)
+                and has_expert_offload_manager()) else None
+            _gctx = (_eom.time_stage("router", self, hidden_states.shape[0],
+                                     accumulate=True)
+                     if _eom is not None else nullcontext())
+            with _gctx:
+                hidden_states_fp32 = hidden_states.float()
+                before_routed_experts = torch.npu.current_stream().record_event()
+                router_logits = F.linear(hidden_states_fp32, gate.weight_fp32)
+                after_routed_experts = torch.npu.current_stream().record_event()
         else:
             before_routed_experts = torch.npu.current_stream().record_event()
             after_routed_experts = None
