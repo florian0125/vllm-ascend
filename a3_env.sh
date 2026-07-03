@@ -19,7 +19,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   exit 1
 fi
 
-conda activate moe_eoffv5
+conda activate moeoffv5-keyi
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 # ---- 1. CANN / NNAL (system-level) -----------------------------------------
 # export ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend}"
@@ -34,7 +35,7 @@ _NNAL_ENV="${ASCEND_HOME_PATH}/nnal/atb/set_env.sh"
 unset TORCH_NPU_PATH
 
 # ---- 3. A3 build target (DETECTED on this machine) -------------------------
-export SOC_VERSION="ascend910_9391"     # confirm with `npu-smi info`
+export SOC_VERSION="ascend910_9382"     # confirm with `npu-smi info`
 # NOTE: on A3 this value really matters — the full custom AscendC kernels are
 # compiled against it (unlike A5, which skipped them). A wrong SOC here = a
 # kernel build that succeeds but is wrong for the silicon.
@@ -70,6 +71,7 @@ export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"  # reduce NPU mem fragm
 export VLLM_ASCEND_ENABLE_FUSED_MC2=0                 # safe off on single card (no comm to fuse)
 export VLLM_SERVER_DEV_MODE=1                         # extra dev endpoints (only affects `vllm serve`)
 export ASCEND_LAUNCH_BLOCKING=0                       # async NPU dispatch (set 1 only to debug)
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export VLLM_BATCH_INVARIANT=1                         # Enable batch invariance to get consistent results regardless of scheduling for online serve mode
 export VLLM_ENABLE_V1_MULTIPROCESSING=0               # Turn off multiprocessing to make the scheduling deterministic
 
@@ -92,13 +94,18 @@ export USE_MULTI_GROUPS_KV_CACHE=1
 
 # ---- 7. Distributed comms (auto-detected to THIS box; override if wrong) ----
 # Colleague used enp189s0f0 / 80.48.37.147 — those are THEIR machine. We detect ours.
-export NIC_NAME="${NIC_NAME:-$(ip -br addr 2>/dev/null | awk '$1!="lo" && $2=="UP"{print $1; exit}')}"
-export NIC_NAME="${NIC_NAME:-eth0}"                   # fallback
-export LOCAL_IP="${LOCAL_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
+# export NIC_NAME="enp194s0f0"
+# Pick the first real, non-virtual interface with a global-scope IPv4 address.
+export NIC_NAME=$(ip -o -4 addr show scope global up 2>/dev/null | \
+  awk '$2 !~ /^(veth|docker|br-|virbr|tun|tap|cni|flannel|lo|dummy)/ {print $2; exit}')
+
+export LOCAL_IP=$(ip -o -4 addr show dev "$NIC_NAME" scope global | awk '{print $4}' | cut -d/ -f1)
 export HCCL_IF_IP="${LOCAL_IP}"
 export GLOO_SOCKET_IFNAME="${NIC_NAME}"
 export TP_SOCKET_IFNAME="${NIC_NAME}"
 export HCCL_SOCKET_IFNAME="${NIC_NAME}"
+
+echo "Using NIC=${NIC_NAME} IP=${LOCAL_IP}"   # sanity-check before launching
 
 # Mooncake libs — only needed for disaggregated/KV-transfer setups; add if present.
 _MOONCAKE_DIR="${ASCEND_HOME_PATH}/ascend-toolkit/latest/python/site-packages/mooncake"

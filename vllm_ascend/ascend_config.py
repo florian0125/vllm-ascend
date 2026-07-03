@@ -274,6 +274,8 @@ class AscendConfig:
 
         self.mix_placement = additional_config.get("mix_placement", False)
         self._check_mix_placement()
+        
+        self.moe_gate_override_path = additional_config.get("moe_gate_override_path", None)
 
         self.hamming_sparse = additional_config.get("hamming_sparse", {"enabled": False, "sparse_json_location": ""})
         self.enable_hamming_sparse = self.hamming_sparse["enabled"]

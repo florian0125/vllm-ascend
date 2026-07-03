@@ -18,14 +18,15 @@
 set -uo pipefail
 
 # ─── EDIT HERE ▸ 1. WHAT TO RUN ──────────────────────────────────────────────
-MODEL="${MODEL:-/data/keyi/llms/deepseek-v4-w8a8}"       # DeepSeek-V4 W8A8 checkpoint
+MODEL="${MODEL:-/home/keyi/llms/deepseekv4-w8a8}"       # DeepSeek-V4 W8A8 checkpoint
+REMOE_GATE="${REMOE_GATE:-}"
 CARD="${CARD:-6}"                                    # NPU id (your env uses 7)
 SERVED_NAME="${SERVED_NAME:-glm-5}"                  # must match server <-> bench client
 PORT="${PORT:-7001}"
 
 # ─── EDIT HERE ▸ 2. WORKLOAD (serve client) ──────────────────────────────────
 DATASET="${DATASET:-sharegpt}"                                                                                         # random | random-mm | sharegpt | sonnet | hf | ...
-DATASET_PATH="${DATASET_PATH:-/data/keyi/llms/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json}"                     # required for non-random datasets
+DATASET_PATH="${DATASET_PATH:-/home/keyi/llms/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json}"                     # required for non-random datasets
 ILEN="${ILEN:-256}"                                  # input length  (tokens)
 OLEN="${OLEN:-128}"                                  # output length (tokens)
 NUM="${NUM:-10}"                                     # number of prompts
@@ -36,7 +37,7 @@ RATE="${RATE:-inf}"                                  # request rate req/s; inf =
 TP="${TP:-1}"                                        # --tensor-parallel-size
 DP="${DP:-1}"                                        # --data-parallel-size
 SEED="${SEED:-1024}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"                 # your V4 command used 0.9
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}"                 # your V4 command used 0.9
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"                # empty = model native
 MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-}"      # empty = vLLM default
@@ -76,8 +77,9 @@ PREDICTOR="${PREDICTOR:-fate}"                                     # existing
 
 # Checkpoint for learned predictors (e.g. mode2_pa_prevhs). Emitted into the
 # config as "expert_predictor_ckpt". Default = mode2_pa_prevhs lowrank w=2048.
-# PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/keyi/code/moe_offload/hq_v5/mode2_pa/learned_predictor_study_mode2_pa.html.ckpts_260619/pa+prevhs_prompt_std_dist_lowrank_w=2048.pt}"
-PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/keyi/code/moe_offload/hq_v5/mode2_pa/learned_predictor_study_mode2_pa.html.ckpts_260624_dump_2000/pa+prevhs_prompt_std_dist_lowrank_w=2048.pt}"
+PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/keyi/llms/ai-predictor/mode2_pa/learned_predictor_study_mode2_pa.html.ckpts_260624_dump_2000/pa+prevhs_prompt_std_dist_lowrank_w=2048.pt}"
+# PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/h50048135/pre-att-dump-bias-600_1/learned_predictor_study_mode2_pa.html.ckpts/pa+prevhs_prompt_std_dist_lowrank_w=2048.pt}"
+# PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/h50048135/pre-att-dump-bias-600_1/learned_predictor_study_mode2_pa.html.ckpts/prevpa+prevhs_prompt_std_dist_twotower_w=2048.pt}"
 
 # NEW: end-of-test hit-rate summary ([EXPERT-OFFLOAD-FINAL]). Requires the
 # seq-stats patch on the build AND CACHE_POLICY=1. Serve window: warmup=0,
@@ -164,34 +166,28 @@ build_additional_config() {
   local parts=()
   if [[ "${OFFLOAD}" == "1" ]]; then
     parts+=( "\"enable_cpu_binding\":$(bool "${CPU_BINDING}")" )
-    # NEW: proactive expert prefetch key. Appended only when PREFETCH=1 so a
-    # baseline run (PREFETCH=0) reproduces the prefetch-off JSON.
-    local prefetch_key=""
-    # NEW: expert_predictor enum key. Selects which next-layer predictor the
-    # prefetch path uses (default FATE). Emitted ONLY when PREFETCH=1 (the
-    # predictor is only consumed by the prefetch path) AND PREDICTOR is set to
-    # a non-empty value, so: (a) a PREFETCH=0 baseline keeps the prefetch-off
-    # JSON, and (b) builds without the predictor-enum patch (which would reject
-    # an unknown "expert_predictor" key) still start as long as PREDICTOR is
-    # left empty. Empty PREDICTOR -> engine default ("fate").
-    local predictor_key=""
+    local prefetch_key="" predictor_key=""
     if [[ "${PREFETCH}" == "1" ]]; then
       prefetch_key=",\"expert_prefetch_enabled\":true"
       [[ -n "${PREDICTOR}" ]] && predictor_key=",\"expert_predictor\":\"${PREDICTOR}\""
-
       [[ -n "${PREDICTOR}" && "${PREDICTOR}" != "fate" && -n "${PREDICTOR_CKPT}" ]] && \
         predictor_key="${predictor_key},\"expert_predictor_ckpt\":\"${PREDICTOR_CKPT}\""
     fi
-    # seq-stats keys appended only when SEQ_STATS=1, so SEQ_STATS=0 reproducesa
-    # the original V4-command JSON byte-for-byte (for unpatched builds).
     local seq_keys=""
     if [[ "${SEQ_STATS}" == "1" ]]; then
-      seq_keys=",\"seq_stats_num_seqs\":${SEQ_NUM}"
+      seq_keys=",\"seq_stats_num_seqs\":${LIMIT:-0}"
       [[ "${TIMING}" == "1" ]] && seq_keys="${seq_keys},\"cache_profile_timing\":true"
     fi
     parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${prefetch_key}${predictor_key},\"moe_offload_debug\":$(bool "${CACHE_DEBUG}")${seq_keys}}" )
   fi
   [[ "${WPREFETCH}" == "1" ]] && parts+=( "\"weight_prefetch_config\":{\"enabled\":true}" )
+  # NEW: ReMoE fine-tuned router-gate override. When REMOE_GATE is a non-empty
+  # path, inject moe_gate_override_path so vllm-ascend swaps the MoE gate
+  # weights in-memory at load time (no on-disk model copy). Independent of
+  # OFFLOAD, so it also works with OFFLOAD=0. Empty (default) => key omitted =>
+  # feature off, nothing overwritten. (NOTE: ADDITIONAL_CONFIG_RAW still fully
+  # overrides this — include the key yourself if you use RAW.)
+  [[ -n "${REMOE_GATE}" ]] && parts+=( "\"moe_gate_override_path\":\"${REMOE_GATE}\"" )
   [[ ${#parts[@]} -eq 0 ]] && return
   local IFS=','; printf '{%s}' "${parts[*]}"
 }

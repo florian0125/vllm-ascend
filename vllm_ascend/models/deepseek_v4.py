@@ -27,6 +27,9 @@ import math
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
+import glob
+import os
+import re
 
 import torch
 import torch.nn.functional as F
@@ -85,6 +88,8 @@ import time  # v10
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX  # v10
 from vllm_ascend.expert_offload.expert_offload_manager import (  # v10
     has_expert_offload_manager, get_expert_offload_manager)
+
+from vllm.logger import logger
 
 if vllm_version_is("0.21.0"):
     from vllm.model_executor.layers.deepseek_compressor import CompressorStateCache  # type:ignore
@@ -1135,6 +1140,34 @@ class DeepseekV2MixtureOfExperts(MixtureOfExperts):
             moe.n_physical_experts = num_physical_experts
             moe.n_redundant_experts = self.num_redundant_experts
             moe.experts.update_expert_map()
+            
+def _gate_layer_num(name: str):
+    # module-level helper (NOT a method): extracts the layer index from a
+    # tensor/param name. Ported from scripts/swap_gates.py::_layer_num.
+    m = re.search(r"(?:layers?[._])(\d+)", name) or re.search(r"(\d+)", name)
+    return int(m.group(1)) if m else None
+
+
+def _load_finetuned_gates(path: str) -> dict[int, "torch.Tensor"]:
+    # module-level helper (NOT a method). Ported from
+    # scripts/swap_gates.py::load_gates. Returns {layer_num: Tensor[E, H]}.
+    if os.path.isdir(path):
+        cand = os.path.join(path, "gate_weights.pt")
+        path = cand if os.path.exists(cand) else next(
+            iter(glob.glob(os.path.join(path, "*.pt")) +
+                 glob.glob(os.path.join(path, "*.bin"))), path)
+    state = torch.load(path, map_location="cpu")
+    if not isinstance(state, dict):
+        raise ValueError(f"[gate-override] --gates must be a dict of tensors, got {type(state)} from {path}")
+    out: dict[int, "torch.Tensor"] = {}
+    for k, v in state.items():
+        if hasattr(v, "shape") and (".gate" in k or "gate" in k):
+            ln = _gate_layer_num(k)
+            if ln is not None:
+                out[ln] = v
+    if not out:
+        raise ValueError(f"[gate-override] no gate tensors parsed from {path}")
+    return out
 
 
 class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle):
@@ -1225,6 +1258,96 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         hc_mult * hidden_size) for the MTP draft model. Populated by
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
+    
+    def _override_moe_gates(self, params_dict, loaded_params):
+        # NEW: runtime replacement of MoE router gate weights — the in-memory
+        # equivalent of scripts/swap_gates.py. Runs at the end of load_weights,
+        # after the base gate.weight tensors are already loaded onto the device.
+        # Only fires when additional_config.moe_gate_override_path is set;
+        # otherwise it's a no-op and the normal serve path is unchanged.
+        gate_path = getattr(get_ascend_config(), "moe_gate_override_path", None)
+        if not gate_path:
+            return  # feature off — leave every base weight as-is
+
+        # {layer_num: Tensor[E, H]} (typically fp32, on CPU).
+        ft = _load_finetuned_gates(gate_path)
+        logger.info(
+            "[gate-override] loaded %d fine-tuned gate(s) from %s (layers %d..%d)",
+            len(ft), gate_path, min(ft), max(ft),
+        )
+
+        # Build {layer_num: param_name} for THIS model's router gates only.
+        # Same detection as the script: name ends in '.gate.weight' and is not a
+        # 'gate_proj' expert weight. In this V4 impl every decoder layer owns a
+        # DeepseekV4MoE, so these are model.layers.{i}.mlp.gate.weight for
+        # i in 0..num_hidden_layers-1. The MTP gate lives on the separate
+        # DeepSeekV4MTP module and is intentionally NOT reachable here (MTP is
+        # out of scope per request); an MTP gate present in `ft` is reported as
+        # unused below rather than causing a failure.
+        model_gates: dict[int, str] = {}
+        for name in params_dict:
+            if name.endswith(".gate.weight") and "gate_proj" not in name:
+                ln = _gate_layer_num(name)
+                if ln is not None:
+                    model_gates[ln] = name
+
+        swapped = 0
+        for ln in sorted(model_gates):
+            if ln not in ft:
+                continue  # this layer wasn't fine-tuned (e.g. early layers) — keep base weight
+            name = model_gates[ln]
+            param = params_dict[name]
+            new = ft[ln]
+            # Exact-shape match is required (per request): a mismatch means the
+            # wrong gate file (e.g. different n_routed_experts / hidden_size).
+            # Fail loudly rather than silently corrupt routing.
+            if list(new.shape) != list(param.shape):
+                raise ValueError(
+                    f"[gate-override] shape mismatch for layer {ln} ({name}): "
+                    f"model {list(param.shape)} vs gates {list(new.shape)}"
+                )
+            # In-place copy onto the already-loaded gate param. The gate is
+            # fp32 (precast_fp32_weight) and replicated across TP/EP, so every
+            # rank holds the full [E, H] and this copy is identical per rank —
+            # no sharding needed. .to(param.dtype) matches dtype; copy_ handles
+            # the CPU->NPU transfer. Uses .data (like the sink handling above)
+            # so autograd never tracks it.
+            param.data.copy_(new.to(param.dtype).contiguous())
+            loaded_params.add(name)
+            swapped += 1
+            logger.info(
+                "[gate-override] swapped gate for layer %d -> %s %s",
+                ln, name, list(param.shape),
+            )
+
+            # --- OPTIONAL: also swap the router bias ------------------------
+            # This fine-tune only ships '.gate.weight', so the correction bias
+            # is left untouched (matches scripts/swap_gates.py). If a future
+            # fine-tune also ships '.gate.e_score_correction_bias', load it into
+            # a second dict `ft_bias` exactly like `ft` above, then uncomment:
+            #
+            #     bias_name = name.replace(".gate.weight",
+            #                              ".gate.e_score_correction_bias")
+            #     if ln in ft_bias and bias_name in params_dict:
+            #         bparam = params_dict[bias_name]
+            #         nb = ft_bias[ln]
+            #         if list(nb.shape) != list(bparam.shape):
+            #             raise ValueError(
+            #                 f"[gate-override] bias shape mismatch layer {ln}: "
+            #                 f"{list(bparam.shape)} vs {list(nb.shape)}")
+            #         bparam.data.copy_(nb.to(bparam.dtype).contiguous())
+            #         loaded_params.add(bias_name)
+            #         logger.info("[gate-override] swapped gate BIAS for layer %d", ln)
+            # ----------------------------------------------------------------
+
+        unused = sorted(set(ft) - set(model_gates))
+        logger.info(
+            "[gate-override] done: %d gate(s) overwritten in this model; "
+            "%d fine-tuned gate(s) not present in this model.",
+            swapped, len(unused),
+        )
+        if unused:
+            logger.info("[gate-override] unused fine-tuned gate layers: %s", unused)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
@@ -1446,4 +1569,10 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
 
+        # after the base weights are loaded, overwrite the fine-tuned MoE
+        # router gates in-memory (runtime swap_gates). No-op unless
+        # additional_config.moe_gate_override_path is set. Placed here so it
+        # runs once per model on every rank, with params already on-device.
+        self._override_moe_gates(params_dict, loaded_params)
+        
         return loaded_params
