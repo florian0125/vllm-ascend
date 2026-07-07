@@ -802,11 +802,17 @@ class ExpertOffloadConfig:
         # path to the learned-predictor checkpoint (.pt). Required
         # only for learned predictors (e.g. mode2_pa_prevhs); ignored for fate.
         "expert_predictor_ckpt": None,
-        # NEW: learned (NN) predictor selection mode. True = reproduce V4-Flash
+        # learned (NN) predictor selection mode. True = reproduce V4-Flash
         # inference selection on the predicted logits (sigmoid + e_score_correction_bias
         # on scores + grouped top-k). False = cheap plain top_k on the raw logits.
         # Ignored by FATE (FATE always uses its own CPU softmax+top_k approximation).
         "expert_predictor_exact_select": True,
+        # Cap the number of experts each prefetch LOADS to the top-N by
+        # predicted score (fate + both learned predictors). None = no cap (load
+        # every predicted miss, current behavior). 1 = only the single highest-score
+        # missing expert; 2 = top-2; etc. Uncapped routed experts still load
+        # on-demand in update_weights, so this never mis-routes.
+        "expert_prefetch_max": None,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -894,6 +900,15 @@ class ExpertOffloadConfig:
             self.config["expert_predictor_ckpt"], str
         ):
             raise TypeError("expert_predictor_ckpt must be a string or null")
+        
+        # validate the prefetch cap. None = no cap; otherwise a positive int.
+        pm = self.config["expert_prefetch_max"]
+        if pm is not None:
+            # bool is an int subclass — reject True/False explicitly.
+            if not isinstance(pm, int) or isinstance(pm, bool):
+                raise TypeError("expert_prefetch_max must be an integer or null")
+            if pm < 1:
+                raise ValueError(f"expert_prefetch_max must be >= 1; got {pm}")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

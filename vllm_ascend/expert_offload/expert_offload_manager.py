@@ -257,9 +257,19 @@ class ExpertOffloadManager:
         )
         # AI driver state. Active for any learned predictor
         self._ai_active = getattr(self._predictor, "uses_model_forward_driver", False)
+        # next-layer driver flag (prevpa+prevhs). Selects the capture-then-
+        # predict-n+1 flow over the original predict-ℓ-before-attn flow.
+        self._ai_predicts_next = getattr(self._predictor, "predicts_next_layer", False)
+
         self._exact_select = self.offload_config.expert_predictor_exact_select
+        # prefetch cap (top-N experts by predicted score). None = no cap.
+        # Read once here; _do_prefetch applies it for every predictor.
+        self._prefetch_max = self.offload_config.expert_prefetch_max
         self._ai_pa_buf = None             # [max_tokens, H] fp32 — pre_attn[ℓ]
         self._ai_ri_buf = [None, None]     # 2x [max_tokens, H] fp32 — router ping-pong
+        # [max_tokens, H] fp32 — current-layer router_input[n] for the
+        # next-layer driver (no ping-pong: consumed within layer n).
+        self._ai_ri_cur_buf = None
         self._ai_pending: dict[int, dict] = {}
 
     # ------------------------------------------------------------------ #
@@ -429,6 +439,10 @@ class ExpertOffloadManager:
                         torch.zeros([mt, hidden_dim], dtype=torch.float32, device="npu"),
                         torch.zeros([mt, hidden_dim], dtype=torch.float32, device="npu"),
                     ]
+                # current-layer router buffer for the next-layer driver.
+                if "router_input" in spec:
+                    self._ai_ri_cur_buf = torch.zeros(
+                        [mt, hidden_dim], dtype=torch.float32, device="npu")
         t7 = time.perf_counter()
         logger.info(
             "[OFFLOAD] finalize breakdown: process_weights=%.1fs "
@@ -953,7 +967,7 @@ class ExpertOffloadManager:
         with torch_npu.npu.stream(self.load_stream):
             if self.cache_policy is not None:
                 router_scores = topk_weights_h.tolist() if topk_weights_h is not None else None
-                # NEW (#3): time observe() as the "lrc" stage. observe() is pure-CPU
+                # time observe() as the "lrc" stage. observe() is pure-CPU
                 # (the per-token EMA loop over num_experts + recent-window bookkeeping),
                 # so perf_counter around it is the pure cost — no device sync needed.
                 # Recorded into _t_pending (prehook): harvested at the hit just below,
@@ -977,7 +991,7 @@ class ExpertOffloadManager:
                     slot_owner[slot] = eid
 
             on_device = set(slot_owner.values())
-            already_there = needed & on_device           # no-op
+            already_there = needed & on_device             # no-op
             need_to_load = needed - already_there          # CPU→NPU copy
             if self.cache_policy is not None:
                 self._record_cache_stats(layer_idx, already_there, need_to_load,
@@ -1000,7 +1014,7 @@ class ExpertOffloadManager:
 
             # start the load timer just before the copy loop; read it after
             # the existing load_stream.synchronize() (no extra sync introduced).
-            # CHANGE (#6): renamed local _time_upload -> _time_miss_load and the
+            # renamed local _time_upload -> _time_miss_load and the
             # recorded metric "upload" -> "miss_load" (see __init__/labels). This
             # measures the on-demand miss path = evict-pick + scale/offset + weight
             # H2D, not a pure transfer.
@@ -1024,7 +1038,7 @@ class ExpertOffloadManager:
                     victim = None
 
                 if slot < 0:
-                    # CHANGE (#11): unconditional WARNING — see Group 2. This is the
+                    # unconditional WARNING — see Group 2. This is the
                     # silent mis-route path (unmapped expert -> clamp(min=0) -> expert 0).
                     logger.warning(
                         "[UPDATE-W] l=%d NO SLOTS: %d experts could not be loaded; "
@@ -1198,7 +1212,7 @@ class ExpertOffloadManager:
             # reading hidden_states and touching next layer's weights.
             compute_event.synchronize()
 
-            # NEW: EAGER-path profiling gate. Mirrors _record_layer_time's gate
+            # EAGER-path profiling gate. Mirrors _record_layer_time's gate
             # exactly (profiling + cache policy + summary not yet printed) so
             # the stash can never grow without a consumer. When off, the timer
             # calls below are skipped entirely — zero overhead.
@@ -1227,7 +1241,9 @@ class ExpertOffloadManager:
 
             # Execute the prefetch (H2D copies)
             completion_event = self._do_prefetch(next_idx, predicted,
-                                                 log2phy_np, use_sleep=False,
+                                                 log2phy_np,
+                                                 priority=predicted,   # FATE list is score-ordered
+                                                 use_sleep=False,
                                                  record_profiling=_record_profiling,
                                                  compute_ms=_compute_ms)
 
@@ -1244,6 +1260,7 @@ class ExpertOffloadManager:
         next_idx: int,
         predicted_experts: set[int],
         log2phy_np,
+        priority: list[int] | None = None,
         use_sleep: bool = True,
         record_profiling: bool = False,
         compute_ms: float = 0.0,
@@ -1275,6 +1292,35 @@ class ExpertOffloadManager:
                 stashed alongside the H2D time.
         """
         next_layer = self.moe_layers[next_idx]
+        # accept either a set (learned drivers) or an ordered list (FATE) —
+        # coerce to a set for the membership math below; `priority` carries order.
+        predicted_experts = set(predicted_experts)
+        
+        # NEW: drop any predicted id outside the model's physical expert range
+        # [0, num_total_experts). The per-layer CPU expert buffers indexed below
+        # (w13_weights_cpu[next_idx][eid], w2_weights_cpu[next_idx][eid], the
+        # scale_cpu_buffers/offset_cpu_buffers[attr][next_idx][eid]) have inner
+        # length == num_total_experts (init_layer_cpu_buffers builds range(ntotal),
+        # ntotal = layer.global_num_experts). A learned predictor whose head width
+        # meta["E"] exceeds that count can select such ids and raise
+        # "IndexError: list index out of range" in the W8A8 copy loop. Out-of-range
+        # ids map to no real expert, so dropping them is correct for prefetch; a
+        # large drop count means a checkpoint/expert-space mismatch (see the
+        # register_from_model E-vs-model warning). Behavior-neutral for matched
+        # checkpoints (fate, pa+prevhs): _bad is empty, nothing changes.
+        _nt = self.num_total_experts
+        if _nt is not None:
+            _bad = {e for e in predicted_experts if e < 0 or e >= _nt}
+            if _bad:
+                if not getattr(self, "_warned_oob_predict", False):
+                    logger.warning(
+                        "[AI-PRED] dropping %d predicted expert id(s) outside "
+                        "[0,%d) at layer %d (e.g. %s); predictor head width "
+                        "(meta['E']) likely exceeds the model's expert count — "
+                        "check the checkpoint.",
+                        len(_bad), _nt, next_idx, sorted(_bad)[:8])
+                    self._warned_oob_predict = True
+                predicted_experts -= _bad
 
         # Copy out so the async H2D write-back (next_layer.log2phy.copy_)
         # reads an independent buffer.  In graph mode log2phy_np is the shared
@@ -1291,6 +1337,24 @@ class ExpertOffloadManager:
         on_device = set(slot_owner.values())
         need_to_load = predicted_experts - on_device
         already_there = on_device & predicted_experts
+        
+        # cap the LOADS to the top expert_prefetch_max by predicted score.
+        # Only need_to_load is trimmed — predicted_experts / already_there / the
+        # protected set and accuracy stats still reflect the full prediction, and
+        # the dropped experts still load on-demand in update_weights (no mis-route).
+        # Ranking source: the caller's `priority` (highest-score-first); if absent,
+        # fall back to LRC hotness so any un-plumbed path still caps sensibly.
+        if self._prefetch_max is not None and len(need_to_load) > self._prefetch_max:
+            if priority:
+                ranked = [e for e in priority if e in need_to_load]
+            elif self.cache_policy is not None:
+                ranked = sorted(
+                    need_to_load,
+                    key=lambda e: self.cache_policy.hotness(next_idx, e),
+                    reverse=True)
+            else:
+                ranked = list(need_to_load)
+            need_to_load = set(ranked[:self._prefetch_max])
 
         if not need_to_load:
             # prediction still happened — record it so the prediction
@@ -1458,29 +1522,24 @@ class ExpertOffloadManager:
     def _ai_layer_index(self, experts) -> int:
         return self.moe_layers.index(experts)
 
-    def _ai_select_topk(self, experts, logits: torch.Tensor) -> torch.Tensor:
-        """Predicted router logits [n, E] -> predicted expert ids [n, top_k].
+    def _ai_select_topk(self, experts, logits: torch.Tensor):
+        """Predicted router logits [n, E] -> (topk_ids [n, top_k], expert_scores).
+
+        expert_scores is [E] = the per-expert priority (max selection score over
+        tokens) used to rank the prefetch cap, or None when no cap is active
+        (self._prefetch_max is None) so we skip the extra reduce. Selection logic
+        is unchanged from before.
 
         exact mode (self._exact_select, default): reproduce the selection V4-Flash
-        inference uses, so the predicted set matches what the real router would pick
-        from these logits. Mirrors experts_selector._native_select_experts (ids path)
-        / the fused moe_gating_top_k(norm_type=1, group_select_mode=1, bias_opt=bias):
-          1. score with the layer's scoring_func (sigmoid for V4),
-          2. ADD the gate's e_score_correction_bias to the SCORES (changes which
-             experts win, not the weights),
-          3. group-mask to the top `topk_group` of `num_expert_group` groups,
-          4. top_k on the masked scores.
-        Reuses the model's own _native_grouped_topk so the grouping can't drift from
-        inference (lazy import to avoid a manager<->experts_selector cycle). Ids only —
-        weights / renormalize / routed_scaling_factor don't affect prefetch.
-
-        approximation mode (not self._exact_select): plain top_k on the raw logits —
-        what FATE-style predictors do. (sigmoid is monotonic, so plain top_k already
-        equals "sigmoid then top_k"; the bias + group mask are what exact mode adds.)
+        inference uses ... (existing docstring body unchanged) ...
         """
         top_k = self._predictor.top_k
+        want_scores = self._prefetch_max is not None          # only when capping
         if not self._exact_select:
-            return logits.topk(top_k, dim=-1).indices              # [n, k]
+            topk_ids = logits.topk(top_k, dim=-1).indices              # [n, k]
+            # raw logits are the scores in approx mode (sigmoid is monotonic).
+            scores_1d = logits.amax(dim=0) if want_scores else None    # [E] | None
+            return topk_ids, scores_1d
 
         sf = getattr(experts, "scoring_func", "sigmoid")
         if sf == "sigmoid":
@@ -1500,15 +1559,24 @@ class ExpertOffloadManager:
         n_group = getattr(experts, "num_expert_group", None) or 1
         topk_group = getattr(experts, "topk_group", None) or 1
         if getattr(experts, "use_grouped_topk", False) and n_group > 1:
-            # Exact group mask (max-per-group, keep top `topk_group` groups, zero the
-            # rest), reusing the model's function so it matches inference exactly.
+            # Exact group mask, reusing the model's function so it matches inference.
             from vllm_ascend.ops.fused_moe.experts_selector import _native_grouped_topk
             scores = _native_grouped_topk(scores, n_group, topk_group)
 
-        # logger.info("ROUTE n_group=%s topk_group=%s scoring=%s", n_group, topk_group, sf)
-        # ROUTE n_group=1 topk_group=1 scoring=sqrtsoftplus
-
-        return scores.to(torch.float32).topk(top_k, dim=-1, sorted=False).indices  # [n, k]
+        scores = scores.to(torch.float32)
+        topk_ids = scores.topk(top_k, dim=-1, sorted=False).indices    # [n, k]
+        # per-expert priority = best (post-bias/group-mask) score over tokens.
+        scores_1d = scores.amax(dim=0) if want_scores else None        # [E] | None
+        return topk_ids, scores_1d
+    
+    def _order_predicted_by_score(self, topk_ids: torch.Tensor,
+                                  expert_scores: torch.Tensor) -> list[int]:
+        """Unique predicted experts ordered by DESC score (highest first), as a host
+        list, for the prefetch cap. topk_ids [n, k]; expert_scores [E]. Only called
+        when a cap is active. One small D2H (the ordered id list)."""
+        uniq = torch.unique(topk_ids)                                    # predicted experts
+        order = uniq[torch.argsort(expert_scores[uniq], descending=True)]
+        return order.tolist()
      
     def ai_predict_start(self, experts, pre_attn):
         """Before attention: predict THIS layer's experts on the prefetch stream
@@ -1546,7 +1614,7 @@ class ExpertOffloadManager:
         # summary not yet printed) so the stash can never grow without a consumer.
         _record_profiling = (self._profile_timing and self.cache_policy is not None
                             and not self._seq_stats_done)
-        # NEW: NPU timing events bracketing the predict (the pf_compute source for
+        # NPU timing events bracketing the predict (the pf_compute source for
         # the learned predictor). Only created when profiling — zero overhead off.
         predict_ev0 = predict_ev1 = None
         if _record_profiling:
@@ -1562,16 +1630,13 @@ class ExpertOffloadManager:
             if predict_ev0 is not None:
                 predict_ev0.record()
             logits = predictor.predict_logits_npu(head_idx, ctx)      # [n, E]
-            # CHANGE: was `topk_ids = logits.topk(predictor.top_k, dim=-1).indices`.
-            # Route the predicted logits through the selection V4 inference actually
-            # uses (sigmoid + e_score_correction_bias on scores + grouped top_k) when
-            # expert_predictor_exact_select is on; plain top_k otherwise. Runs here on
-            # the prefetch stream inside the predict-timing bracket, so its (small) NPU
-            # cost is folded into pf_compute — no separate stage/sync.
-            topk_ids = self._ai_select_topk(experts, logits)          # [n, k]
+            #  _ai_select_topk now also returns the per-expert priority
+            # scores (None when no cap) for the prefetch cap ranking.
+            topk_ids, pri_scores = self._ai_select_topk(experts, logits)  # [n,k], [E]|None
             if predict_ev1 is not None:
                 predict_ev1.record()
         self._ai_pending[moe_idx] = {"moe_idx": moe_idx, "topk_ids": topk_ids,
+                                    "pri_scores": pri_scores,
                                     "predict_ev0": predict_ev0,
                                     "predict_ev1": predict_ev1}
         return self._ai_pending[moe_idx]
@@ -1583,20 +1648,28 @@ class ExpertOffloadManager:
         if ctx is None:
             return
         moe_idx = ctx["moe_idx"]
+        topk_ids = ctx["topk_ids"]
         # .tolist() blocks until the predict finishes -> by the line after, the
         # predict's NPU timing events are complete and elapsed_time() won't block.
-        predicted = set(int(e) for e in ctx["topk_ids"].flatten().tolist())
-    
+        predicted = set(int(e) for e in topk_ids.flatten().tolist())
+
+        # highest-score-first order for the prefetch cap (no-op when uncapped —
+        # pri_scores is None unless self._prefetch_max is set).
+        priority = None
+        pri_scores = ctx.get("pri_scores")
+        if self._prefetch_max is not None and pri_scores is not None:
+            priority = self._order_predicted_by_score(topk_ids, pri_scores)
+
         compute_ms = 0.0
         ev0 = ctx.get("predict_ev0")
         ev1 = ctx.get("predict_ev1")
         if ev0 is not None and ev1 is not None:
             # NPU time of the predict (runs on _prefetch_stream, overlapping attn).
             compute_ms = ev0.elapsed_time(ev1)
-    
+
         _record_profiling = (self._profile_timing and self.cache_policy is not None
                             and not self._seq_stats_done)
-    
+
         next_layer = self.moe_layers[moe_idx]
         log2phy_np = next_layer.log2phy.cpu().numpy()
         # _do_prefetch stashes {predicted, ..., compute_ms, h2d_ms}; the main thread
@@ -1605,6 +1678,7 @@ class ExpertOffloadManager:
         # the metric.
         event = self._do_prefetch(
             moe_idx, predicted, log2phy_np,
+            priority=priority,                    # NEW: cap ranking (None when uncapped)
             use_sleep=False, record_profiling=_record_profiling,
             compute_ms=compute_ms,
         )
@@ -1615,6 +1689,144 @@ class ExpertOffloadManager:
         if done is not None:
             done.set()
         self._ai_pending.pop(moe_idx, None)
+        
+    def ai_capture_pre_attn(self, experts, pre_attn: torch.Tensor):
+        """Before attention (next-layer driver): stash pre_attn[n] for the heads>=1
+        next-layer predicts (run later in fused_moe) AND, at the first covered layer
+        (head 0), issue the head-0 CURRENT-layer predict+prefetch from this layer's
+        OWN pre_attn (router half zeroed) — matching training's first-layer feature
+        (build_mode_base out[:,0,:H]=pa[0]). Eager + decode only."""
+        if not self._ai_active or not self._ai_predicts_next or _EXTRA_CTX.capturing:
+            return
+        predictor = self._predictor
+        if not getattr(predictor, "ready", False):
+            return
+        if "pre_attn" not in predictor.input_spec:
+            return
+        n = pre_attn.shape[0]
+        if n > self.offload_threshold:                 # prefill / large batch
+            return
+        moe_idx = self._ai_layer_index(experts)
+        head_here = predictor.head_index(moe_idx)      # this layer's head (0 => head-0 target)
+        head_next = predictor.head_index(moe_idx + 1)  # next layer's head (heads>=1 target)
+        # Capture pre_attn[moe_idx] iff it feeds a predict: the head-0 current-layer
+        # predict of THIS layer (head_here == 0) or the next-layer predict of
+        # moe_idx+1 (head_next >= 1)
+        if head_here != 0 and (head_next is None or head_next == 0):
+            return
+        self._ai_pa_buf[:n].copy_(pre_attn.to(torch.float32))
+
+        if head_here == 0:
+            # First covered layer: predict THIS layer (head 0) from its own pre_attn, router half zeroed
+            copy_event = torch_npu.npu.current_stream().record_event()
+            self._ai_predict_and_prefetch(moe_idx, 0, n, self._ai_pa_buf[:n],
+                                          None, copy_event)
+
+    def ai_predict_prefetch_next(self, experts, router_input: torch.Tensor):
+        """After layer n's on-demand load (update_weights): predict layer n+1's
+        experts from pre_attn[n] ‖ router_input[n] and prefetch them so the H2D
+        overlaps layer n's MoE MLP. Eager + decode only. Handshake keyed by n+1,
+        consumed by update_weights at n+1."""
+        if not self._ai_active or not self._ai_predicts_next or _EXTRA_CTX.capturing:
+            return
+        predictor = self._predictor
+        if not getattr(predictor, "ready", False):
+            return
+        n = router_input.shape[0]
+        if n > self.offload_threshold:                 # prefill / large batch
+            return
+        moe_idx = self._ai_layer_index(experts)
+        next_idx = moe_idx + 1
+        if next_idx >= len(self.moe_layers):
+            return                                     # last layer — nothing to prefetch
+
+        head_idx = predictor.head_index(next_idx)      # head for the predicted layer n+1
+        if head_idx is None:
+            return                                     # n+1 is a leading hash/dense layer
+        if head_idx == 0:
+            # (the first MoE layer) is a CURRENT-layer prediction
+            return
+        spec = predictor.input_spec
+
+        pa = None
+        if "pre_attn" in spec:
+            pa = self._ai_pa_buf[:n]                   # holds pre_attn[n] (captured pre-attn)
+
+        router_cur = None
+        # head 0 has no trained predecessor router input -> zero half (training-
+        # faithful). heads >=1 use the real current-layer router input (=x).
+        if "router_input" in spec and head_idx > 0:
+            router_cur = self._ai_ri_cur_buf[:n]
+            router_cur.copy_(router_input.to(torch.float32))
+
+        # One event on the compute stream orders BOTH the pre_attn copy (queued
+        # before attention) and the router copy just above before the prefetch
+        # stream reads them (FIFO on the same stream).
+        copy_event = torch_npu.npu.current_stream().record_event()
+        self._ai_predict_and_prefetch(next_idx, head_idx, n, pa, router_cur, copy_event)
+            
+    def _ai_predict_and_prefetch(self, target_idx, head_idx, n, pa, router_cur,
+                                 copy_event):
+        """Shared predict -> select -> prefetch for BOTH twotower paths.
+
+        Predicts head `head_idx` (already offset-mapped) on the prefetch stream,
+        selects with `target_idx`'s gate config (activation + per-layer bias +
+        grouped-topk), prefetches `target_idx`, and keys the prefetch handshake by
+        `target_idx` (consumed by update_weights at `target_idx`). Callers stage
+        `pa`/`router_cur` and record `copy_event` on the compute stream first.
+
+          - head 0 (first covered layer): current-layer predict from this layer's
+            OWN pre_attn (router_cur=None -> assemble zeros the half), issued from
+            ai_capture_pre_attn so the H2D overlaps this layer's attention;
+          - heads >= 1: next-layer predict from pre_attn[n] ‖ router_input[n],
+            issued from ai_predict_prefetch_next so the H2D overlaps this layer's GMM.
+        """
+        target_layer = self.moe_layers[target_idx]
+        _record_profiling = (self._profile_timing and self.cache_policy is not None
+                             and not self._seq_stats_done)
+        predict_ev0 = predict_ev1 = None
+        if _record_profiling:
+            predict_ev0 = torch_npu.npu.Event(enable_timing=True)
+            predict_ev1 = torch_npu.npu.Event(enable_timing=True)
+
+        self._prefetch_layer_done[target_idx] = threading.Event()
+        ctx = AIPredictCtx(layer_idx=head_idx, n_tokens=n,
+                           pre_attn=pa, router_input=router_cur)
+
+        with torch_npu.npu.stream(self._prefetch_stream):
+            self._prefetch_stream.wait_event(copy_event)
+            if predict_ev0 is not None:
+                predict_ev0.record()
+            logits = self._predictor.predict_logits_npu(head_idx, ctx)     # [n, E]
+            topk_ids, pri_scores = self._ai_select_topk(target_layer, logits)
+            if predict_ev1 is not None:
+                predict_ev1.record()
+
+        # .tolist() blocks until the predict completes; the H2D issued by
+        # _do_prefetch below runs on _prefetch_stream and overlaps the caller's
+        # subsequent compute (attention for head 0, GMM for heads >= 1).
+        predicted = set(int(e) for e in topk_ids.flatten().tolist())
+        priority = None
+        if self._prefetch_max is not None and pri_scores is not None:
+            priority = self._order_predicted_by_score(topk_ids, pri_scores)
+
+        compute_ms = 0.0
+        if predict_ev0 is not None and predict_ev1 is not None:
+            compute_ms = predict_ev0.elapsed_time(predict_ev1)
+
+        log2phy_np = target_layer.log2phy.cpu().numpy()
+        event = self._do_prefetch(
+            target_idx, predicted, log2phy_np,
+            priority=priority,
+            use_sleep=False, record_profiling=_record_profiling,
+            compute_ms=compute_ms,
+        )
+        with self._prefetch_state_lock:
+            if event is not None:
+                self._prefetch_layer_npu_event[target_idx] = event
+        done = self._prefetch_layer_done.get(target_idx)
+        if done is not None:
+            done.set()
 
     def ai_save_router_input(self, experts, router_input: torch.Tensor):
         """Post-attention: copy this layer's gate input into ping-pong slot ℓ%2
@@ -1630,7 +1842,7 @@ class ExpertOffloadManager:
         if n > self.offload_threshold:
             return
         moe_idx = self._ai_layer_index(experts)
-        if self._predictor.head_index(moe_idx) is None:   # <-- NEW: don't save for leading layers
+        if self._predictor.head_index(moe_idx) is None:   # <-- don't save for leading layers
             return
         self._ai_ri_buf[moe_idx % 2][:n].copy_(router_input.to(torch.float32))
 
@@ -1735,6 +1947,7 @@ class ExpertOffloadManager:
             self._prefetch_stream.wait_event(compute_event)
             completion_event = self._do_prefetch(
                 next_idx, predicted, self._prefetch_log2phy_np,
+                priority=predicted,               # FATE list is score-ordered
                 use_sleep=False)
 
         # Store completion event for update_weights() to wait on.
@@ -2168,7 +2381,7 @@ class ExpertOffloadManager:
                         cells += ("%*.3f" % (col, s / c)) if c else ("%*s" % (col, "-"))
                     lines += ["     %-6s" % ("L%02d" % li) + cells]
 
-            # NEW: prefetch accuracy fractions (0..1), printed separately from
+            # prefetch accuracy fractions (0..1), printed separately from
             # the ms table. Same over-steps / over-windows aggregation; reuses
             # ns (total measured steps) from above.
             if any(self._t_sum_win[mt] for mt in self._t_rate_metrics):
@@ -2232,7 +2445,7 @@ class ExpertOffloadManager:
                        % (self._t_label[mt], self._t_sum_total[mt] / ns)]
                 md += ["| %s ms over steps (avg/med/min/max) | %.3f / %.3f / %.3f / %.3f |"
                        % (self._t_label[mt], step[0], step[1], step[2], step[3])]
-            # NEW: fraction metrics get fraction rows (no "ms").
+            # fraction metrics get fraction rows (no "ms").
             for mt in self._t_rate_metrics:
                 if not self._t_sum_win[mt]:
                     continue

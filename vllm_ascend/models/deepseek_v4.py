@@ -870,7 +870,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # NEW (#2): one manager handle for all the timing/prefetch hooks below, plus a
+        # one manager handle for all the timing/prefetch hooks below, plus a
         # small local helper for the "hc" stage timer (nullcontext when there's no
         # offload manager; time_stage itself no-ops off profiling/large-batch).
         _eom = None
@@ -891,9 +891,16 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         _ai_ctx = None
         if _eom is not None and getattr(_eom, "_ai_active", False):
-            _ai_ctx = _eom.ai_predict_start(self.mlp.experts, hidden_states)
+            # split by driver mode. The next-layer driver (prevpa+prevhs)
+            # only CAPTURES pre_attn[n] here; it predicts n+1 later in fused_moe
+            # after the on-demand load. The current-layer driver (pa+prevhs) keeps
+            # predicting layer ℓ here, before attention.
+            if getattr(_eom, "_ai_predicts_next", False):
+                _eom.ai_capture_pre_attn(self.mlp.experts, hidden_states)
+            else:
+                _ai_ctx = _eom.ai_predict_start(self.mlp.experts, hidden_states)
 
-        # NEW (#4): pure-isolation prerequisite. Drain the prefetch/load streams (and,
+        # pure-isolation prerequisite. Drain the prefetch/load streams (and,
         # for FATE, the background worker for this layer) so the stage timers below
         # measure pure cost. Must run AFTER ai_predict_start (so the NN predict it
         # launched is drained) and BEFORE the attention timer. No-op off profiling.
@@ -914,6 +921,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             _atmgr.record_attention_time(self.mlp.experts, (time.perf_counter() - _t_attn) * 1000.0)
 
         if _ai_ctx is not None:
+            # Current-layer driver only; _ai_ctx stays None for the next-layer driver.
             _eom.ai_prefetch_finish(_ai_ctx)
 
         with _hc():  # NEW (#2): hc_post(attn)
@@ -924,10 +932,14 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(hidden_states)
 
         if _eom is not None and getattr(_eom, "_ai_active", False):
-            _eom.ai_save_router_input(self.mlp.experts, hidden_states)
+            # only the current-layer driver saves router_input here (for the
+            # NEXT layer's predict). The next-layer driver reads the current
+            # router_input directly in fused_moe (= x), so it skips this save.
+            if not getattr(_eom, "_ai_predicts_next", False):
+                _eom.ai_save_router_input(self.mlp.experts, hidden_states)
 
         hidden_states = self.mlp(hidden_states)
-        # NEW (#2): hc_post(ffn) runs AFTER mlp (i.e. after the cache-hit point), so
+        # hc_post(ffn) runs AFTER mlp (i.e. after the cache-hit point), so
         # record it post-hit directly into _t_step (post=True) for same-layer/same-step
         # attribution.
         with _hc(post=True):
@@ -1149,24 +1161,42 @@ def _gate_layer_num(name: str):
 
 
 def _load_finetuned_gates(path: str) -> dict[int, "torch.Tensor"]:
-    # module-level helper (NOT a method). Ported from
-    # scripts/swap_gates.py::load_gates. Returns {layer_num: Tensor[E, H]}.
+    # Ported from scripts/swap_gates.py::load_gates. Handles BOTH:
+    #   (1) trainer checkpoint  {"gates": {layer_idx: W}, "opt": ...}  (int keys)
+    #   (2) flat gate dump      {"...gate.weight": W}                  (str keys)
     if os.path.isdir(path):
         cand = os.path.join(path, "gate_weights.pt")
         path = cand if os.path.exists(cand) else next(
             iter(glob.glob(os.path.join(path, "*.pt")) +
                  glob.glob(os.path.join(path, "*.bin"))), path)
-    state = torch.load(path, map_location="cpu")
+    # weights_only=False: trainer ckpts carry optimizer state / non-tensor objects.
+    state = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(state, dict):
         raise ValueError(f"[gate-override] --gates must be a dict of tensors, got {type(state)} from {path}")
+
     out: dict[int, "torch.Tensor"] = {}
-    for k, v in state.items():
-        if hasattr(v, "shape") and (".gate" in k or "gate" in k):
-            ln = _gate_layer_num(k)
+
+    # (1) trainer format: gates nested under "gates", keyed by layer index.
+    inner = state.get("gates") if isinstance(state.get("gates"), dict) else None
+    if inner is not None:
+        for k, v in inner.items():
+            if not hasattr(v, "shape"):
+                continue
+            ln = k if isinstance(k, int) else _gate_layer_num(str(k))
             if ln is not None:
                 out[ln] = v
+
+    # (2) flat format: top-level tensor-name -> weight.
     if not out:
-        raise ValueError(f"[gate-override] no gate tensors parsed from {path}")
+        for k, v in state.items():
+            if hasattr(v, "shape") and "gate" in str(k):
+                ln = _gate_layer_num(str(k))
+                if ln is not None:
+                    out[ln] = v
+
+    if not out:
+        raise ValueError(f"[gate-override] no gate tensors parsed from {path} "
+                         f"(top-level keys: {list(state.keys())[:8]})")
     return out
 
 
@@ -1260,7 +1290,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         return getattr(self.model, "_mtp_hidden_buffer", None)
     
     def _override_moe_gates(self, params_dict, loaded_params):
-        # NEW: runtime replacement of MoE router gate weights — the in-memory
+        # runtime replacement of MoE router gate weights — the in-memory
         # equivalent of scripts/swap_gates.py. Runs at the end of load_weights,
         # after the base gate.weight tensors are already loaded onto the device.
         # Only fires when additional_config.moe_gate_override_path is set;

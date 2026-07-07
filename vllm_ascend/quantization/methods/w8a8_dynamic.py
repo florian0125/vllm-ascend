@@ -257,8 +257,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 f"zero_expert_type={zero_expert_type}"
             )
 
-        # v10: resolve a timing handle on the decode path (x.size(0) == num_tokens,
-        # known before select_experts). Eager only.
+        # Resolve a timing handle on the decode path, Eager only.
         _tmgr = None
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
@@ -329,6 +328,9 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             num_tokens = topk_ids.size(0)
             mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
                                hidden_states=x)
+            # next-layer learned predictor
+            if getattr(mgr, "_ai_predicts_next", False):
+                mgr.ai_predict_prefetch_next(layer, x)
             if num_tokens > mgr.offload_threshold and mgr._prefill_initialized and not mgr._skip_prefill:
                 use_prefill_pool = True
                 try:

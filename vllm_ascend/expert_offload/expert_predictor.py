@@ -217,7 +217,7 @@ class FATEPredictor(ExpertPredictor):
 
     def predict_from_device(
         self, layer_idx: int, hidden_states: torch.Tensor
-    ) -> set[int] | None:
+    ) -> list[int] | None:                     # ordered list (was set[int])
         # Early-out BEFORE the .cpu() (last layer / missing gate) so the last
         # layer never pays an unnecessary D2H.
         next_idx = layer_idx + 1
@@ -232,7 +232,7 @@ class FATEPredictor(ExpertPredictor):
 
     def predict_from_host(
         self, layer_idx: int, hs_cpu: torch.Tensor
-    ) -> set[int] | None:
+    ) -> list[int] | None:                     # CHANGE: ordered list (was set[int])
         next_idx = layer_idx + 1
         if next_idx >= len(self.mgr.moe_layers):
             return None  # last layer — nothing to prefetch
@@ -242,19 +242,17 @@ class FATEPredictor(ExpertPredictor):
         if gate_w is None:
             return None
 
-        # NOTE (#7): INTENTIONAL SIMPLIFICATION. The model routes with grouped-topk
-        # (n_group/topk_group), the configured scoring_func, and e_score_correction_bias
-        # (see DeepseekV4MoE select_experts args). This predictor uses plain softmax+topk
-        # as a cheap proxy (FATE, arXiv:2502.12224). So pred_acc here is capped by BOTH
-        # the cross-layer hidden-state proxy AND this scorer mismatch — do not read a low
-        # FATE pred_acc as purely a proxy-quality signal. The learned (NN) predictor is
-        # trained against the true routed set and does not carry this mismatch.
+        # INTENTIONAL SIMPLIFICATION. ... (existing note unchanged) ...
         # hs_cpu is fp32 on CPU; gate_w is fp32 on CPU.
         router_logits = F.linear(hs_cpu, gate_w)  # [num_tokens, n_experts]
         # Simplified routing: softmax + topk (approximation).
         probs = router_logits.softmax(dim=-1)
         _, topk_ids = probs.topk(self.mgr.topk, dim=-1)
-        return set(topk_ids.flatten().tolist())
+        # return predicted experts ORDERED by DESC aggregate score
+        uniq = torch.unique(topk_ids)
+        agg = probs.amax(dim=0)                                      # [E] best prob per expert
+        order = uniq[torch.argsort(agg[uniq], descending=True)]
+        return order.tolist()
 
     def register_from_model(self, model) -> None:
         # FATE's parameters are the per-layer gate weights, kept on CPU (its
@@ -297,11 +295,31 @@ class _LowRankHead(_PredictorHead):
         h = F.layer_norm(h, (self.width,))
         h = F.gelu(h)
         return h @ self.Wo[head_idx] + self.bo[head_idx]      # [n, E]
+    
+    
+class _TwoTowerHead(_PredictorHead):
+    """TwoTower / retrieval head: per-layer query projection q = LN(x·P + bp)
+    and learned per-layer expert embeddings Emb[E,d]; score(e) = q · Emb_e.
+    Mirrors moe_predictor_study_mode2_pa.TwoTowerProbe.forward (study lines
+    718-737), sliced per head_idx. params: P[L,in,d], bp[L,d], Emb[L,E,d], bo[L,E]."""
+
+    def load(self, params, dev, dtype):
+        g = lambda k: params[k].to(device=dev, dtype=dtype).contiguous()
+        self.P = g("P"); self.bp = g("bp")
+        self.Emb = g("Emb"); self.bo = g("bo")
+        self.d = self.P.shape[-1]
+
+    def forward(self, head_idx, x_n):
+        q = x_n @ self.P[head_idx] + self.bp[head_idx]        # [n, d]
+        q = F.layer_norm(q, (self.d,))
+        # In study: einsum("nld,led->nle"); per-head: q[n,d] @ Emb[h][E,d]^T -> [n, E]
+        return q @ self.Emb[head_idx].t() + self.bo[head_idx]  # [n, E]
 
 
 # arch name (checkpoint meta["arch"]) -> head class. Add new archs HERE only.
 _HEAD_BUILDERS: dict[str, type[_PredictorHead]] = {
     "lowrank": _LowRankHead,
+    "twotower": _TwoTowerHead,
     # "mlp": _MLPHead, "resid": _ResidHead, "twotower": _TwoTowerHead, ...
 }
 
@@ -324,6 +342,7 @@ class AIPredictCtx:
     n_tokens: int
     pre_attn: torch.Tensor | None = None            # pre_attn[ℓ]        [n, H]
     router_input_prev: torch.Tensor | None = None   # router_input[ℓ-1] [n, H] | None@head0
+    router_input: torch.Tensor | None = None
 
 
 class LearnedNPUPredictor(ExpertPredictor):
@@ -342,6 +361,10 @@ class LearnedNPUPredictor(ExpertPredictor):
     IN_FEATURES: int = 1                       # H-blocks in the concatenated input
     INPUT_SPEC: frozenset[str] = frozenset()   # AIPredictCtx fields consumed
     uses_model_forward_driver = True           # manager flag: run the AI driver
+    # when True the manager runs the *next-layer* driver (capture pre_attn
+    # before attn; predict n+1 + prefetch from fused_moe after on-demand load).
+    # Default False = the original *current-layer* driver (predict ℓ before attn).
+    predicts_next_layer = False
 
     def __init__(self, mgr):
         super().__init__(mgr)
@@ -386,6 +409,24 @@ class LearnedNPUPredictor(ExpertPredictor):
             raise ValueError(
                 f"{type(self).__name__}: checkpoint L={self.L} exceeds model MoE "
                 f"layers {n_moe}")
+            
+        # NEW: the head's output width E = meta["E"] is the expert-id space this
+        # predictor selects over (topk in _ai_select_topk). If it doesn't match the
+        # model's physical expert count, predicted ids can fall outside the per-layer
+        # CPU expert buffers and _do_prefetch would IndexError (now filtered there).
+        # Warn loudly with both numbers so a mismatched checkpoint is obvious — a
+        # next-layer twotower dump trained for a different expert count is the first
+        # thing to check when it predicts but accuracy is poor. Non-fatal: the
+        # _do_prefetch filter keeps the run alive on the valid id subset.
+        nt = self.mgr.num_total_experts
+        if nt is not None and self.E != nt:
+            logger.warning(
+                "[AI-PRED] %s checkpoint E=%d != model num_total_experts=%d; "
+                "predicted ids outside [0,%d) will be dropped by _do_prefetch. If "
+                "unexpected, this checkpoint was trained for a different expert "
+                "space and its predictions won't be meaningful for this model.",
+                type(self).__name__, self.E, nt, nt)    
+            
         self.ready = True
         logger.info("[AI-PRED] %s arch=%s in_dim=%d (H=%d) L=%d E=%d top_k=%d "
                     "covers MoE layers [%d,%d) on %s",

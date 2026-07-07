@@ -32,7 +32,7 @@ RANGE_RATIO="${RANGE_RATIO:-0}"                      # 0 = fixed lengths (random
 # 4 keeps every decode step on the cache path with NUM_DEVICE_EXPERTS=32
 # (offload_threshold = 32 / topk(6) = 5 >= 4), per the new bench-mode policy.
 BS="${BS:-4}"                                        # batch size (latency mode only)
-# NEW: latency iteration counts (were hardcoded 10/30 in run_latency). Surfaced
+# latency iteration counts (were hardcoded 10/30 in run_latency). Surfaced
 # so the seq-stats warmup/measured windows can align with them exactly — each
 # latency iteration is one generated batch = one measured "sequence".
 ITERS_WARMUP="${ITERS_WARMUP:-10}"                   # latency warmup iterations
@@ -63,13 +63,13 @@ OFFLOAD="${OFFLOAD:-1}"                              # 1 = enable expert offload
 # An explicit NUM_DEVICE_EXPERTS=... still wins.
 NUM_DEVICE_EXPERTS="${NUM_DEVICE_EXPERTS:-$([[ "${MODE}" == "serve" ]] && echo 12 || echo 32)}"
 NUM_DEVICE_LAYERS="${NUM_DEVICE_LAYERS:-2}"          # prefill: full-expert layers kept on NPU
-TOPK="${TOPK:-6}"                                    # NEW: model top_k (DeepSeek-V2-Lite=6); used only for the threshold warning below
+TOPK="${TOPK:-6}"                                    # model top_k (DeepSeek-V2-Lite=6); used only for the threshold warning below
 CACHE_POLICY="${CACHE_POLICY:-1}"                    # 1 = LRC eviction policy
 CACHE_DEBUG="${CACHE_DEBUG:-0}"                      # 1 = per-paging [UPDATE-W] logs (0 = clean perf)
 CPU_BINDING="${CPU_BINDING:-0}"                      # enable_cpu_binding (reference = 0)
 WPREFETCH="${WPREFETCH:-0}"                          # 1 = L2 weight prefetch (separate feature)
 
-# NEW: end-of-test hit-rate summary ([EXPERT-OFFLOAD-FINAL] line; requires the
+# end-of-test hit-rate summary ([EXPERT-OFFLOAD-FINAL] line; requires the
 # seq-stats patch on this branch — set SEQ_STATS=0 on an UNPATCHED build, the
 # config validator rejects unknown keys). Also needs CACHE_POLICY=1 to record.
 # Per-mode defaults:
@@ -117,7 +117,7 @@ die()  { echo "ERROR: $*" >&2; exit 1; }
 bool() { [[ "${1}" == "1" ]] && echo true || echo false; }
 show() { printf '+ %s\n' "$*"; }                     # echo a command line
 
-# NEW: reap vLLM engine-core worker processes (process-title prefix
+# reap vLLM engine-core worker processes (process-title prefix
 # "VLLMEngineCor", e.g. VLLMEngineCore_DP0) that can outlive the bench/serve
 # command and keep holding NPU memory. Current user only, excludes this shell,
 # graceful SIGTERM then SIGKILL. Matches the process NAME (comm) OR the first
@@ -162,7 +162,7 @@ build_additional_config() {
   local parts=()
   if [[ "${OFFLOAD}" == "1" ]]; then
     parts+=( "\"enable_cpu_binding\":$(bool "${CPU_BINDING}")" )
-    # NEW: append the end-of-test summary keys when SEQ_STATS=1. Kept as a
+    # append the end-of-test summary keys when SEQ_STATS=1. Kept as a
     # separate suffix so SEQ_STATS=0 reproduces the pre-patch JSON byte-for-
     # byte (needed when running this script against an unpatched build).
     local seq_keys=""
@@ -226,7 +226,7 @@ print_summary() {
   fi
   echo "  offload=${OFFLOAD} device_experts=${NUM_DEVICE_EXPERTS} device_layers=${NUM_DEVICE_LAYERS}"\
        "lrc=${CACHE_POLICY} dbg=${CACHE_DEBUG} cpu_bind=${CPU_BINDING} prefetch=${WPREFETCH} profile=${PROFILE}"
-  # NEW: surface the summary-window settings next to the offload knobs.
+  # surface the summary-window settings next to the offload knobs.
   if [[ "${OFFLOAD}" == "1" && "${SEQ_STATS}" == "1" ]]; then
     echo "  seq_stats: warmup_seqs=${SEQ_WARMUP} num_seqs=${SEQ_NUM}"\
          "(grep [EXPERT-OFFLOAD-FINAL]; num_seqs=0 prints at engine teardown)"
@@ -318,7 +318,7 @@ run_serve() {
       --request-rate "${RATE}" --seed "${SEED}" \
       --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,95,99 \
       --save-result --result-dir ./bench_results "${EXTRA_BENCH_FLAGS[@]}"
-  # NEW: the seq-stats summary fires on the NUM-th finished request (Group 3
+  # the seq-stats summary fires on the NUM-th finished request (Group 3
   # hook) and lands in the server log; surface it here for convenience.
   if [[ "${OFFLOAD}" == "1" && "${SEQ_STATS}" == "1" ]]; then
     echo "[serve] expert-offload final stats (from ${log}):"
@@ -331,7 +331,7 @@ run_serve() {
 build_engine_args
 build_dataset_args
 print_summary
-# NEW: ensure engine-core workers are reaped when the test ends — any mode,
+# ensure engine-core workers are reaped when the test ends — any mode,
 # normal exit OR Ctrl-C/error. Skipped under DRY_RUN (nothing was launched).
 [[ "${DRY_RUN}" != "1" ]] && trap cleanup_on_exit EXIT
 case "${MODE}" in

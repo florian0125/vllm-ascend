@@ -37,7 +37,7 @@ RATE="${RATE:-inf}"                                  # request rate req/s; inf =
 TP="${TP:-1}"                                        # --tensor-parallel-size
 DP="${DP:-1}"                                        # --data-parallel-size
 SEED="${SEED:-1024}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}"                 # your V4 command used 0.9
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"                 # your V4 command used 0.9
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"                # empty = model native
 MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-}"      # empty = vLLM default
@@ -53,7 +53,7 @@ CACHE_DEBUG="${CACHE_DEBUG:-0}"                      # your V4 command used true
 CPU_BINDING="${CPU_BINDING:-0}"                      # enable_cpu_binding
 WPREFETCH="${WPREFETCH:-0}"                          # 1 = L2 weight prefetch (not in your command)
 
-# NEW: PROACTIVE EXPERT PREFETCH (the v5.0 next-layer predictive prefetch).
+# PROACTIVE EXPERT PREFETCH (the v5.0 next-layer predictive prefetch).
 # This is the feature you want to test "with prefetch enabled". It is OFF by
 # default in the engine, so it must be requested explicitly here.
 #   PREFETCH=1 -> "expert_prefetch_enabled":true   (default for this script)
@@ -61,8 +61,14 @@ WPREFETCH="${WPREFETCH:-0}"                          # 1 = L2 weight prefetch (n
 # Needs CACHE_POLICY=1 (LRC supplies choose_victim) and the v5.0 build with the
 # prefetch feature. Decode-only: requires MAX_NUM_SEQS <= offload_threshold.
 PREFETCH="${PREFETCH:-1}"                            # 1 = enable proactive expert prefetch
+# EXPERT_PREFETCH_MAX — cap the experts each prefetch LOADS to the top-N by
+# predicted score (fate + both learned predictors). Empty = no cap (load every
+# predicted miss; current behavior). 1 = only the highest-score missing expert;
+# 2 = top-2; etc. Emitted into expert_offload_config only when PREFETCH=1 and
+# non-empty, so PREFETCH=0 baselines and pre-cap builds start unchanged.
+EXPERT_PREFETCH_MAX="${EXPERT_PREFETCH_MAX:-}"
 
-# NEW: PREDICTOR — which next-layer expert predictor the prefetch path uses,
+# PREDICTOR — which next-layer expert predictor the prefetch path uses,
 # i.e. the expert_offload_config "expert_predictor" enum. Default is the
 # cross-layer-gate FATE method.
 #   PREDICTOR=""      -> omit the key; engine uses its default ("fate").
@@ -76,12 +82,13 @@ PREFETCH="${PREFETCH:-1}"                            # 1 = enable proactive expe
 PREDICTOR="${PREDICTOR:-fate}"                                     # existing
 
 # Checkpoint for learned predictors (e.g. mode2_pa_prevhs). Emitted into the
+# PREDICTOR=mode2_prevpa_prevhs_2tower
 # config as "expert_predictor_ckpt". Default = mode2_pa_prevhs lowrank w=2048.
 PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/keyi/llms/ai-predictor/mode2_pa/learned_predictor_study_mode2_pa.html.ckpts_260624_dump_2000/pa+prevhs_prompt_std_dist_lowrank_w=2048.pt}"
 # PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/h50048135/pre-att-dump-bias-600_1/learned_predictor_study_mode2_pa.html.ckpts/pa+prevhs_prompt_std_dist_lowrank_w=2048.pt}"
-# PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/h50048135/pre-att-dump-bias-600_1/learned_predictor_study_mode2_pa.html.ckpts/prevpa+prevhs_prompt_std_dist_twotower_w=2048.pt}"
+# PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/h50048135/dump_sharegpt_260629_n2000_l64_s42/learned_predictor_study_mode2_pa.html.ckpts/prevpa+prevhs_prompt_std_dist_twotower_w=2048.pt}"
 
-# NEW: end-of-test hit-rate summary ([EXPERT-OFFLOAD-FINAL]). Requires the
+# end-of-test hit-rate summary ([EXPERT-OFFLOAD-FINAL]). Requires the
 # seq-stats patch on the build AND CACHE_POLICY=1. Serve window: warmup=0,
 # num=NUM (at MAX_NUM_SEQS=1, 1 request = 1 sequence).
 # !! Your V4 build is a DIFFERENT checkout (moeoffload_v5 / vLLM 0.21.0). If it
@@ -91,7 +98,7 @@ SEQ_STATS="${SEQ_STATS:-1}"                          # 1 = pass seq_stats_* keys
 TIMING="${TIMING:-0}"                                # 1 = per-layer compute/upload timing (eager only)
 
 export CSV="${CSV:-1}"
-export CSV_PATH=/home/keyi/code/moe_offload/hq_v5/vllm-ascend/bench_csvs/
+export CSV_PATH=/home/keyi/code/vllm-ascend-moe5/bench_csvs
 
 SEQ_WARMUP="${SEQ_WARMUP:-0}"
 SEQ_NUM="${SEQ_NUM:-${NUM}}"
@@ -166,22 +173,23 @@ build_additional_config() {
   local parts=()
   if [[ "${OFFLOAD}" == "1" ]]; then
     parts+=( "\"enable_cpu_binding\":$(bool "${CPU_BINDING}")" )
-    local prefetch_key="" predictor_key=""
+    local prefetch_key="" predictor_key="" prefetch_max_key=""
     if [[ "${PREFETCH}" == "1" ]]; then
       prefetch_key=",\"expert_prefetch_enabled\":true"
       [[ -n "${PREDICTOR}" ]] && predictor_key=",\"expert_predictor\":\"${PREDICTOR}\""
       [[ -n "${PREDICTOR}" && "${PREDICTOR}" != "fate" && -n "${PREDICTOR_CKPT}" ]] && \
         predictor_key="${predictor_key},\"expert_predictor_ckpt\":\"${PREDICTOR_CKPT}\""
+      [[ -n "${EXPERT_PREFETCH_MAX}" ]] && prefetch_max_key=",\"expert_prefetch_max\":${EXPERT_PREFETCH_MAX}"
     fi
     local seq_keys=""
     if [[ "${SEQ_STATS}" == "1" ]]; then
       seq_keys=",\"seq_stats_num_seqs\":${LIMIT:-0}"
       [[ "${TIMING}" == "1" ]] && seq_keys="${seq_keys},\"cache_profile_timing\":true"
     fi
-    parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${prefetch_key}${predictor_key},\"moe_offload_debug\":$(bool "${CACHE_DEBUG}")${seq_keys}}" )
+    parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${prefetch_key}${predictor_key}${prefetch_max_key},\"moe_offload_debug\":$(bool "${CACHE_DEBUG}")${seq_keys}}" )
   fi
   [[ "${WPREFETCH}" == "1" ]] && parts+=( "\"weight_prefetch_config\":{\"enabled\":true}" )
-  # NEW: ReMoE fine-tuned router-gate override. When REMOE_GATE is a non-empty
+  # ReMoE fine-tuned router-gate override. When REMOE_GATE is a non-empty
   # path, inject moe_gate_override_path so vllm-ascend swaps the MoE gate
   # weights in-memory at load time (no on-disk model copy). Independent of
   # OFFLOAD, so it also works with OFFLOAD=0. Empty (default) => key omitted =>
@@ -270,7 +278,7 @@ print_summary() {
     if [[ "${PREFETCH}" == "1" && "${CACHE_POLICY}" != "1" ]]; then
       echo "  warn: PREFETCH=1 but CACHE_POLICY=0 — prefetch falls back to arbitrary eviction (no LRC brain)."
     fi
-    # NEW: a predictor choice only matters when prefetch is on; flag the no-op.
+    # a predictor choice only matters when prefetch is on; flag the no-op.
     if [[ -n "${PREDICTOR}" && "${PREFETCH}" != "1" ]]; then
       echo "  warn: PREDICTOR='${PREDICTOR}' set but PREFETCH=0 — the predictor is only used by the prefetch path; the expert_predictor key is omitted."
     fi

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  serve_eval.sh — launch the DeepSeek-V4 offload server, wait for /health, then
+#  v4_eval.sh — launch the DeepSeek-V4 offload server, wait for /health, then
 #  run lm-eval (gsm8k + mmlu) against it via the local-completions client.
 #
 #  Datasets are read from a pre-seeded HF cache (no per-task YAML, no download).
 #  Seed it ONCE with network (see the preflight message if it's missing).
 #
 #  Usage:   source <your_v4_env>.sh
-#           ./serve_eval.sh
-#  Preview: DRY_RUN=1 ./serve_eval.sh
+#           ./v4_eval.sh
+#  Preview: DRY_RUN=1 ./v4_eval.sh
 # =============================================================================
 set -uo pipefail
 
@@ -20,7 +20,7 @@ CARD="${CARD:-6}"
 PORT="${PORT:-7001}"
 TP="${TP:-1}"; DP="${DP:-1}"
 SEED="${SEED:-1024}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"       # keep <= num_device_experts/topk to hold the offload path
 
 # ── MoE offload (the config whose accuracy you're measuring) ─────────────────
@@ -29,6 +29,7 @@ NUM_DEVICE_EXPERTS="${NUM_DEVICE_EXPERTS:-24}"
 NUM_DEVICE_LAYERS="${NUM_DEVICE_LAYERS:-1}"
 CACHE_POLICY="${CACHE_POLICY:-1}"       # 1 = LRC (required by prefetch)
 PREFETCH="${PREFETCH:-1}"               # 1 = proactive expert prefetch
+EXPERT_PREFETCH_MAX="${EXPERT_PREFETCH_MAX:-}"
 PREDICTOR="${PREDICTOR:-fate}"
 PREDICTOR_CKPT="${PREDICTOR_CKPT:-}"    # only used when PREDICTOR != fate
 
@@ -41,9 +42,10 @@ CONCURRENCY="${CONCURRENCY:-1}"
 OUT_DIR="${OUT_DIR:-./eval_results/$(date +%Y%m%d_%H%M%S)}"
 
 # ── dataset cache (pre-seeded; no download) ──────────────────────────────────
-export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/home/keyi/llms/benchmarks/keyi/hf_cache}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/home/keyi/llms/benchmarks/hf_cache}"
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export USE_MODELSCOPE_HUB=0
+export VLLM_BATCH_INVARIANT=0
 
 WAIT="${WAIT:-1000}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -72,6 +74,9 @@ offload_json() {
   [[ "${PREFETCH}" == "1" ]] && {
     p="${p},\"expert_prefetch_enabled\":true,\"expert_predictor\":\"${PREDICTOR}\""
     [[ "${PREDICTOR}" != "fate" && -n "${PREDICTOR_CKPT}" ]] && p="${p},\"expert_predictor_ckpt\":\"${PREDICTOR_CKPT}\""
+    # prefetch cap (top-N experts by predicted score). Emitted only when set,
+    # so an empty EXPERT_PREFETCH_MAX reproduces the previous JSON byte-for-byte.
+    [[ -n "${EXPERT_PREFETCH_MAX}" ]] && p="${p},\"expert_prefetch_max\":${EXPERT_PREFETCH_MAX}"
   }
   printf '{"expert_offload_config":{%s}}' "${p}"
 }
@@ -120,7 +125,9 @@ preflight() {
   [[ -d "${HF_DATASETS_CACHE}" ]] || {
     echo "[!!] No dataset cache at ${HF_DATASETS_CACHE}. Seed it ONCE (with network):" >&2
     echo "     HF_DATASETS_CACHE=${HF_DATASETS_CACHE} python -c \"from datasets import load_dataset;" >&2
-    echo "       load_dataset('openai/gsm8k','main'); load_dataset('cais/mmlu','all')\"" >&2
+    echo "       load_dataset('openai/gsm8k','main')\"" >&2
+    echo "     mmlu must be seeded PER SUBJECT (config 'all' will NOT satisfy lm-eval):" >&2
+    echo "       for s in abstract_algebra anatomy ...(57)...: load_dataset('cais/mmlu', s)" >&2
     die "dataset cache not seeded"
   }
 }
@@ -129,7 +136,7 @@ preflight() {
 build_serve; build_eval
 
 echo "────────────────────────────────────────────────────────────"
-echo "  serve : ${SERVED_NAME} on :${PORT} (card ${CARD})  offload=${OFFLOAD} prefetch=${PREFETCH} predictor=${PREDICTOR}"
+echo "  serve : ${SERVED_NAME} on :${PORT} (card ${CARD})  offload=${OFFLOAD} prefetch=${PREFETCH} predictor=${PREDICTOR} prefetch_max=${EXPERT_PREFETCH_MAX:-none}"
 echo "  eval  : tasks=${TASKS} limit=${LIMIT:-full} tokenizer=${TOKENIZER}"
 echo "  cache : ${HF_DATASETS_CACHE}   out=${OUT_DIR}"
 echo "────────────────────────────────────────────────────────────"

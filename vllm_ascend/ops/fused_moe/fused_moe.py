@@ -196,6 +196,12 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             num_tokens = topk_ids.size(0)
             mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
                                hidden_states=x)
+            # next-layer learned predictor (predicts_next_layer). After layer
+            # n's on-demand load is done, predict n+1 from pre_attn[n] ‖ router_input[n]
+            # (=x) and prefetch it so the H2D overlaps this layer's GMM. Self-gates
+            # (eager+decode, covered layer); no-op for FATE and the pa+prevhs driver.
+            if getattr(mgr, "_ai_predicts_next", False):
+                mgr.ai_predict_prefetch_next(layer, x)
             if num_tokens > mgr.offload_threshold and mgr._prefill_initialized and not mgr._skip_prefill:
                 use_prefill_pool = True
                 try:
