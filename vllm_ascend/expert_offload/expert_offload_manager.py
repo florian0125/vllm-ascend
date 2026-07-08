@@ -202,8 +202,7 @@ class ExpertOffloadManager:
         self._gate_weights_npu: list[torch.Tensor | None] = []
 
         # Prefetch state: _prefetch_state_lock guards _prefetch_layer_npu_event,
-        # which carries load_done_event from trigger_next_layer_prefetch into
-        # update_weights' stream-join (capture-stream invariant — must stay).
+        # which is shared by the forward thread and the graph host callback.
         self._prefetch_state_lock = threading.Lock()
         self._prefetch_layer_npu_event: dict[int, torch_npu.npu.Event] = {}
 
@@ -1180,10 +1179,12 @@ class ExpertOffloadManager:
         with torch_npu.npu.stream(self.load_stream):
             for eid in range(ntotal):
                 self._prefill_w13[pool_slot].untyped_storage()[eid * self.w13_expert_size_bytes : (eid + 1) * self.w13_expert_size_bytes].copy_(
-                    self._expert_src_storage(layer_idx, eid, 'w13')
+                    self._expert_src_storage(layer_idx, eid, 'w13'),
+                    non_blocking=True
                 )
                 self._prefill_w2[pool_slot].untyped_storage()[eid * self.w2_expert_size_bytes : (eid + 1) * self.w2_expert_size_bytes].copy_(
-                    self._expert_src_storage(layer_idx, eid, 'w2')
+                    self._expert_src_storage(layer_idx, eid, 'w2'),
+                    non_blocking=True
                 )
 
             # W8A8 scale/offset — load into prefill buffers
@@ -1197,7 +1198,7 @@ class ExpertOffloadManager:
                         for eid in range(min(ntotal, len(cpu_buffers[scale_name][layer_idx]))):
                             src = cpu_buffers[scale_name][layer_idx][eid]
                             prefill_list[pool_slot][eid].copy_(
-                                src.reshape(prefill_list[pool_slot][eid].shape))
+                                src.reshape(prefill_list[pool_slot][eid].shape), non_blocking=True)
             for offset_name, prefill_list, cpu_buffers in [
                 ("w13_weight_offset", self._prefill_w13_offset, self.offset_cpu_buffers),
                 ("w2_weight_offset", self._prefill_w2_offset, self.offset_cpu_buffers),
@@ -1208,7 +1209,7 @@ class ExpertOffloadManager:
                         for eid in range(min(ntotal, len(cpu_buffers[offset_name][layer_idx]))):
                             src = cpu_buffers[offset_name][layer_idx][eid]
                             prefill_list[pool_slot][eid].copy_(
-                                src.reshape(prefill_list[pool_slot][eid].shape))
+                                src.reshape(prefill_list[pool_slot][eid].shape), non_blocking=True)
 
             # W4A8_DYNAMIC scale_bias — load into prefill buffers
             for sb_name, prefill_list in [
@@ -1222,7 +1223,7 @@ class ExpertOffloadManager:
                         for eid in range(min(ntotal, len(cpu_buffers[sb_name][layer_idx]))):
                             src = cpu_buffers[sb_name][layer_idx][eid]
                             prefill_list[pool_slot][eid].copy_(
-                                src.reshape(prefill_list[pool_slot][eid].shape))
+                                src.reshape(prefill_list[pool_slot][eid].shape), non_blocking=True)
 
             # Refresh fp32 scale for prefill pool
             if (pool_slot < len(self._prefill_w13_scale_fp32) and
@@ -1230,7 +1231,7 @@ class ExpertOffloadManager:
                 # Copy scale data from freshly loaded scale to fp32
                 for eid in range(min(ntotal, self._prefill_w13_scale[pool_slot].shape[0])):
                     self._prefill_w13_scale_fp32[pool_slot][eid].copy_(
-                        self._prefill_w13_scale[pool_slot][eid].to(torch.float32))
+                        self._prefill_w13_scale[pool_slot][eid].to(torch.float32), non_blocking=True)
 
             self.load_stream.synchronize()
 
@@ -2013,7 +2014,6 @@ class ExpertOffloadManager:
         return self._update_weights, (
             topk_ids_h, log2phy_np, next_layer, next_idx, topk_weights_h,
             self._is_prefetch)
-
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #
