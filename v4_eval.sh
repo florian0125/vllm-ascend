@@ -30,22 +30,28 @@ NUM_DEVICE_LAYERS="${NUM_DEVICE_LAYERS:-1}"
 CACHE_POLICY="${CACHE_POLICY:-1}"       # 1 = LRC (required by prefetch)
 PREFETCH="${PREFETCH:-1}"               # 1 = proactive expert prefetch
 EXPERT_PREFETCH_MAX="${EXPERT_PREFETCH_MAX:-}"
+ON_DEMAND_LOAD_MAX="${ON_DEMAND_LOAD_MAX:-}"
 PREDICTOR="${PREDICTOR:-fate}"
 PREDICTOR_CKPT="${PREDICTOR_CKPT:-}"    # only used when PREDICTOR != fate
 
 # ── eval ─────────────────────────────────────────────────────────────────────
-TASKS="${TASKS:-gsm8k,mmlu}"
-LIMIT="${LIMIT:-5}"                    # per task; empty = full
+TASKS="${TASKS:-gsm8k}"
+LIMIT="${LIMIT:-}"                    # per task; empty = full
 TOKENIZER="${TOKENIZER:-/home/keyi/llms/dsv4-tokenizer}"  # tokenizer-only dir (no config.json)
 MAX_LENGTH="${MAX_LENGTH:-8192}"
 CONCURRENCY="${CONCURRENCY:-1}"
 OUT_DIR="${OUT_DIR:-./eval_results/$(date +%Y%m%d_%H%M%S)}"
 
+TIMING="${TIMING:-0}"                           # 1 -> cache_profile_timing:true
+SEQ_STATS_NUM_SEQS="${SEQ_STATS_NUM_SEQS:-0}"   # decode seqs per summary window; 0 = all finished seqs (flush at shutdown)
+MOE_DEBUG="${MOE_DEBUG:-0}"                     # 1 -> moe_offload_debug:true (verbose offload logging)
+CPU_BIND="${CPU_BIND:-0}" 
+
 # ── dataset cache (pre-seeded; no download) ──────────────────────────────────
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/home/keyi/llms/benchmarks/hf_cache}"
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export USE_MODELSCOPE_HUB=0
-export VLLM_BATCH_INVARIANT=0
+export VLLM_BATCH_INVARIANT=1
 
 WAIT="${WAIT:-1000}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -71,6 +77,7 @@ offload_json() {
   [[ "${OFFLOAD}" != "1" ]] && return
   local p="\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS}"
   p="${p},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$([[ ${CACHE_POLICY} == 1 ]] && echo true || echo false)"
+  [[ -n "${ON_DEMAND_LOAD_MAX}" ]] && p="${p},\"on_demand_load_max\":${ON_DEMAND_LOAD_MAX}"
   [[ "${PREFETCH}" == "1" ]] && {
     p="${p},\"expert_prefetch_enabled\":true,\"expert_predictor\":\"${PREDICTOR}\""
     [[ "${PREDICTOR}" != "fate" && -n "${PREDICTOR_CKPT}" ]] && p="${p},\"expert_predictor_ckpt\":\"${PREDICTOR_CKPT}\""
@@ -78,7 +85,11 @@ offload_json() {
     # so an empty EXPERT_PREFETCH_MAX reproduces the previous JSON byte-for-byte.
     [[ -n "${EXPERT_PREFETCH_MAX}" ]] && p="${p},\"expert_prefetch_max\":${EXPERT_PREFETCH_MAX}"
   }
-  printf '{"expert_offload_config":{%s}}' "${p}"
+  p="${p},\"moe_offload_debug\":$([[ ${MOE_DEBUG} == 1 ]] && echo true || echo false)"
+  p="${p},\"seq_stats_num_seqs\":${SEQ_STATS_NUM_SEQS}"
+  p="${p},\"cache_profile_timing\":$([[ ${TIMING} == 1 ]] && echo true || echo false)"
+  printf '{"enable_cpu_binding":%s,"expert_offload_config":{%s}}' \
+         "$([[ ${CPU_BIND} == 1 ]] && echo true || echo false)" "${p}"
 }
 
 # ── serve command ────────────────────────────────────────────────────────────
@@ -94,6 +105,7 @@ build_serve() {
           --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4
           --enable-auto-tool-choice --reasoning-parser deepseek_v4
           --enable-chunked-prefill --enable-prefix-caching
+          --aggregate-engine-logging
           --safetensors-load-strategy prefetch --api-server-count 1 )
   local addl; addl="$(offload_json)"
   # ReMoE fine-tuned router-gate override.
@@ -136,7 +148,8 @@ preflight() {
 build_serve; build_eval
 
 echo "────────────────────────────────────────────────────────────"
-echo "  serve : ${SERVED_NAME} on :${PORT} (card ${CARD})  offload=${OFFLOAD} prefetch=${PREFETCH} predictor=${PREDICTOR} prefetch_max=${EXPERT_PREFETCH_MAX:-none}"
+echo "  serve : ${SERVED_NAME} on :${PORT} (card ${CARD})  offload=${OFFLOAD} prefetch=${PREFETCH} predictor=${PREDICTOR} prefetch_max=${EXPERT_PREFETCH_MAX:-none} ondemand_load_max=${ON_DEMAND_LOAD_MAX:-none}"
+echo "  stats : timing=${TIMING} seq_stats_num_seqs=${SEQ_STATS_NUM_SEQS} moe_debug=${MOE_DEBUG} cpu_bind=${CPU_BIND}"
 echo "  eval  : tasks=${TASKS} limit=${LIMIT:-full} tokenizer=${TOKENIZER}"
 echo "  cache : ${HF_DATASETS_CACHE}   out=${OUT_DIR}"
 echo "────────────────────────────────────────────────────────────"

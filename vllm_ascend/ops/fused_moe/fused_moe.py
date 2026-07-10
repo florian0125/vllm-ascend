@@ -194,8 +194,12 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
             num_tokens = topk_ids.size(0)
+            # pass router_logits so update_weights can score ALL experts
+            # (not just the top-k in topk_weights) for SMoE substitution candidate
+            # ranking. No-op unless on_demand_load_max is set. router_logits here
+            # is the real gate output for both internal- and external-router paths.
             mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
-                               hidden_states=x)
+                               hidden_states=x, router_logits=router_logits)
             # next-layer learned predictor (predicts_next_layer). After layer
             # n's on-demand load is done, predict n+1 from pre_attn[n] ‖ router_input[n]
             # (=x) and prefetch it so the H2D overlaps this layer's GMM. Self-gates

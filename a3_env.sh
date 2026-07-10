@@ -19,7 +19,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   exit 1
 fi
 
-conda activate moeoffv5-keyi
+# conda activate moeoffv5-keyi
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 # ---- 1. CANN / NNAL (system-level) -----------------------------------------

@@ -149,6 +149,10 @@ class ExpertOffloadManager:
         self._summary_request_cnt: int = 0
         self._summary_layer_rate_sum: dict[int, float] = {}
         self._summary_layer_rate_cnt: dict[int, int] = {}
+        self._summary_subst_sum: float = 0.0
+        self._summary_subst_cnt: int = 0
+        self._summary_subst_layer_sum: dict[int, float] = {}
+        self._summary_subst_layer_cnt: dict[int, int] = {}
         self._seq_stats_done: bool = False
 
         # Generalized per-(layer, step) timing (decode path, profiling only).
@@ -265,6 +269,15 @@ class ExpertOffloadManager:
         # prefetch cap (top-N experts by predicted score). None = no cap.
         # Read once here; _do_prefetch applies it for every predictor.
         self._prefetch_max = self.offload_config.expert_prefetch_max
+        # on-demand load cap for SMoE expert substitution. None = OFF (load
+        # every missing expert on-demand, original behavior). Read once here;
+        # _update_weights applies it. Independent of the prefetch cap above.
+        self._on_demand_load_max = self.offload_config.on_demand_load_max
+        # per-layer substitution plan produced by _update_weights (real
+        # expert id -> resident substitute expert id) and consumed by
+        # update_weights, which rewrites the current step's device topk_ids.
+        # Transient: overwritten every decode step, never persisted into log2phy.
+        self._pending_subst: dict[int, dict[int, int]] = {}
         self._ai_pa_buf = None             # [max_tokens, H] fp32 — pre_attn[ℓ]
         self._ai_ri_buf = [None, None]     # 2x [max_tokens, H] fp32 — router ping-pong
         # [max_tokens, H] fp32 — current-layer router_input[n] for the
@@ -403,6 +416,14 @@ class ExpertOffloadManager:
         self.log2phy_h = torch.zeros(ntotal, dtype=torch.int32,
                                      device='cpu', pin_memory=True)
         self.log2phy_np = self.log2phy_h.numpy()
+        # pinned host buffer for the full per-expert router scores, staged
+        # by update_weights and read by _update_weights to (a) sort the misses by
+        # score and (b) rank resident-inactive substitute candidates. Allocated
+        # only when substitution is enabled
+        if self._on_demand_load_max is not None:
+            self.router_logits_h = torch.zeros(
+                [self.offload_threshold, ntotal],
+                dtype=torch.float32, device="cpu", pin_memory=True)
         t4 = time.perf_counter()
 
         self.refresh_fp32_scales()
@@ -867,7 +888,8 @@ class ExpertOffloadManager:
     def update_weights(self, layer, topk_ids: torch.Tensor,
                         log2phy: torch.Tensor,
                         topk_weights: torch.Tensor | None = None,
-                        hidden_states: torch.Tensor | None = None) -> int:
+                        hidden_states: torch.Tensor | None = None,
+                        router_logits: torch.Tensor | None = None) -> int:
         """Incrementally page in needed experts, overwriting unused slots.
 
         Routes to prefill pool (full-overwrite) when num_tokens exceeds
@@ -927,6 +949,29 @@ class ExpertOffloadManager:
                 and self.offload_config.cache_router_weight != 0):
             topk_weights_h = self.topk_weights_h[:num_tokens]
             topk_weights_h.copy_(topk_weights.to(dtype=torch.float32), non_blocking=_EXTRA_CTX.capturing)
+        
+        # stage the full per-expert router scores for SMoE substitution.
+        router_scores_h = None
+        subst_enabled = (self._on_demand_load_max is not None
+                         and not _EXTRA_CTX.capturing)
+        if subst_enabled and router_logits is not None:
+            if router_logits.shape[-1] == self.num_total_experts:
+                router_scores_h = self.router_logits_h[:num_tokens]
+                router_scores_h.copy_(router_logits, non_blocking=_EXTRA_CTX.capturing)
+            else:
+                # LOUD: substitution needs full per-expert scores; a width
+                # mismatch here silently disabled the whole feature before.
+                logger.warning_once(
+                    "[SUBST] router_logits width %d != num_total_experts %d — "
+                    "expert substitution DISABLED. If these should match, "
+                    "check n_routed_experts vs layer.global_num_experts.",
+                    router_logits.shape[-1], self.num_total_experts)
+        elif subst_enabled and router_logits is None:
+            logger.warning_once(
+                "[SUBST] on_demand_load_max set but router_logits is None — "
+                "did fused_moe.apply pass router_logits=router_logits to "
+                "update_weights? Substitution DISABLED.")   
+        
         log2phy_h = self.log2phy_h
         log2phy_np = self.log2phy_np
         topk_ids_h.copy_(topk_ids, non_blocking=_EXTRA_CTX.capturing)
@@ -944,6 +989,7 @@ class ExpertOffloadManager:
             layer,
             layer_idx,
             topk_weights_h,
+            router_scores_h,
         )
         if _EXTRA_CTX.capturing:
             torch_npu.npu._launch_host_func(
@@ -953,6 +999,11 @@ class ExpertOffloadManager:
             )
         else:
             self._update_weights(args)
+            # apply the SMoE substitution plan produced by _update_weights.
+            subst = self._pending_subst.pop(layer_idx, None)
+            if subst:
+                for real_eid, sub_eid in subst.items():
+                    topk_ids[topk_ids == real_eid] = sub_eid
 
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
 
@@ -963,6 +1014,7 @@ class ExpertOffloadManager:
             layer,
             layer_idx,
             topk_weights_h,
+            router_scores_h,
         ) = args
         with torch_npu.npu.stream(self.load_stream):
             if self.cache_policy is not None:
@@ -999,8 +1051,73 @@ class ExpertOffloadManager:
                 # fold the prefetch profiling sample for this layer into
                 # the same step (no-op unless cache_profile_timing is on and a sample exists
                 self._record_prefetch_stats(layer_idx, needed)
+                
+            # Expert-substitution planning.
+            # Default (feature off): load every miss, exactly as before.
+            #   protected == needed, to_load == need_to_load, subst_map == {}.
+            # When on_demand_load_max is set AND we have full scores, cap the
+            # loads to the top-N misses by router score and substitute the rest
+            # with resident-inactive experts (score-ranked, distinct). Substitutes
+            # are added to `protected` so the capped loads below can't evict them
+            protected = set(needed)
+            subst_map: dict[int, int] = {}
+            cap = self._on_demand_load_max
+            if router_scores_h is not None and cap is not None:
+                # Per-expert score = max over tokens of the raw gate logit (a
+                # monotone importance proxy; softmax/sigmoid would give the same
+                # ranking). Used both to order misses and to rank candidates.
+                escore = router_scores_h.max(dim=0).values.tolist()
+                misses_sorted = sorted(need_to_load, key=lambda e: escore[e], reverse=True)
+                if len(misses_sorted) > cap:
+                    to_load = misses_sorted[:cap]          # load highest-score misses
+                    tail = misses_sorted[cap:]             # substitute the rest
+                    # Candidates: resident-INACTIVE experts (in the device cache
+                    # but not in this step's top-k), highest score first. Their
+                    # score is ≤ any active expert's, so the "< replaced score"
+                    # rule is a safety guard that essentially always holds.
+                    cand_pool = sorted((e for e in on_device if e not in needed),
+                                       key=lambda e: escore[e], reverse=True)
+                    used: set[int] = set()
+                    for eid in tail:                       # tail is score-desc
+                        sub = None
+                        for c in cand_pool:
+                            if c in used:
+                                continue
+                            if escore[c] < escore[eid]:    # closest lower-scored
+                                sub = c
+                                break
+                        if sub is not None:
+                            subst_map[eid] = sub
+                            used.add(sub)
+                            protected.add(sub)             # don't evict the substitute
+                        else:
+                            # No qualifying resident-inactive candidate — per the
+                            # design this only arises if the cache is smaller than
+                            # top-k (in which case offload is off), so it's a
+                            # safety net: fall back to loading the real expert.
+                            to_load.append(eid)
+                else:
+                    to_load = list(misses_sorted)          # nothing to substitute
+            else:
+                to_load = need_to_load
+                
+            # record the per-(layer, step) substitution ratio for
+            # the end-of-run summary = (#experts substituted) / (#requests this
+            # step). #substituted = len(subst_map) (misses beyond the cap that
+            # were bridged from cache;
+            if (router_scores_h is not None and cap is not None
+                    and not self._seq_stats_done):
+                _req = topk_ids_h.shape[0] or 1            # requests (decode tokens) this step
+                _sratio = len(subst_map) / _req
+                self._summary_subst_sum += _sratio
+                self._summary_subst_cnt += 1
+                self._summary_subst_layer_sum[layer_idx] = (
+                    self._summary_subst_layer_sum.get(layer_idx, 0.0) + _sratio)
+                self._summary_subst_layer_cnt[layer_idx] = (
+                    self._summary_subst_layer_cnt.get(layer_idx, 0) + 1)
+                
             reusable_slots = [s for s, e in slot_owner.items()
-                            if e not in needed]          # slots to recycle
+                                if e not in protected]          # slots to recycle
 
             if self._debug:
                 logger.info("[UPDATE-W] l=%d expert_hit=%s expert_miss=%s hit_rate=%.2f",
@@ -1022,12 +1139,12 @@ class ExpertOffloadManager:
             _tc0 = time.perf_counter() if _time_miss_load else 0.0
 
             n_copies = 0
-            for eid in need_to_load:
+            for eid in to_load:
                 if self.cache_policy is not None:
                     victim = self.cache_policy.choose_victim(
                         layer_idx,
                         slot_owner,
-                        protected=needed,
+                        protected=protected,
                     )
                     slot = int(log2phy_np[victim]) if victim is not None else -1
                 elif reusable_slots:
@@ -1082,11 +1199,15 @@ class ExpertOffloadManager:
                     reusable_slots.remove(slot)
                 n_copies += 1
 
+            # hand the substitution plan to update_weights, which rewrites
+            # the device topk_ids. Stored unconditionally (empty when the feature
+            # is off) so update_weights' pop() is always well-defined.
+            self._pending_subst[layer_idx] = subst_map
+            
             self.load_stream.synchronize()
 
             if _time_miss_load:
                 copy_ms = (time.perf_counter() - _tc0) * 1000.0 if n_copies else 0.0
-                # CHANGE (#6): "upload" -> "miss_load".
                 self._t_step["miss_load"][layer_idx] = copy_ms
 
     # ------------------------------------------------------------------ #
@@ -1296,7 +1417,7 @@ class ExpertOffloadManager:
         # coerce to a set for the membership math below; `priority` carries order.
         predicted_experts = set(predicted_experts)
         
-        # NEW: drop any predicted id outside the model's physical expert range
+        # drop any predicted id outside the model's physical expert range
         # [0, num_total_experts). The per-layer CPU expert buffers indexed below
         # (w13_weights_cpu[next_idx][eid], w2_weights_cpu[next_idx][eid], the
         # scale_cpu_buffers/offset_cpu_buffers[attr][next_idx][eid]) have inner
@@ -2136,7 +2257,7 @@ class ExpertOffloadManager:
             slot = d.setdefault(metric, {})
             slot[idx] = (slot.get(idx, 0.0) + ms) if accumulate else ms
 
-    # NEW (#4): pure-isolation prerequisite. Before timing this layer's stages,
+    # pure-isolation prerequisite. Before timing this layer's stages,
     # drain everything that would otherwise run concurrently on another stream:
     #   - FATE: this layer's prefetch runs on the background worker (triggered by
     #     the PREVIOUS layer's compute). Wait for it to finish, then drain the
@@ -2412,6 +2533,27 @@ class ExpertOffloadManager:
                         lines += ["     %-6s" % ("L%02d" % li) + cells]
 
         lines += [" Per-layer mean hit rate"] + pl_lines
+        
+        # expert-substitution activity
+        if self._summary_subst_cnt > 0:
+            subst_mean = self._summary_subst_sum / self._summary_subst_cnt
+            sl_lines: list[str] = []
+            srow: list[str] = []
+            for lidx in sorted(self._summary_subst_layer_sum):
+                r = (self._summary_subst_layer_sum[lidx]
+                     / self._summary_subst_layer_cnt[lidx])
+                srow.append("L%02d=%.2f" % (lidx, r))
+                if len(srow) == 6:
+                    sl_lines.append("   " + " ".join(srow)); srow = []
+            if srow:
+                sl_lines.append("   " + " ".join(srow))
+            lines += [
+                " Expert substitution (substituted experts / request, decode path)",
+                "   over steps×layers : mean=%.4f  (samples=%d, cap=%s)"
+                    % (subst_mean, self._summary_subst_cnt, self._on_demand_load_max),
+                " Per-layer mean substituted experts / request",
+            ] + sl_lines
+            
         lines += [bar, ""]
         logger.info("[EXPERT-OFFLOAD-FINAL]\n%s", "\n".join(lines))
 
@@ -2452,6 +2594,11 @@ class ExpertOffloadManager:
                 step = [self._t_sum_step[mt][i] / ns for i in range(4)]
                 md += ["| %s over steps (avg/med/min/max) | %.4f / %.4f / %.4f / %.4f |"
                        % (self._t_label[mt], step[0], step[1], step[2], step[3])]
+        # substitution row in the markdown summary. Emitted only
+        # when the feature ran. Placed just before the trailing md += [""].
+        if self._summary_subst_cnt > 0:
+            md += ["| substituted experts / request (mean over steps×layers) | %.4f |"
+                   % (self._summary_subst_sum / self._summary_subst_cnt)]
         md += [""]
         logger.info("[EXPERT-OFFLOAD-FINAL-MD]\n%s", "\n".join(md))
 
@@ -2487,7 +2634,7 @@ class ExpertOffloadManager:
  
         # One column per metric: hit_rate, then each timing metric as <m>_ms,
         # then each rate metric (fraction). No per-metric count columns.
-        header = ["layer", "hit_rate"]
+        header = ["layer", "hit_rate", "subst_ratio"]
         header += ["%s_ms" % m for m in timing]
         header += list(rates)
  
@@ -2505,7 +2652,9 @@ class ExpertOffloadManager:
                 w.writerow(header)
                 for li in range(n_layers):
                     row = [li, _mean(self._summary_layer_rate_sum,
-                                     self._summary_layer_rate_cnt, li)]
+                                     self._summary_layer_rate_cnt, li),
+                                _mean(self._summary_subst_layer_sum,
+                                     self._summary_subst_layer_cnt, li)]
                     for m in timing:
                         row.append(_mean(self._t_sum_layer_sum[m],
                                          self._t_sum_layer_cnt[m], li))

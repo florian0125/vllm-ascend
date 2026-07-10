@@ -813,6 +813,12 @@ class ExpertOffloadConfig:
         # missing expert; 2 = top-2; etc. Uncapped routed experts still load
         # on-demand in update_weights, so this never mis-routes.
         "expert_prefetch_max": None,
+        # cap on the number of MISSING experts the decode on-demand path
+        # LOADS per layer per step. None = feature OFF -> load every missing expert on-demand (original
+        # behavior, JSON unchanged). N (>=1) = load the top-N missing experts by
+        # router score; the remaining (lowest-score) missing experts are
+        # substituted by resident-inactive experts already in this layer's cache
+        "on_demand_load_max": None,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -909,6 +915,13 @@ class ExpertOffloadConfig:
                 raise TypeError("expert_prefetch_max must be an integer or null")
             if pm < 1:
                 raise ValueError(f"expert_prefetch_max must be >= 1; got {pm}")
+            
+        om = self.config["on_demand_load_max"]
+        if om is not None:
+            if not isinstance(om, int) or isinstance(om, bool):
+                raise TypeError("on_demand_load_max must be an integer or null")
+            if om < 1:
+                raise ValueError(f"on_demand_load_max must be >= 1; got {om}")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

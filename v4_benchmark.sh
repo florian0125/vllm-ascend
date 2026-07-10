@@ -67,6 +67,7 @@ PREFETCH="${PREFETCH:-1}"                            # 1 = enable proactive expe
 # 2 = top-2; etc. Emitted into expert_offload_config only when PREFETCH=1 and
 # non-empty, so PREFETCH=0 baselines and pre-cap builds start unchanged.
 EXPERT_PREFETCH_MAX="${EXPERT_PREFETCH_MAX:-}"
+ON_DEMAND_LOAD_MAX="${ON_DEMAND_LOAD_MAX:-}"
 
 # PREDICTOR — which next-layer expert predictor the prefetch path uses,
 # i.e. the expert_offload_config "expert_predictor" enum. Default is the
@@ -181,12 +182,14 @@ build_additional_config() {
         predictor_key="${predictor_key},\"expert_predictor_ckpt\":\"${PREDICTOR_CKPT}\""
       [[ -n "${EXPERT_PREFETCH_MAX}" ]] && prefetch_max_key=",\"expert_prefetch_max\":${EXPERT_PREFETCH_MAX}"
     fi
+    local subst_key=""
+    [[ -n "${ON_DEMAND_LOAD_MAX}" ]] && subst_key=",\"on_demand_load_max\":${ON_DEMAND_LOAD_MAX}"
     local seq_keys=""
     if [[ "${SEQ_STATS}" == "1" ]]; then
       seq_keys=",\"seq_stats_num_seqs\":${LIMIT:-0}"
       [[ "${TIMING}" == "1" ]] && seq_keys="${seq_keys},\"cache_profile_timing\":true"
     fi
-    parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${prefetch_key}${predictor_key}${prefetch_max_key},\"moe_offload_debug\":$(bool "${CACHE_DEBUG}")${seq_keys}}" )
+    parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${subst_key}${prefetch_key}${predictor_key}${prefetch_max_key},\"moe_offload_debug\":$(bool "${CACHE_DEBUG}")${seq_keys}}" )
   fi
   [[ "${WPREFETCH}" == "1" ]] && parts+=( "\"weight_prefetch_config\":{\"enabled\":true}" )
   # ReMoE fine-tuned router-gate override. When REMOE_GATE is a non-empty

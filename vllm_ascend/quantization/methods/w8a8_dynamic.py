@@ -327,7 +327,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             mgr = ExpertOffloadManager.get_instance()
             num_tokens = topk_ids.size(0)
             mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
-                               hidden_states=x)
+                               hidden_states=x, router_logits=router_logits)
             # next-layer learned predictor
             if getattr(mgr, "_ai_predicts_next", False):
                 mgr.ai_predict_prefetch_next(layer, x)
