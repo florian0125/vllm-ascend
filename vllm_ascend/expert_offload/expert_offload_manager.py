@@ -8,6 +8,7 @@ import torch
 import torch_npu
 import torch.nn.functional as F
 from vllm.config import VllmConfig
+from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -1879,8 +1880,14 @@ class ExpertOffloadManager:
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Predict which experts layer layer_idx+1 will need, on NPU.
 
-        Runs entirely on the NPU (softmax + topk) so it can be captured in
-        a CUDA/NPU graph. The returned tensors live on NPU.
+        Runs entirely on the NPU so it can be captured in a CUDA/NPU graph.
+        The returned tensors live on NPU.
+
+        Two paths:
+        - Hash-routed layers (first num_hash_layers): experts come from the
+          tid2eid table indexed by token id (deterministic, 100% accurate).
+        - Learned layers (the rest): softmax + topk on the gate logits of the
+          first token.
 
         Args:
             layer_idx: Current layer index.
@@ -1899,6 +1906,31 @@ class ExpertOffloadManager:
         gate_w = self._gate_weights_npu[next_idx]
         if gate_w is None:
             return None
+
+        # Hash-routed layers (the first num_hash_layers in DeepSeek-V4):
+        # experts are a deterministic function of the token id via the tid2eid
+        # table, NOT of the gate logits. The learned softmax+topk path below
+        # would predict the *wrong* experts for these layers, so look the
+        # table up directly — perfect prediction, no matmul needed.
+        # See md_analysis/2026-0711-1430-ds-v4前三层的topk计算规则.md §7.
+        next_layer = self.moe_layers[next_idx]
+        tid2eid = getattr(getattr(next_layer, "gate", None), "tid2eid", None)
+        if tid2eid is not None:
+            input_ids = get_forward_context().input_ids
+            if input_ids is None:
+                return None
+            # [1] on the tid2eid device -> index_select -> [1, topk] int32.
+            first_id = input_ids[:1].to(tid2eid.device).long()
+            topk_ids = tid2eid.index_select(0, first_id)
+            # Selection does not depend on affinity for hash layers, so the
+            # router weight is meaningless; uniform placeholders keep the
+            # [1, topk] shape the caller expects (cache_router_weight is
+            # optional).
+            topk_weights = torch.full(
+                (1, self.topk), 1.0 / self.topk,
+                dtype=torch.float32, device=topk_ids.device,
+            )
+            return topk_weights, topk_ids
 
         # Predict from the first token only — one representative token's
         # experts is enough for prefetch; others are handled reactively by
