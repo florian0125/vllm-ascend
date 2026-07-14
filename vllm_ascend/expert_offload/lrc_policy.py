@@ -157,6 +157,33 @@ class LRCExpertCachePolicy:
             - self.age_weight * age
         )
 
+    def seed_layer_hotness(self, layer_idx: int,
+                           weights: dict[int, float]) -> None:
+        """Seed per-layer hotness from offline stats (decode resident preload).
+
+        Freshly preloaded hot experts must survive early choose_victim() calls
+        before runtime observe() builds up real statistics; without seeding
+        they read hotness≈0 and get evicted first, undoing the preload.
+
+        Offline weights are softmax router scores (~1e-2), far smaller than the
+        freq term (recent_weight*freq, ~1 per hit) that dominates hotness, so
+        writing them into ema/router_score yields hotness ~1e-2 — still evicted
+        first against any runtime-hit expert (freq>=1). We therefore min-max
+        normalize each layer's weights into [1, recent_window] and write that
+        into freq (the dominant term), keeping the raw weight in router_score.
+        This makes a preloaded hot expert's initial hotness comparable to (or
+        above) a runtime-hit expert, preventing early eviction.
+        """
+        state = self.layer_states[layer_idx]
+        if not weights:
+            return
+        w_max = max(weights.values()) or 1.0
+        for eid, w in weights.items():
+            norm = (w / w_max) if w_max > 0 else 0.0
+            state.freq[eid] = max(1, round(norm * self.recent_window))
+            state.router_score[eid] = float(w)
+            state.last_used[eid] = state.step    # zero age penalty
+
     def layer_step(self, layer_idx: int) -> int:
         return self.layer_states[layer_idx].step
 

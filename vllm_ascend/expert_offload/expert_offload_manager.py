@@ -1,5 +1,6 @@
 """Expert Offload Manager — manages CPU-side expert weights and NPU paging."""
 
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -334,6 +335,8 @@ class ExpertOffloadManager:
 
         self.refresh_fp32_scales()
         t5 = time.perf_counter()
+        self._preload_hot_experts()
+        t_hot = time.perf_counter()
         self.create_prefill_pool()
         t6 = time.perf_counter()
         if self.offload_config.expert_prefetch_enabled:
@@ -351,8 +354,9 @@ class ExpertOffloadManager:
         logger.info(
             "[OFFLOAD] finalize breakdown: process_weights=%.1fs "
             "cache_policy=%.1fs buffers=%.1fs init_device=%.1fs "
-            "prefill_pool=%.1fs gate=%.1fs | total=%.1fs",
-            t2 - t1, t3 - t2, t4 - t3, t5 - t4, t6 - t5, t7 - t6, t7 - t0)
+            "hot_preload=%.1fs prefill_pool=%.1fs gate=%.1fs | total=%.1fs",
+            t2 - t1, t3 - t2, t4 - t3, t5 - t4, t_hot - t5, t6 - t_hot,
+            t7 - t6, t7 - t0)
 
     def process_weights_after_loading(self):
         """Convert resident CPU expert buffers to the on-device weight format.
@@ -1121,6 +1125,54 @@ class ExpertOffloadManager:
 
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
 
+    def _copy_expert_into_slot(self, layer, layer_idx: int, eid: int,
+                               slot: int) -> None:
+        """Copy one expert's w13/w2 + scale/offset/scale_bias + fp32 scale
+        from CPU buffers into a device resident slot.
+
+        Extracted from _update_weights' inner loop (the physical slot fill);
+        does NOT touch victim selection or log2phy bookkeeping — callers own
+        those. Shared by _update_weights (reactive) and _preload_hot_experts
+        (offline hot-expert preload at finalize time).
+        """
+        layer.w13_weight.data.untyped_storage()[slot * self.w13_expert_size_bytes : (slot + 1) * self.w13_expert_size_bytes].copy_(
+            self.w13_weights_cpu[layer_idx][eid].untyped_storage(), non_blocking=True
+        )
+        layer.w2_weight.data.untyped_storage()[slot * self.w2_expert_size_bytes : (slot + 1) * self.w2_expert_size_bytes].copy_(
+            self.w2_weights_cpu[layer_idx][eid].untyped_storage(), non_blocking=True
+        )
+        for attr_name, buffers in self.scale_cpu_buffers.items():
+            if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
+                continue
+            dev_tensor = getattr(layer, attr_name, None)
+            if dev_tensor is None:
+                continue
+            src = buffers[layer_idx][eid]
+            dev_tensor.data[slot].copy_(
+                src.reshape(dev_tensor.data[slot].shape), non_blocking=True)
+        for attr_name, buffers in self.offset_cpu_buffers.items():
+            if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
+                continue
+            dev_tensor = getattr(layer, attr_name, None)
+            if dev_tensor is None:
+                continue
+            src = buffers[layer_idx][eid]
+            dev_tensor.data[slot].copy_(
+                src.reshape(dev_tensor.data[slot].shape), non_blocking=True)
+        for attr_name, buffers in self.scale_bias_cpu_buffers.items():
+            if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
+                continue
+            dev_tensor = getattr(layer, attr_name, None)
+            if dev_tensor is None:
+                continue
+            src = buffers[layer_idx][eid]
+            dev_tensor.data[slot].copy_(
+                src.reshape(dev_tensor.data[slot].shape), non_blocking=True)
+        # Refresh derived fp32 scale if present (W8A8_DYNAMIC)
+        if hasattr(layer, 'w13_weight_scale_fp32'):
+            layer.w13_weight_scale_fp32[slot].copy_(
+                layer.w13_weight_scale.data[slot].to(torch.float32))
+
     def _update_weights(self, args):
         (
             topk_ids_h,
@@ -1201,44 +1253,7 @@ class ExpertOffloadManager:
                             sorted(list(need_to_load))[n_copies:][:20])
                     break  # no free slots — should not happen in normal usage
                 
-                layer.w13_weight.data.untyped_storage()[slot * self.w13_expert_size_bytes : (slot + 1) * self.w13_expert_size_bytes].copy_(
-                    self.w13_weights_cpu[layer_idx][eid].untyped_storage(), non_blocking=True
-                )
-                layer.w2_weight.data.untyped_storage()[slot * self.w2_expert_size_bytes : (slot + 1) * self.w2_expert_size_bytes].copy_(
-                    self.w2_weights_cpu[layer_idx][eid].untyped_storage(), non_blocking=True
-                )
-                # Copy scales/offsets from CPU to NPU
-                for attr_name, buffers in self.scale_cpu_buffers.items():
-                    if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
-                        continue
-                    dev_tensor = getattr(layer, attr_name, None)
-                    if dev_tensor is None:
-                        continue
-                    src = buffers[layer_idx][eid]
-                    dev_tensor.data[slot].copy_(
-                        src.reshape(dev_tensor.data[slot].shape), non_blocking=True)
-                for attr_name, buffers in self.offset_cpu_buffers.items():
-                    if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
-                        continue
-                    dev_tensor = getattr(layer, attr_name, None)
-                    if dev_tensor is None:
-                        continue
-                    src = buffers[layer_idx][eid]
-                    dev_tensor.data[slot].copy_(
-                        src.reshape(dev_tensor.data[slot].shape), non_blocking=True)
-                for attr_name, buffers in self.scale_bias_cpu_buffers.items():
-                    if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
-                        continue
-                    dev_tensor = getattr(layer, attr_name, None)
-                    if dev_tensor is None:
-                        continue
-                    src = buffers[layer_idx][eid]
-                    dev_tensor.data[slot].copy_(
-                        src.reshape(dev_tensor.data[slot].shape), non_blocking=True)
-                # Refresh derived fp32 scale if present (W8A8_DYNAMIC)
-                if hasattr(layer, 'w13_weight_scale_fp32'):
-                    layer.w13_weight_scale_fp32[slot].copy_(
-                        layer.w13_weight_scale.data[slot].to(torch.float32))
+                self._copy_expert_into_slot(layer, layer_idx, eid, slot)
                 # Update mapping
                 if victim is None:
                     victim = slot_owner[slot]
@@ -1251,6 +1266,56 @@ class ExpertOffloadManager:
                     reusable_slots.remove(slot)
                 n_copies += 1
 
+            self.load_stream.synchronize()
+
+    def _preload_hot_experts(self):
+        """Preload each layer's top-N hot experts into device resident slots
+        from offline statistics, and seed LRC hotness so they aren't evicted
+        before runtime observe() builds up real stats.
+
+        Triggered from _finalize_offload() when hot_expert_preload is on.
+        Reads hot_experts_file: {"<layer_idx>": [[expert_id, weight], ...]},
+        weight descending. Slot i = the i-th hottest expert. Fully rewrites
+        layer.log2phy (non-preloaded experts -> -1). No-op when the switch
+        is off, so default behavior is unchanged.
+        """
+        if not self.offload_config.hot_expert_preload:
+            return
+        path = self.offload_config.hot_experts_file
+        if not path:
+            logger.warning("[HOT-PRELOAD] hot_expert_preload=true but "
+                           "hot_experts_file empty, skip")
+            return
+        # 相对路径相对 expert_offload 模块目录 resolve（热点 JSON 始终放该目录）
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(__file__), path)
+        import json
+        with open(path) as f:
+            hot = json.load(f)                  # {"<layer_idx>": [[eid,w],...]}
+        ndev = self.num_device_experts
+        with torch_npu.npu.stream(self.load_stream):
+            for layer_idx, layer in enumerate(self.moe_layers):
+                pairs = hot.get(str(layer_idx))
+                if not pairs:
+                    logger.warning("[HOT-PRELOAD] l=%d missing in json, skip",
+                                   layer_idx)
+                    continue
+                pairs = pairs[:ndev]                        # top-ndev hottest
+                log2phy_np = self.log2phy_np
+                log2phy_np[:] = -1
+                weights = {}
+                for slot, (eid, w) in enumerate(pairs):
+                    self._copy_expert_into_slot(layer, layer_idx, eid, slot)
+                    log2phy_np[eid] = slot
+                    weights[eid] = w
+                layer.log2phy.copy_(self.log2phy_h)         # H2D writeback
+                if self.cache_policy is not None:
+                    self.cache_policy.seed_layer_hotness(layer_idx, weights)
+                if self._debug:
+                    logger.info("[HOT-PRELOAD] l=%d loaded %d hot experts, "
+                                "ids=%s",
+                                layer_idx, len(pairs),
+                                [p[0] for p in pairs[:20]])
             self.load_stream.synchronize()
 
     def predict_next_layer_experts_npu(
