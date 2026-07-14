@@ -964,6 +964,8 @@ class ExpertOffloadConfig:
         "expert_prefetch_num": 2,
         "shard_per_rank": True,
         "enable_multi_card": False,
+        "hot_expert_preload": False,
+        "hot_experts_file": "",
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -991,6 +993,23 @@ class ExpertOffloadConfig:
                 raise TypeError("The expert_map is not json.")
             if not (os.path.exists(self.expert_map_path) and os.access(self.expert_map_path, os.R_OK)):
                 raise ValueError("The expert_map is not exist.")
+        if not isinstance(self.config["hot_expert_preload"], bool):
+            raise TypeError("hot_expert_preload must be a boolean")
+        if self.hot_expert_preload:
+            if not self.hot_experts_file:
+                raise ValueError(
+                    "hot_expert_preload is True but hot_experts_file is empty")
+            if not self.hot_experts_file.endswith(".json"):
+                raise TypeError("hot_experts_file must be a .json file")
+            # 相对路径相对 expert_offload 模块目录 resolve（热点 JSON 始终放该目录）
+            hot_path = self.hot_experts_file
+            if not os.path.isabs(hot_path):
+                hot_path = os.path.join(os.path.dirname(__file__),
+                                        "expert_offload", hot_path)
+            if not (os.path.exists(hot_path) and os.access(hot_path, os.R_OK)):
+                raise ValueError(
+                    f"hot_experts_file not found or unreadable: "
+                    f"{self.hot_experts_file} (resolved: {hot_path})")
         if not isinstance(self.config["num_device_experts"], int):
             raise TypeError("num_device_experts must be an integer")
         if self.config["num_device_experts"] < 0:
