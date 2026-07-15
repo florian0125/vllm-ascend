@@ -83,11 +83,15 @@ ON_DEMAND_LOAD_MAX="${ON_DEMAND_LOAD_MAX:-}"
 PREDICTOR="${PREDICTOR:-fate}"                                     # existing
 
 # Checkpoint for learned predictors (e.g. mode2_pa_prevhs). Emitted into the
+# PREDICTOR=mode2_pa_prevhs
 # PREDICTOR=mode2_prevpa_prevhs_2tower
+# PREDICTOR=mode2_pa_prevhs_ptlg
+# PREDICTOR=mode2_prevpa_prevhs_ptlg
 # config as "expert_predictor_ckpt". Default = mode2_pa_prevhs lowrank w=2048.
-PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/keyi/llms/ai-predictor/mode2_pa/learned_predictor_study_mode2_pa.html.ckpts_260624_dump_2000/pa+prevhs_prompt_std_dist_lowrank_w=2048.pt}"
-# PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/h50048135/pre-att-dump-bias-600_1/learned_predictor_study_mode2_pa.html.ckpts/pa+prevhs_prompt_std_dist_lowrank_w=2048.pt}"
-# PREDICTOR_CKPT="${PREDICTOR_CKPT:-/home/h50048135/dump_sharegpt_260629_n2000_l64_s42/learned_predictor_study_mode2_pa.html.ckpts/prevpa+prevhs_prompt_std_dist_twotower_w=2048.pt}"
+PREDICTOR_CKPT="${PREDICTOR_CKPT:-/path/pa+prevhs_prompt_std_dist_lowrank_w=2048.pt}"
+# PREDICTOR_CKPT="${PREDICTOR_CKPT:-/path/prevpa+prevhs_prompt_std_dist_twotower_w=2048.pt}"
+# PREDICTOR_CKPT="${PREDICTOR_CKPT:-/path/pa+prevhs+ptlg_prompt_std_dist_lowrank_w=2048_miss=0.pt}"
+# PREDICTOR_CKPT="${PREDICTOR_CKPT:-/path/prevpa+prevhs+ptlg_prompt_std_dist_lowrank_w=2048_miss=0.pt}"
 
 # end-of-test hit-rate summary ([EXPERT-OFFLOAD-FINAL]). Requires the
 # seq-stats patch on the build AND CACHE_POLICY=1. Serve window: warmup=0,

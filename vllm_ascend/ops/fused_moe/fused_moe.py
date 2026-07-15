@@ -200,6 +200,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             # is the real gate output for both internal- and external-router paths.
             mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
                                hidden_states=x, router_logits=router_logits)
+            # cache this layer's gate output for the NEXT decode token's predict
+            mgr.ai_save_router_logits(layer, router_logits)
             # next-layer learned predictor (predicts_next_layer). After layer
             # n's on-demand load is done, predict n+1 from pre_attn[n] ‖ router_input[n]
             # (=x) and prefetch it so the H2D overlaps this layer's GMM. Self-gates

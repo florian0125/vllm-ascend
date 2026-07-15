@@ -343,6 +343,9 @@ class AIPredictCtx:
     pre_attn: torch.Tensor | None = None            # pre_attn[ℓ]        [n, H]
     router_input_prev: torch.Tensor | None = None   # router_input[ℓ-1] [n, H] | None@head0
     router_input: torch.Tensor | None = None
+    # the PREVIOUS decode token's router logits at THIS layer, i.e. router_logits[t-1, ℓ] (ATOM_SPEC["ptlg"] = ("lg", False,
+    # True, True): logit stream, NO layer shift, one token back)
+    router_logits_prev: torch.Tensor | None = None  # router_logits[t-1, ℓ] [n, E]
 
 
 class LearnedNPUPredictor(ExpertPredictor):
@@ -359,6 +362,7 @@ class LearnedNPUPredictor(ExpertPredictor):
     """
 
     IN_FEATURES: int = 1                       # H-blocks in the concatenated input
+    E_FEATURES: int = 0                        # E-dim (router-logit) blocks in the concatenated input.
     INPUT_SPEC: frozenset[str] = frozenset()   # AIPredictCtx fields consumed
     uses_model_forward_driver = True           # manager flag: run the AI driver
     # when True the manager runs the *next-layer* driver (capture pre_attn
@@ -388,12 +392,19 @@ class LearnedNPUPredictor(ExpertPredictor):
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         meta = ckpt["meta"]
         self.L = int(meta["L"]); self.E = int(meta["E"])
-        self.in_dim = int(meta["in_dim"]); self.top_k = int(meta["top_k"])
-        if self.in_dim % self.IN_FEATURES != 0:
+        self.in_dim = int(meta["in_dim"])
+        self.top_k = int(meta["top_k"])
+        
+        self.H = self.mgr.moe_layers[0].hidden_size
+        expect = self.IN_FEATURES * self.H + self.E_FEATURES * self.E
+        if self.in_dim != expect:
             raise ValueError(
-                f"{type(self).__name__}: in_dim={self.in_dim} not divisible by "
-                f"IN_FEATURES={self.IN_FEATURES} — wrong checkpoint for this composition?")
-        self.H = self.in_dim // self.IN_FEATURES
+                f"{type(self).__name__}: checkpoint in_dim={self.in_dim}, but this "
+                f"composition needs IN_FEATURES({self.IN_FEATURES})*H({self.H}) + "
+                f"E_FEATURES({self.E_FEATURES})*E({self.E}) = {expect}. Either "
+                f"IN_FEATURES/E_FEATURES don't describe the checkpoint's atom list, "
+                f"or it was trained on a model with a different hidden_size.")
+    
         self._dev = dev
         self._head = _build_head(meta["arch"])
         self._head.load(ckpt["params"], dev, torch.float32)
@@ -410,14 +421,10 @@ class LearnedNPUPredictor(ExpertPredictor):
                 f"{type(self).__name__}: checkpoint L={self.L} exceeds model MoE "
                 f"layers {n_moe}")
             
-        # NEW: the head's output width E = meta["E"] is the expert-id space this
+        # the head's output width E = meta["E"] is the expert-id space this
         # predictor selects over (topk in _ai_select_topk). If it doesn't match the
         # model's physical expert count, predicted ids can fall outside the per-layer
         # CPU expert buffers and _do_prefetch would IndexError (now filtered there).
-        # Warn loudly with both numbers so a mismatched checkpoint is obvious — a
-        # next-layer twotower dump trained for a different expert count is the first
-        # thing to check when it predicts but accuracy is poor. Non-fatal: the
-        # _do_prefetch filter keeps the run alive on the valid id subset.
         nt = self.mgr.num_total_experts
         if nt is not None and self.E != nt:
             logger.warning(

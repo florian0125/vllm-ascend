@@ -168,18 +168,15 @@ class ExpertOffloadManager:
         self._t_prehook = ("attn", "router", "hc", "lrc")
         self._t_label = {
             "attn": "Attention", "router": "Router (gate + select_experts)",
-            # CHANGE (#6): renamed; this is the on-demand miss path, which is
-            # evict-pick + scale/offset + weight H2D, not a pure transfer.
             "miss_load": "Cache-miss on-demand load (evict+H2D)",
             "compute": "Routed experts (fused_experts)",
             "shared": "Shared expert MLP",
-            # NEW (#2): structural hyperconnection ops (hc_pre/hc_post) + the two
+            # structural hyperconnection ops (hc_pre/hc_post) + the two
             # RMSNorms + residual clones around attention and the MoE.
             "hc": "Hyperconnection + layernorm + residual",
-            # NEW (#3): LRC cache-policy observe() bookkeeping (the O(num_experts)
-            # EMA update per token).
+            # LRC cache-policy observe() bookkeeping (the O(num_experts) EMA update per token).
             "lrc": "LRC policy observe()",
-            # NEW
+            # prefetch predict (CPU) + upload (H2D)
             "pf_compute": "Prefetch predict (CPU)",
             "pf_h2d": "Prefetch upload (H2D)",
             "pred_acc": "Prediction accuracy (|P&G|/|P|)",
@@ -283,6 +280,8 @@ class ExpertOffloadManager:
         # [max_tokens, H] fp32 — current-layer router_input[n] for the
         # next-layer driver (no ping-pong: consumed within layer n).
         self._ai_ri_cur_buf = None
+        self._ai_lg_buf = None
+        self._ai_lg_dirty = False
         self._ai_pending: dict[int, dict] = {}
 
     # ------------------------------------------------------------------ #
@@ -464,6 +463,20 @@ class ExpertOffloadManager:
                 if "router_input" in spec:
                     self._ai_ri_cur_buf = torch.zeros(
                         [mt, hidden_dim], dtype=torch.float32, device="npu")
+                # the ptlg (previous token router logits) cache.
+                if "router_logits_prev" in spec:
+                    e_ckpt = self._predictor.E
+                    if e_ckpt != self.num_total_experts:
+                        raise ValueError(
+                            f"[AI-PRED] {type(self._predictor).__name__} caches "
+                            f"per-layer router logits (ptlg), but checkpoint "
+                            f"E={e_ckpt} != model num_total_experts="
+                            f"{self.num_total_experts}; the two expert spaces "
+                            f"cannot be aligned. Use a checkpoint trained on this "
+                            f"model.")
+                    self._ai_lg_buf = torch.zeros(
+                        [self._predictor.L, mt, e_ckpt],
+                        dtype=torch.float32, device="npu")
         t7 = time.perf_counter()
         logger.info(
             "[OFFLOAD] finalize breakdown: process_weights=%.1fs "
@@ -1235,7 +1248,7 @@ class ExpertOffloadManager:
             Set of predicted expert IDs, or None if prediction is not
             possible (e.g. last layer, no gate weight).
         """
-        # CHANGE: delegate to the pluggable predictor (default FATEPredictor).
+        # delegate to the pluggable predictor (default FATEPredictor).
         # The FATE implementation is identical to the previous body (early-out
         # before .cpu(), then CPU linear+softmax+topk) — see
         # expert_predictor.py. Callers (the prefetch worker) are unchanged.
@@ -1253,7 +1266,7 @@ class ExpertOffloadManager:
         Used by the graph-mode host callback over the pre-staged pinned
         buffer (_prefetch_hs_h).
         """
-        # CHANGE: delegate to the pluggable predictor (default FATEPredictor).
+        # delegate to the pluggable predictor (default FATEPredictor).
         # Behavior is identical to the previous body. The graph-mode host
         # callback (_do_prefetch_host_callback) is unchanged — it still calls
         # this method over the pre-staged pinned buffer.
@@ -1436,9 +1449,11 @@ class ExpertOffloadManager:
                 if not getattr(self, "_warned_oob_predict", False):
                     logger.warning(
                         "[AI-PRED] dropping %d predicted expert id(s) outside "
-                        "[0,%d) at layer %d (e.g. %s); predictor head width "
-                        "(meta['E']) likely exceeds the model's expert count — "
-                        "check the checkpoint.",
+                        "[0,%d) at layer %d (e.g. %s). If the values are only "
+                        "slightly out of range, meta['E'] exceeds the model's "
+                        "expert count — check the checkpoint. If they are huge or "
+                        "negative, topk_ids was read before the predict finished — "
+                        "a stream-ordering bug, not a checkpoint problem.",
                         len(_bad), _nt, next_idx, sorted(_bad)[:8])
                     self._warned_oob_predict = True
                 predicted_experts -= _bad
@@ -1730,6 +1745,12 @@ class ExpertOffloadManager:
         router_prev = None
         if "router_input_prev" in spec and head_idx > 0:   # head 0 uses zeros
             router_prev = self._ai_ri_buf[(moe_idx - 1) % 2][:n]
+            
+        # (ptlg): the PREVIOUS decode token's logits for THIS head, written by
+        # ai_save_router_logits at this same layer one token ago on the compute stream
+        router_logits_prev = None
+        if "router_logits_prev" in spec:
+            router_logits_prev = self._ai_lg_buf[head_idx, :n]
 
         # Mirror the FATE worker's profiling gate exactly (profiling + cache policy +
         # summary not yet printed) so the stash can never grow without a consumer.
@@ -1744,7 +1765,8 @@ class ExpertOffloadManager:
 
         self._prefetch_layer_done[moe_idx] = threading.Event()
         ctx = AIPredictCtx(layer_idx=head_idx, n_tokens=n,
-                        pre_attn=pa, router_input_prev=router_prev)
+                        pre_attn=pa, router_input_prev=router_prev,
+                        router_logits_prev=router_logits_prev)
 
         with torch_npu.npu.stream(self._prefetch_stream):
             self._prefetch_stream.wait_event(copy_event)
@@ -1772,6 +1794,7 @@ class ExpertOffloadManager:
         topk_ids = ctx["topk_ids"]
         # .tolist() blocks until the predict finishes -> by the line after, the
         # predict's NPU timing events are complete and elapsed_time() won't block.
+        self._prefetch_stream.synchronize()
         predicted = set(int(e) for e in topk_ids.flatten().tolist())
 
         # highest-score-first order for the prefetch cap (no-op when uncapped —
@@ -1911,8 +1934,12 @@ class ExpertOffloadManager:
             predict_ev1 = torch_npu.npu.Event(enable_timing=True)
 
         self._prefetch_layer_done[target_idx] = threading.Event()
+        router_logits_prev = None
+        if "router_logits_prev" in self._predictor.input_spec:
+            router_logits_prev = self._ai_lg_buf[head_idx, :n]
         ctx = AIPredictCtx(layer_idx=head_idx, n_tokens=n,
-                           pre_attn=pa, router_input=router_cur)
+                           pre_attn=pa, router_input=router_cur,
+                           router_logits_prev=router_logits_prev)
 
         with torch_npu.npu.stream(self._prefetch_stream):
             self._prefetch_stream.wait_event(copy_event)
@@ -1926,6 +1953,7 @@ class ExpertOffloadManager:
         # .tolist() blocks until the predict completes; the H2D issued by
         # _do_prefetch below runs on _prefetch_stream and overlaps the caller's
         # subsequent compute (attention for head 0, GMM for heads >= 1).
+        self._prefetch_stream.synchronize()
         predicted = set(int(e) for e in topk_ids.flatten().tolist())
         priority = None
         if self._prefetch_max is not None and pri_scores is not None:
@@ -1966,6 +1994,62 @@ class ExpertOffloadManager:
         if self._predictor.head_index(moe_idx) is None:   # <-- don't save for leading layers
             return
         self._ai_ri_buf[moe_idx % 2][:n].copy_(router_input.to(torch.float32))
+        
+    def ai_save_router_logits(self, experts, router_logits: torch.Tensor):
+        """Post-gate: cache THIS layer's router logits for the NEXT decode token's
+        predict — the study's "ptlg" atom (ATOM_SPEC["ptlg"] = logit stream, NO
+        layer shift, one TOKEN back: router_logits[t-1, ℓ]). Only when the active
+        predictor consumes it. Eager + decode only.
+
+        Writes head ℓ's row-block of _ai_lg_buf; the value lives there until layer
+        ℓ of the NEXT token reads it in ai_predict_start — a whole token later,
+        which is why the cache is [L, n, E] and not a slot rotation.
+
+        Read/write ordering (why one slot per head is safe): this layer's own
+        predict already consumed this block — ai_prefetch_finish (.tolist())
+        host-blocks on the predict back in DeepseekV4DecoderLayer.forward, BEFORE
+        self.mlp() and therefore before this write is even enqueued. The next
+        token's read is ordered against this write by the copy_event
+        ai_predict_start records on the compute stream (same-stream FIFO). Same
+        discipline the single _ai_pa_buf already relies on.
+
+        Prefill / large batch: zero the cache instead of writing. A prefill pass
+        marks a new prompt, and training zero-fills pt* atoms at a prompt's first
+        decode token (study build_atom line ~2069: out[prev_tok_bad] = 0) — without
+        this reset the first decode token would read the PREVIOUS prompt's logits.
+        The _ai_lg_dirty guard keeps a chunked prefill to one zero_() total.
+        """
+        if not self._ai_active or _EXTRA_CTX.capturing:
+            return
+        if "router_logits_prev" not in self._predictor.input_spec:
+            return
+        if not getattr(self._predictor, "ready", False):
+            return
+        n = router_logits.shape[0]
+        if n > self.offload_threshold:                 # prefill / large batch
+            if self._ai_lg_dirty:
+                self._ai_lg_buf.zero_()
+                self._ai_lg_dirty = False
+            return
+        moe_idx = self._ai_layer_index(experts)
+        head_idx = self._predictor.head_index(moe_idx)
+        if head_idx is None:      # leading hash/dense layer: not in the checkpoint
+            return
+        if router_logits.shape[-1] != self._ai_lg_buf.shape[-1]:
+            # Defensive only: _finalize_offload already fails startup when the
+            # checkpoint's E != num_total_experts. If the GATE's width still
+            # differs here (e.g. zero/shared experts appended to the logits),
+            # ptlg cannot be aligned — say so once and leave the block zeroed
+            # rather than killing a live server over a prefetch hint. Mirrors the
+            # warning_once pattern update_weights uses for [SUBST].
+            logger.warning_once(
+                "[AI-PRED] router_logits width %d != ptlg cache width %d — ptlg "
+                "DISABLED (the predictor will see zeros for that input block, so "
+                "its accuracy will be far below the trained checkpoint's).",
+                router_logits.shape[-1], self._ai_lg_buf.shape[-1])
+            return
+        self._ai_lg_buf[head_idx, :n].copy_(router_logits.to(torch.float32))
+        self._ai_lg_dirty = True
 
     def trigger_next_layer_prefetch(self, layer,
                                     hidden_states: torch.Tensor):
@@ -2204,7 +2288,7 @@ class ExpertOffloadManager:
     def record_shared_time(self, layer, ms):    self._record_layer_time("shared", layer, ms)
     # "miss_load" is recorded internally in _update_weights.
 
-    # NEW (#2,#3,#6): router/gate now share one metric, so a pending value may be
+    # router/gate now share one metric, so a pending value may be
     # written by more than one call site (gate timer + select timer) before the
     # hit harvests it. Accumulate instead of overwrite. Same gate as
     # _record_layer_time (profiling + cache policy + summary not printed).
@@ -2218,14 +2302,14 @@ class ExpertOffloadManager:
             return
         self._t_pending[metric][idx] = self._t_pending[metric].get(idx, 0.0) + ms
 
-    # NEW (#2): gate GEMM time folds into the router stage. Called from the gate
+    # gate GEMM time folds into the router stage. Called from the gate
     # site (fused_moe.shared_forward_impl for is_internal_router, else
     # DeepseekV4MoE.forward). Accumulates into the same pending slot select_experts
     # writes to via record_router_time.
     def record_gate_time(self, layer, ms):
         self._accumulate_pending("router", layer, ms)
 
-    # NEW (#2,#4): pure-isolation stage timer. Drains the COMPUTE stream before and
+    # pure-isolation stage timer. Drains the COMPUTE stream before and
     # after the wrapped block so `metric` reflects the block's cost with nothing
     # else running on that stream (combine with quiesce_for_timing, which drains
     # the prefetch/load streams + the FATE worker, for full isolation). prehook
@@ -2305,7 +2389,7 @@ class ExpertOffloadManager:
         rates_by_layer = self._seq_token_layer_hits
         if not rates_by_layer:
             return
-        # CHANGE: cross-layer summary stats (avg/median/min/max + per-step total)
+        # cross-layer summary stats (avg/median/min/max + per-step total)
         # are computed over MoE layers only — drop the leading num_hash_layers
         # "hash" layers (layer_idx < self._num_hash_layers). The per-layer loops
         # below still record ALL layers, so the per-layer tables / CSV are
@@ -2323,7 +2407,7 @@ class ExpertOffloadManager:
                 d = self._t_step[m]
                 if not d:
                     continue
-                # CHANGE: exclude hash layers from the cross-layer reduction AND
+                # exclude hash layers from the cross-layer reduction AND
                 # the per-step total (shared filtered list).
                 vals = [v for li, v in d.items() if li >= nh]
                 if vals:
@@ -2356,9 +2440,7 @@ class ExpertOffloadManager:
         if self._seq_stats_done:
             _reset()
             return
-        # REMOVED (#10): the `if self._seq_warmup_remaining > 0:` warmup-discard
-        # branch. It referenced self._debug_update_weights, which is never defined
-        # (latent AttributeError if warmup>0), and warmup is unused (SEQ_WARMUP=0).
+
         n = len(token_stats)
         self._summary_seq_stats.append((
             sum(t[0] for t in token_stats) / n,
@@ -2470,7 +2552,7 @@ class ExpertOffloadManager:
         if self._profile_timing and self._t_sum_stepcnt > 0 and any(self._t_sum_win[mt] for mt in self._t_metrics):
             ns = self._t_sum_stepcnt
             lines += [" Per-layer timing (ms), decode path  [eager; relative breakdown, not absolute latency]"]
-            # CHANGE: iterate timing-only metrics so the fraction metrics aren't
+            # iterate timing-only metrics so the fraction metrics aren't
             # printed/labelled as ms (they get their own block below).
             for mt in self._t_timing_metrics:
                 if not self._t_sum_win[mt]:
@@ -2485,7 +2567,7 @@ class ExpertOffloadManager:
                     "     over windows: avg=%.3f median=%.3f min=%.3f max=%.3f" % tuple(win),
                 ]
             # per-layer means: fixed-width columns aligned under their headers.
-            # CHANGE: pf_compute/pf_h2d abbreviations added; iterate timing metrics.
+            # pf_compute/pf_h2d abbreviations added; iterate timing metrics.
             abbr = {"attn": "att", "router": "rtr", "hc": "hc", "lrc": "lrc",
                     "miss_load": "mld", "compute": "cmp", "shared": "shr",
                     "pf_compute": "pfc", "pf_h2d": "pfh"}
@@ -2566,7 +2648,7 @@ class ExpertOffloadManager:
             "| device_experts / routed | %d / %s |"
                 % (self.num_device_experts, self.num_total_experts),
             "| prefetch | %s | %s"
-                % ("on" if getattr(self.offload_config, "expert_prefetch_enabled", False) else "off", getattr(self.offload_config, "expert_predictor")),
+                % ("on" if getattr(self.offload_config, "expert_prefetch_enabled", False) else "off", getattr(self.offload_config, "expert_predictor") if getattr(self.offload_config, "expert_prefetch_enabled", False) else "None"),
             "| max_num_seqs / top_k / threshold | %s / %d / %d |"
                 % (meta.get("max_num_seqs", "?"), self.topk, self.offload_threshold),
             "| requests / decode_steps / gen_tokens | %d / %d / %d |"
@@ -2578,7 +2660,7 @@ class ExpertOffloadManager:
         ]
         if self._profile_timing and self._t_sum_stepcnt > 0:
             ns = self._t_sum_stepcnt
-            # CHANGE: ms metrics use ms labels...
+            # ms metrics use ms labels...
             for mt in self._t_timing_metrics:
                 if not self._t_sum_win[mt]:
                     continue

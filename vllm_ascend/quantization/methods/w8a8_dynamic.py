@@ -328,6 +328,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             num_tokens = topk_ids.size(0)
             mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
                                hidden_states=x, router_logits=router_logits)
+            # cache this layer's gate output for the NEXT decode token's predict
+            mgr.ai_save_router_logits(layer, router_logits)
             # next-layer learned predictor
             if getattr(mgr, "_ai_predicts_next", False):
                 mgr.ai_predict_prefetch_next(layer, x)
