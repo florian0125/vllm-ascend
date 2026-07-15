@@ -51,7 +51,7 @@ CPU_BIND="${CPU_BIND:-0}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/home/keyi/llms/benchmarks/hf_cache}"
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export USE_MODELSCOPE_HUB=0
-export VLLM_BATCH_INVARIANT=1
+export VLLM_BATCH_INVARIANT=0
 
 WAIT="${WAIT:-1000}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -100,6 +100,8 @@ build_serve() {
           --tensor-parallel-size "${TP}" --data-parallel-size "${DP}"
           --max-num-seqs "${MAX_NUM_SEQS}"
           --seed "${SEED}" --gpu-memory-utilization "${GPU_MEM_UTIL}"
+          --generation-config vllm
+          --override-generation-config '{"temperature":0.0,"top_p":1.0}'
           --enforce-eager --quantization ascend --enable-expert-parallel
           --trust-remote-code
           --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4

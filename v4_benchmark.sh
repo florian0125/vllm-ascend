@@ -207,6 +207,8 @@ build_engine_args() {
   ENGINE_ARGS=( --trust-remote-code
                 --tensor-parallel-size "${TP}"
                 --seed "${SEED}"
+                --generation-config vllm
+                --override-generation-config '{"temperature":0.0,"top_p":1.0}'
                 --gpu-memory-utilization "${GPU_MEM_UTIL}" )
   [[ "${ENFORCE_EAGER}" == "1" ]]  && ENGINE_ARGS+=( --enforce-eager )
   [[ -n "${MAX_MODEL_LEN}" ]]      && ENGINE_ARGS+=( --max-model-len "${MAX_MODEL_LEN}" )

@@ -19,7 +19,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   exit 1
 fi
 
-# conda activate moeoffv5-keyi
+conda activate moeoffv5-keyi
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 # ---- 1. CANN / NNAL (system-level) -----------------------------------------
@@ -72,7 +72,7 @@ export VLLM_ASCEND_ENABLE_FUSED_MC2=0                 # safe off on single card 
 export VLLM_SERVER_DEV_MODE=1                         # extra dev endpoints (only affects `vllm serve`)
 export ASCEND_LAUNCH_BLOCKING=0                       # async NPU dispatch (set 1 only to debug)
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-export VLLM_BATCH_INVARIANT=1                         # Enable batch invariance to get consistent results regardless of scheduling for online serve mode
+export VLLM_BATCH_INVARIANT=0                         # Enable batch invariance to get consistent results regardless of scheduling for online serve mode
 export VLLM_ENABLE_V1_MULTIPROCESSING=0               # Turn off multiprocessing to make the scheduling deterministic
 
 # CPU threading
