@@ -149,6 +149,7 @@ class ExpertOffloadManager:
         self._summary_request_cnt: int = 0
         self._summary_layer_rate_sum: dict[int, float] = {}
         self._summary_layer_rate_cnt: dict[int, int] = {}
+        self._summary_substitute_stats: list[float] = []
         self._seq_stats_done: bool = False
 
         # Generalized per-(layer, step) timing (decode path, profiling only).
@@ -395,6 +396,9 @@ class ExpertOffloadManager:
 
         ntotal = self.num_total_experts
         self.topk_ids_h = torch.zeros(
+            [self.offload_threshold, self.topk],
+            dtype=torch.int32, device="cpu", pin_memory=True)
+        self.gt_topk_ids_h = torch.zeros(
             [self.offload_threshold, self.topk],
             dtype=torch.int32, device="cpu", pin_memory=True)
         self.topk_weights_h = torch.zeros(
@@ -867,7 +871,8 @@ class ExpertOffloadManager:
     def update_weights(self, layer, topk_ids: torch.Tensor,
                         log2phy: torch.Tensor,
                         topk_weights: torch.Tensor | None = None,
-                        hidden_states: torch.Tensor | None = None) -> int:
+                        hidden_states: torch.Tensor | None = None,
+                        gt_topk_ids: torch.Tensor | None = None) -> int:
         """Incrementally page in needed experts, overwriting unused slots.
 
         Routes to prefill pool (full-overwrite) when num_tokens exceeds
@@ -921,7 +926,7 @@ class ExpertOffloadManager:
         if npu_event is not None:
             torch_npu.npu.current_stream().wait_event(npu_event)
 
-        topk_ids_h = self.topk_ids_h[:num_tokens]
+        topk_ids_h = self.topk_ids_h[:num_tokens]        
         topk_weights_h = None
         if (self.cache_policy is not None and topk_weights is not None 
                 and self.offload_config.cache_router_weight != 0):
@@ -932,6 +937,11 @@ class ExpertOffloadManager:
         topk_ids_h.copy_(topk_ids, non_blocking=_EXTRA_CTX.capturing)
         log2phy_h.copy_(log2phy, non_blocking=_EXTRA_CTX.capturing)
 
+        gt_topk_ids_h = None
+        if gt_topk_ids is not None:
+            gt_topk_ids_h = self.gt_topk_ids_h[:num_tokens]
+            gt_topk_ids_h.copy_(gt_topk_ids, non_blocking=_EXTRA_CTX.capturing)
+
         current_compute_stream = torch_npu.npu.current_stream()
         subscribed_compute_streams = get_subscribed_compute_streams()
         if current_compute_stream not in subscribed_compute_streams:
@@ -940,6 +950,7 @@ class ExpertOffloadManager:
 
         args = (
             topk_ids_h,
+            gt_topk_ids_h,
             log2phy_np,
             layer,
             layer_idx,
@@ -959,6 +970,7 @@ class ExpertOffloadManager:
     def _update_weights(self, args):
         (
             topk_ids_h,
+            gt_topk_ids_h,
             log2phy_np,
             layer,
             layer_idx,
@@ -1083,6 +1095,17 @@ class ExpertOffloadManager:
                 n_copies += 1
 
             self.load_stream.synchronize()
+
+            if gt_topk_ids_h is not None:
+                token_count, _ = topk_ids_h.shape
+                sum_subbed = 0.0
+                for t in range(token_count):
+                    topk_ids = set(topk_ids_h[t].tolist())
+                    gt_topk_ids = set(gt_topk_ids_h[t].tolist())
+                    num_subbed = self.topk - len(topk_ids & gt_topk_ids)
+                    sum_subbed += float(num_subbed)
+                
+                self._summary_substitute_stats.append(sum_subbed / float(token_count))
 
             if _time_miss_load:
                 copy_ms = (time.perf_counter() - _tc0) * 1000.0 if n_copies else 0.0
@@ -2295,6 +2318,11 @@ class ExpertOffloadManager:
         window_mean = [sum(s[i] for s in seq_stats) / nw for i in range(4)]
         step_mean = [self._summary_step_sum[i] / nstep for i in range(4)]
 
+        if len(self._summary_substitute_stats) > 0:
+            subbed_expert_mean = sum(self._summary_substitute_stats) / len(self._summary_substitute_stats)
+        else:
+            subbed_expert_mean = 0.0
+
         layers = sorted(self._summary_layer_rate_sum)
         pl_lines: list[str] = []
         row: list[str] = []
@@ -2322,25 +2350,30 @@ class ExpertOffloadManager:
             ]
         lines += [
             " Offload config",
-            "   device_experts    : %d / %s routed    device_layers: %d    moe_layers: %d"
+            "   device_experts      : %d / %s routed    device_layers: %d    moe_layers: %d"
                 % (self.num_device_experts, self.num_total_experts,
                    self.num_device_layers, len(self.moe_layers)),
-            "   top_k             : %d    offload_threshold: %d  (decode cache when batch<=%d)"
+            "   top_k               : %d    offload_threshold: %d  (decode cache when batch<=%d)"
                 % (self.topk, self.offload_threshold, self.offload_threshold),
-            "   cache_policy      : %s"
+            "   cache_policy        : %s"
                 % ("LRC" if self.cache_policy is not None else "off (arbitrary eviction)"),
-            "   prefetch          : %s"
+            "   prefetch            : %s"
                 % ("on" if getattr(self.offload_config, "expert_prefetch_enabled", False) else "off"),
+            "   expert substitution : %s    threshold: %.4f"
+                % ("on" if getattr(self.offload_config, "expert_substitution_enabled", False) else "off",
+                   getattr(self.offload_config, "expert_substitution_threshold", False)),
             " Workload measured (decode phase only)",
-            "   requests          : %d%s"
+            "   requests            : %d%s"
                 % (self._summary_request_cnt,
                    "" if self._summary_request_cnt > 0 else "  (finished-request hook not applied)"),
-            "   flush_windows     : %d" % nw,
-            "   decode_steps      : %d" % nstep,
-            "   gen_tokens        : %d" % self._summary_gen_tokens,
+            "   flush_windows       : %d" % nw,
+            "   decode_steps        : %d" % nstep,
+            "   gen_tokens          : %d" % self._summary_gen_tokens,
             " Hit rate (routed experts resident / routed experts needed)",
-            "   over decode_steps : avg=%.4f  median=%.4f  min=%.4f  max=%.4f" % tuple(step_mean),
-            "   over windows      : avg=%.4f  median=%.4f  min=%.4f  max=%.4f" % tuple(window_mean),
+            "   over decode_steps   : avg=%.4f  median=%.4f  min=%.4f  max=%.4f" % tuple(step_mean),
+            "   over windows        : avg=%.4f  median=%.4f  min=%.4f  max=%.4f" % tuple(window_mean),
+            " Number of Substituted Experts",
+            "   Average             : %.4f " % subbed_expert_mean,
         ]
 
         # Timing — one block per metric, then a per-layer table. Only when data

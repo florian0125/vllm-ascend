@@ -26,6 +26,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 from vllm_ascend.utils import get_weight_prefetch_method
 
+from vllm.logger import logger
 
 def select_experts(
     hidden_states: torch.Tensor,
@@ -136,6 +137,186 @@ def select_experts(
 
     return topk_weights, topk_ids
 
+def select_experts_with_substitution(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    top_k: int,
+    use_grouped_topk: bool,
+    renormalize: bool,
+    log2phy: torch.Tensor,
+    expert_substitution_threshold: float = 0.25,
+    topk_group: int | None = None,
+    num_expert_group: int | None = None,
+    custom_routing_function: Callable | None = None,
+    scoring_func: str = "softmax",
+    routed_scaling_factor=1.0,
+    e_score_correction_bias: torch.Tensor | None = None,
+    indices_type: torch.dtype | None = None,
+    mix_placement: bool = False,
+    num_logical_experts: int = -1,
+    num_shared_experts: int = 0,
+    num_experts: int = -1,
+    input_ids: torch.Tensor | None = None,
+    tid2eid: torch.Tensor | None = None,
+):
+    """
+    Fused experts with select experts.
+
+    Args:
+        router_logits: router logits of shape (num_tokens, hidden_size).
+        hidden_states: Hidden states of shape (num_tokens, hidden_size).
+        top_k: number of top k experts.
+        use_grouped_topk: Whether to group experts before selecting top-k.
+        renormalize: Whether to renormalize the routing weights.
+        topk_group: Number of expert groups to select from.
+        num_expert_group: Number of experts in each group.
+        custom_routing_function: Custom routing function.
+        scoring_func: Scoring function to use.
+        e_score_correction_bias: Correction bias to apply to expert scores.
+        indices_type: dtype of indices
+        num_experts: Number of experts.
+
+    Returns:
+        topk_weights: router weights of shape (num_tokens, top_k).
+        topk_ids: selected expert IDs of shape (num_tokens, top_k).
+    """
+    # prefetch w1_w3_proj.weight preprocess
+    weight_prefetch_method = get_weight_prefetch_method()
+    if weight_prefetch_method:
+        weight_prefetch_method.maybe_prefetch_moe_weight_preprocess(hidden_states, "gate_up")
+    is_support_npu_moe_gating_top_k = check_npu_moe_gating_top_k(
+        hidden_states=hidden_states,
+        top_k=top_k,
+        renormalize=renormalize,
+        topk_group=topk_group,
+        num_expert_group=num_expert_group,
+        scoring_func=scoring_func,
+        custom_routing_function=custom_routing_function,
+    )
+
+    if is_support_npu_moe_gating_top_k:
+        topk_weights, topk_ids = _select_experts_with_fusion_ops(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            topk_group=topk_group,
+            renormalize=renormalize,
+            e_score_correction_bias=e_score_correction_bias,
+            num_expert_group=num_expert_group,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            tid2eid=tid2eid,
+            input_ids=input_ids,
+        )
+    else:
+        topk_weights, topk_ids = _native_select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            num_experts=num_experts,
+            tid2eid=None,
+            input_ids=None,
+        )
+        # Apply routed scaling factor to weights
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * routed_scaling_factor
+    
+    def substitute_experts(
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        log2phy: torch.Tensor,
+        expert_substitution_threshold: float = 0.25,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        M, K = topk_ids.shape
+        
+        if scoring_func == "softmax":
+            scores = router_logits.softmax(dim=-1)
+        elif scoring_func == "sigmoid":
+            scores = router_logits.sigmoid()
+        elif scoring_func == "sqrtsoftplus":
+            scores = F.softplus(router_logits).sqrt()
+        else:
+            raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+        sorted_scores, _ = scores.sort(dim=-1, descending=True)
+        
+        midscore = sorted_scores[:, K].clamp(min=0)
+        upper = midscore * (1 + expert_substitution_threshold)
+        lower = midscore * (1 - expert_substitution_threshold)
+
+        selected_scores = torch.gather(scores, 1, topk_ids)
+        low_confidence = selected_scores < upper.unsqueeze(1)
+
+        in_cache = log2phy[topk_ids] >= 0
+        needs_sub = low_confidence & ~in_cache
+        if not needs_sub.any():
+            return topk_weights, topk_ids
+        
+        cached_list = torch.where(log2phy >= 0)[0].tolist()
+        cached_set: set[int] = set(cached_list)
+
+        out_ids: torch.Tensor = topk_ids.clone()
+        out_weights: torch.Tensor = topk_weights.clone()
+
+        for t in range(M):
+            rows = needs_sub[t].nonzero(as_tuple=True)[0]
+            if not rows.numel():
+                continue
+
+            token_scores = scores[t]
+
+            in_range = (token_scores >= lower[t]) & (token_scores < midscore[t])
+            pool = set(torch.where(in_range)[0].tolist()) & cached_set
+            pool.difference_update(out_ids[t].tolist())
+
+            sorted_pool = sorted(pool, key=lambda e: token_scores[e].item(), reverse=True)
+
+            for pos in rows.tolist():
+                if not sorted_pool:
+                    break
+                sub = sorted_pool.pop(0)
+                out_ids[t, pos] = sub
+                out_weights[t, pos] = token_scores[sub].item()
+
+        if renormalize:
+            out_weights = out_weights / out_weights.sum(dim=-1, keepdim=True)
+            
+        return out_weights, out_ids
+
+    # logger.info(f"[SUBSTITUTION] GT Expert IDs {topk_ids[0].tolist()}")
+    gt_topk_ids = topk_ids 
+    if log2phy is not None:     
+        topk_weights, topk_ids = substitute_experts(router_logits, topk_weights, topk_ids, log2phy, expert_substitution_threshold)
+        # logger.info(f"[SUBSTITUTION] Subbed Expert IDs {topk_ids[0].tolist()}")
+
+    if mix_placement:
+        shared_expert_routing_factor = 1.0 if is_support_npu_moe_gating_top_k else (1 / routed_scaling_factor)
+        batch_size = topk_ids.shape[0]
+        pad_shared_expert_ids = torch.arange(
+            num_logical_experts, num_logical_experts + num_shared_experts, dtype=topk_ids.dtype, device=topk_ids.device
+        ).repeat(batch_size, 1)
+
+        pad_shared_expert_weights = torch.full(
+            (topk_weights.shape[0], num_shared_experts),
+            shared_expert_routing_factor,
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
+        )
+
+        topk_ids = torch.cat([topk_ids, pad_shared_expert_ids], dim=1)
+        topk_weights = torch.cat([topk_weights, pad_shared_expert_weights], dim=1)
+
+    return topk_weights, topk_ids, gt_topk_ids
 
 def check_npu_moe_gating_top_k(
     hidden_states: torch.Tensor,

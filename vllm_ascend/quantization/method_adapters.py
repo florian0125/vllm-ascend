@@ -270,6 +270,8 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         mc2_mask: torch.Tensor | None = None,
+        enable_expert_substitution: bool = False,
+        expert_substitution_threshold: float = 0.25,
     ) -> torch.Tensor:
         return self.quant_method.apply(
             layer=layer,
@@ -295,6 +297,8 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
             apply_router_weight_on_input=apply_router_weight_on_input,
             mc2_mask=mc2_mask,
             tid2eid=self.tid2eid,
+            enable_expert_substitution=enable_expert_substitution,
+            expert_substitution_threshold=expert_substitution_threshold
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
