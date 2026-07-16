@@ -190,7 +190,7 @@ build_additional_config() {
     [[ -n "${ON_DEMAND_LOAD_MAX}" ]] && subst_key=",\"on_demand_load_max\":${ON_DEMAND_LOAD_MAX}"
     local seq_keys=""
     if [[ "${SEQ_STATS}" == "1" ]]; then
-      seq_keys=",\"seq_stats_num_seqs\":${LIMIT:-0}"
+      seq_keys=",\"seq_stats_num_seqs\":${SEQ_NUM}"
       [[ "${TIMING}" == "1" ]] && seq_keys="${seq_keys},\"cache_profile_timing\":true"
     fi
     parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${subst_key}${prefetch_key}${predictor_key}${prefetch_max_key},\"moe_offload_debug\":$(bool "${CACHE_DEBUG}")${seq_keys}}" )

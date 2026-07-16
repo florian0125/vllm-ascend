@@ -1012,9 +1012,13 @@ class ExpertOffloadManager:
             )
         else:
             self._update_weights(args)
-            # apply the SMoE substitution plan produced by _update_weights.
+            # apply the expert substitution plan produced by _update_weights.
             subst = self._pending_subst.pop(layer_idx, None)
             if subst:
+                # substitution must never reach a hash layer.
+                assert layer_idx >= self._num_hash_layers, (
+                    f"[SUBST] substitution planned for HASH layer {layer_idx} "
+                    f"(num_hash_layers={self._num_hash_layers}) — planning gate missing")
                 for real_eid, sub_eid in subst.items():
                     topk_ids[topk_ids == real_eid] = sub_eid
 
@@ -1074,8 +1078,11 @@ class ExpertOffloadManager:
             # are added to `protected` so the capped loads below can't evict them
             protected = set(needed)
             subst_map: dict[int, int] = {}
+            
+            # Substitution + cap apply to MoE layers ONLY
             cap = self._on_demand_load_max
-            if router_scores_h is not None and cap is not None:
+            is_moe_layer = layer_idx >= self._num_hash_layers
+            if router_scores_h is not None and cap is not None and is_moe_layer:
                 # Per-expert score = max over tokens of the raw gate logit (a
                 # monotone importance proxy; softmax/sigmoid would give the same
                 # ranking). Used both to order misses and to rank candidates.
@@ -1085,9 +1092,10 @@ class ExpertOffloadManager:
                     to_load = misses_sorted[:cap]          # load highest-score misses
                     tail = misses_sorted[cap:]             # substitute the rest
                     # Candidates: resident-INACTIVE experts (in the device cache
-                    # but not in this step's top-k), highest score first. Their
-                    # score is ≤ any active expert's, so the "< replaced score"
-                    # rule is a safety guard that essentially always holds.
+                    # but not in this step's top-k), highest score first. NOTE:
+                    # selection uses sqrtsoftplus(logit) + e_score_correction_bias
+                    # (topk_method=noaux_tc), so an inactive expert can outrank an
+                    # active one in raw-logit space
                     cand_pool = sorted((e for e in on_device if e not in needed),
                                        key=lambda e: escore[e], reverse=True)
                     used: set[int] = set()
@@ -1118,7 +1126,7 @@ class ExpertOffloadManager:
             # the end-of-run summary = (#experts substituted) / (#requests this
             # step). #substituted = len(subst_map) (misses beyond the cap that
             # were bridged from cache;
-            if (router_scores_h is not None and cap is not None
+            if (router_scores_h is not None and cap is not None and is_moe_layer
                     and not self._seq_stats_done):
                 _req = topk_ids_h.shape[0] or 1            # requests (decode tokens) this step
                 _sratio = len(subst_map) / _req
