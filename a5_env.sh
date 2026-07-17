@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# env_a3.sh — single environment file for vllm-ascend on Atlas A3 (Ascend 910).
+# a5_env.sh — single environment file for vllm-ascend on Atlas A3 (Ascend 910).
 # Fuses install-time + runtime + performance vars. Perf knobs adopted from a
 # known-good colleague config (see SESSION_SPEC.md for the classification).
 #
@@ -9,8 +9,8 @@
 # CANN 9.0.0 + torch/torch-npu 2.10.0 + triton-ascend 3.2.1.
 #
 # USAGE: SOURCE it (do NOT execute), every shell, before building or running:
-#     conda activate vllm-ascend
-#     source env_a3.sh
+#     conda activate moeoffv5
+#     source a5_env.sh
 # Then pick a free card per run:  ASCEND_RT_VISIBLE_DEVICES=5 python run_infer.py ...
 
 # ---- 0. Guard: must be sourced ---------------------------------------------
@@ -35,7 +35,7 @@ _NNAL_ENV="${ASCEND_HOME_PATH}/nnal/atb/set_env.sh"
 unset TORCH_NPU_PATH
 
 # ---- 3. A3 build target (DETECTED on this machine) -------------------------
-export SOC_VERSION="ascend910_9382"     # confirm with `npu-smi info -t board -i 0 -c 0`
+export SOC_VERSION="Ascend950PR_9597"     # confirm with `npu-smi info -t board -i 0`
 # NOTE: on A3 this value really matters — the full custom AscendC kernels are
 # compiled against it (unlike A5, which skipped them). A wrong SOC here = a
 # kernel build that succeeds but is wrong for the silicon.
