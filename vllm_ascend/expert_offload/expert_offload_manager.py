@@ -22,7 +22,7 @@ from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 from vllm_ascend.expert_offload.expert_predictor import make_predictor, AIPredictCtx
-
+from vllm_ascend.ops.fused_moe.experts_selector import substitute_experts
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
 def get_subscribed_compute_streams() -> set:
@@ -872,7 +872,11 @@ class ExpertOffloadManager:
                         log2phy: torch.Tensor,
                         topk_weights: torch.Tensor | None = None,
                         hidden_states: torch.Tensor | None = None,
-                        gt_topk_ids: torch.Tensor | None = None) -> int:
+                        router_logits: torch.Tensor | None = None,
+                        enable_expert_substitution: bool = False,
+                        expert_substitution_threshold: float = 0.25,
+                        renormalize: bool = False,
+                        scoring_func: str = "softmax") -> int:
         """Incrementally page in needed experts, overwriting unused slots.
 
         Routes to prefill pool (full-overwrite) when num_tokens exceeds
@@ -926,6 +930,14 @@ class ExpertOffloadManager:
         if npu_event is not None:
             torch_npu.npu.current_stream().wait_event(npu_event)
 
+        if enable_expert_substitution:
+            gt_topk_ids = topk_ids.clone()
+            subbed_weights, subbed_ids = substitute_experts(router_logits, topk_weights[:][:self.topk],
+                                                            topk_ids[:][:self.topk], log2phy,
+                                                            renormalize, expert_substitution_threshold, scoring_func)
+            topk_weights[:][:self.topk] = subbed_weights
+            topk_ids[:][:self.topk] = subbed_ids
+
         topk_ids_h = self.topk_ids_h[:num_tokens]        
         topk_weights_h = None
         if (self.cache_policy is not None and topk_weights is not None 
@@ -938,7 +950,7 @@ class ExpertOffloadManager:
         log2phy_h.copy_(log2phy, non_blocking=_EXTRA_CTX.capturing)
 
         gt_topk_ids_h = None
-        if gt_topk_ids is not None:
+        if enable_expert_substitution:
             gt_topk_ids_h = self.gt_topk_ids_h[:num_tokens]
             gt_topk_ids_h.copy_(gt_topk_ids, non_blocking=_EXTRA_CTX.capturing)
 

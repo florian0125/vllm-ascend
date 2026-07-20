@@ -35,7 +35,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
-from vllm_ascend.ops.fused_moe.experts_selector import select_experts, select_experts_with_substitution, zero_experts_compute
+from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
@@ -167,44 +167,24 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             num_experts,
             global_redundant_expert_num=global_redundant_expert_num,
             num_shared_experts=num_shared_experts,
+        )    
+
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            num_experts=num_logical_experts,
+            tid2eid=self.tid2eid,
+            input_ids=input_ids,
         )
-        if not enable_expert_substitution:
-            topk_weights, topk_ids = select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                top_k=top_k,
-                use_grouped_topk=use_grouped_topk,
-                renormalize=renormalize,
-                topk_group=topk_group,
-                num_expert_group=num_expert_group,
-                custom_routing_function=custom_routing_function,
-                scoring_func=scoring_func,
-                routed_scaling_factor=routed_scaling_factor,
-                e_score_correction_bias=e_score_correction_bias,
-                num_experts=num_logical_experts,
-                tid2eid=self.tid2eid,
-                input_ids=input_ids,
-            )
-            gt_topk_ids = None
-        else:
-            topk_weights, topk_ids, gt_topk_ids = select_experts_with_substitution(
-                hidden_states=x,
-                router_logits=router_logits,
-                top_k=top_k,
-                use_grouped_topk=use_grouped_topk,
-                renormalize=renormalize,
-                log2phy=log2phy,
-                expert_substitution_threshold=expert_substitution_threshold,
-                topk_group=topk_group,
-                num_expert_group=num_expert_group,
-                custom_routing_function=custom_routing_function,
-                scoring_func=scoring_func,
-                routed_scaling_factor=routed_scaling_factor,
-                e_score_correction_bias=e_score_correction_bias,
-                num_experts=num_logical_experts,
-                tid2eid=self.tid2eid,
-                input_ids=input_ids,
-            )
 
         # Expert offload: incrementally page in needed experts, update log2phy
         use_prefill_pool = False
@@ -217,8 +197,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
             num_tokens = topk_ids.size(0)
-            mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
-                               hidden_states=x, gt_topk_ids=gt_topk_ids)
+            mgr.update_weights(layer, topk_ids, log2phy, topk_weights, hidden_states=x, router_logits=router_logits,
+                               enable_expert_substitution=enable_expert_substitution,
+                               expert_substitution_threshold=expert_substitution_threshold,
+                               renormalize=renormalize, scoring_func=scoring_func)
             # next-layer learned predictor (predicts_next_layer). After layer
             # n's on-demand load is done, predict n+1 from pre_attn[n] ‖ router_input[n]
             # (=x) and prefetch it so the H2D overlaps this layer's GMM. Self-gates
@@ -819,43 +801,22 @@ class AscendFusedMoE(FusedMoE):
                     shared_out = tensor_model_parallel_all_reduce(shared_out)
                 set_flash_common3_context(shared_out=shared_out)
                 input_ids = getattr(get_forward_context(), "input_ids", None)
-                if not self.enable_expert_substitution:
-                    topk_weights, topk_ids = select_experts(
-                        hidden_states=hidden_states,
-                        router_logits=router_logits,
-                        top_k=self.top_k,
-                        use_grouped_topk=self.use_grouped_topk,
-                        renormalize=self.renormalize,
-                        topk_group=self.topk_group,
-                        num_expert_group=self.num_expert_group,
-                        custom_routing_function=self.custom_routing_function,
-                        scoring_func=self.scoring_func,
-                        routed_scaling_factor=self._original_routed_scaling_factor,
-                        e_score_correction_bias=self.e_score_correction_bias,
-                        num_experts=self.moe_config.num_experts,
-                        input_ids=input_ids,
-                        tid2eid=self.tid2eid,
-                    )
-                else:
-                    topk_weights, topk_ids, gt_topk_ids = select_experts_with_substitution(
-                        hidden_states=hidden_states,
-                        router_logits=router_logits,
-                        top_k=self.top_k,
-                        use_grouped_topk=self.use_grouped_topk,
-                        renormalize=self.renormalize,
-                        log2phy=self.log2phy,
-                        expert_substitution_threshold=self.expert_substitution_threshold,
-                        topk_group=self.topk_group,
-                        num_expert_group=self.num_expert_group,
-                        custom_routing_function=self.custom_routing_function,
-                        scoring_func=self.scoring_func,
-                        routed_scaling_factor=self._original_routed_scaling_factor,
-                        e_score_correction_bias=self.e_score_correction_bias,
-                        num_experts=self.moe_config.num_experts,
-                        input_ids=input_ids,
-                        tid2eid=self.tid2eid,
-                    )
-
+                topk_weights, topk_ids = select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    top_k=self.top_k,
+                    use_grouped_topk=self.use_grouped_topk,
+                    renormalize=self.renormalize,
+                    topk_group=self.topk_group,
+                    num_expert_group=self.num_expert_group,
+                    custom_routing_function=self.custom_routing_function,
+                    scoring_func=self.scoring_func,
+                    routed_scaling_factor=self._original_routed_scaling_factor,
+                    e_score_correction_bias=self.e_score_correction_bias,
+                    num_experts=self.moe_config.num_experts,
+                    input_ids=input_ids,
+                    tid2eid=self.tid2eid,
+                )
                 if isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl):
                     topk_weights = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(topk_weights, True, True)
                     topk_ids = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(topk_ids, True, True)
