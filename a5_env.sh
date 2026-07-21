@@ -19,7 +19,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   exit 1
 fi
 
-# conda activate moeoffv5
+conda activate moeoffv5-keyi
 # export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 # ---- 1. CANN / NNAL (system-level) -----------------------------------------
@@ -35,7 +35,7 @@ _NNAL_ENV="${ASCEND_HOME_PATH}/nnal/atb/set_env.sh"
 unset TORCH_NPU_PATH
 
 # ---- 3. A3 build target (DETECTED on this machine) -------------------------
-export SOC_VERSION="Ascend950PR_9597"     # confirm with `npu-smi info -t board -i 0`
+export SOC_VERSION="ascend950pr_9579"     # confirm with `npu-smi info -t board -i 0`
 # NOTE: on A3 this value really matters — the full custom AscendC kernels are
 # compiled against it (unlike A5, which skipped them). A wrong SOC here = a
 # kernel build that succeeds but is wrong for the silicon.
@@ -74,6 +74,8 @@ export ASCEND_LAUNCH_BLOCKING=0                       # async NPU dispatch (set 
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export VLLM_BATCH_INVARIANT=0                         # Enable batch invariance to get consistent results regardless of scheduling for online serve mode
 export VLLM_ENABLE_V1_MULTIPROCESSING=0               # Turn off multiprocessing to make the scheduling deterministic
+export COMPILE_CUSTOM_KERNELS=1
+export COPY_NON_BLOCKING=1
 
 # CPU threading
 export OMP_PROC_BIND=false
