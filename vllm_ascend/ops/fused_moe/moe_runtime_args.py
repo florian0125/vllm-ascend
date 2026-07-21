@@ -146,7 +146,16 @@ def build_fused_experts_input(
     w1_offset: torch.Tensor | None = None,
     w2_offset: torch.Tensor | None = None,
     swiglu_limit: float = 0.0,
+    num_local_experts: int | None = None,
 ) -> MoEFusedExpertsInput:
+    # Per-layer device-resident expert count. Auto-derived from w1 so callers
+    # don't need to pass it: w1's dim 0 (single tensor) or length (per-expert
+    # list) IS the number of experts the group_list must cover. Required for the
+    # AllGather decode path when num_device_experts varies per MoE layer — the
+    # shared moe_comm_method dispatcher can't track a per-layer count.
+    if num_local_experts is None:
+        num_local_experts = (len(w1) if isinstance(w1, (list, tuple))
+                             else w1.shape[0])
     return MoEFusedExpertsInput(
         hidden_states=hidden_states,
         topk_weights=topk_weights,
@@ -170,6 +179,7 @@ def build_fused_experts_input(
             apply_router_weight_on_input=apply_router_weight_on_input,
             log2phy=log2phy,
             pertoken_scale=pertoken_scale,
+            num_local_experts=num_local_experts,
         ),
         activation=activation,
         need_trans=need_trans,

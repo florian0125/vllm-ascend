@@ -399,11 +399,15 @@ class AscendFusedMoE(FusedMoE):
         from vllm_ascend.ascend_config import get_ascend_config
         from vllm_ascend.expert_offload.utils import init_expert_offload_config
         _offload_cfg = get_ascend_config().expert_offload_config
-        self.enable_expert_offload, _offload_emap = init_expert_offload_config(
-            _offload_cfg, kwargs.get("num_experts", 0))
+        # moe_counter is bumped below (after super().__init__), so this layer's
+        # registration index is counter+1 here. Used to resolve a per-layer
+        # num_device_experts when the config is a list.
+        _layer_idx = AscendFusedMoE.moe_counter + 1
+        self.enable_expert_offload, _offload_emap, _ndev = init_expert_offload_config(
+            _offload_cfg, kwargs.get("num_experts", 0), _layer_idx)
         if _offload_emap is not None:
             self._expert_map_offload = _offload_emap
-            self._expert_map_offload_count = _offload_cfg.num_device_experts
+            self._expert_map_offload_count = _ndev
 
         self._original_routed_scaling_factor = kwargs.get("routed_scaling_factor", 1.0)
         super().__init__(*args, **kwargs)
@@ -487,7 +491,8 @@ class AscendFusedMoE(FusedMoE):
         else:
             from vllm_ascend.expert_offload.utils import init_log2phy_for_offload
             self.log2phy = init_log2phy_for_offload(
-                self.global_num_experts, _offload_cfg.num_device_experts)
+                self.global_num_experts,
+                _offload_cfg.num_device_experts_for_layer(self.moe_instance_id))
 
         if not vllm_version_is("0.21.0"):
             self.expert_map_manager._local_num_experts = self.local_num_experts
@@ -582,7 +587,7 @@ class AscendFusedMoE(FusedMoE):
         mgr = ExpertOffloadManager.get_instance()
         layer_moe_idx = self.moe_instance_id
         orig_wl = self.weight_loader
-        ndev = mgr.num_device_experts
+        ndev = mgr.num_device_experts_for_layer(layer_moe_idx)
 
         def _offload_weight_loader(param, loaded_weight, weight_name, shard_id,
                                    expert_id, **kwargs):

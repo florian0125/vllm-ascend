@@ -47,7 +47,13 @@ class ExpertOffloadManager:
         from vllm_ascend.ascend_config import get_ascend_config
 
         self.offload_config = get_ascend_config().expert_offload_config
-        self.num_device_experts = self.offload_config.num_device_experts
+        # num_device_experts may now be per-layer (config list). Keep a
+        # representative scalar from the min across layers: the decode↔prefill
+        # dispatch threshold must use the smallest buffer so the most-
+        # constrained layer switches to full prefill before thrashing. When all
+        # layers share one value this is identical to the old behavior. Also
+        # reused as LRC cache_size (informational only).
+        self.num_device_experts = min(self.offload_config.num_device_experts_list)
         self.topk = vllm_config.model_config.hf_config.num_experts_per_tok
         self.offload_threshold = self.num_device_experts // self.topk
 
@@ -161,6 +167,14 @@ class ExpertOffloadManager:
     # ------------------------------------------------------------------ #
     #  Lifecycle: called during model init and after weight loading       #
     # ------------------------------------------------------------------ #
+
+    def num_device_experts_for_layer(self, layer_idx: int) -> int:
+        """Per-layer device-expert buffer size (delegates to offload config).
+
+        The config is the single source of truth: a scalar broadcasts, a list
+        indexes by MoE-layer registration order.
+        """
+        return self.offload_config.num_device_experts_for_layer(layer_idx)
 
     def init_layer_cpu_buffers(self, layer, layer_moe_idx: int):
         """Allocate CPU weight + scale/offset buffers for one MoE layer.
@@ -300,6 +314,20 @@ class ExpertOffloadManager:
         t2 = time.perf_counter()
 
         num_moe_layers = len(self.moe_layers)
+        # Validate a per-layer num_device_experts list covers every MoE layer.
+        # Scalars and single-element lists broadcast; a multi-element list must
+        # match the registered MoE-layer count exactly.
+        nde_list = self.offload_config.num_device_experts_list
+        if len(nde_list) > 1 and len(nde_list) != num_moe_layers:
+            raise ValueError(
+                f"num_device_experts list length ({len(nde_list)}) must equal "
+                f"the number of MoE layers ({num_moe_layers}); use a scalar or "
+                f"a single-element list to broadcast, or a list of length "
+                f"{num_moe_layers}")
+        if self._debug:
+            logger.info(
+                "[OFFLOAD] num_device_experts per layer (n_layers=%d): %s",
+                num_moe_layers, nde_list if len(nde_list) > 1 else nde_list[0])
         if self.offload_config.cache_policy_enabled:
             self.cache_requests = [0 for _ in range(num_moe_layers)]
             self.cache_hits = [0 for _ in range(num_moe_layers)]
@@ -310,6 +338,10 @@ class ExpertOffloadManager:
             self.cache_policy = LRCExpertCachePolicy(
                 num_layers=num_moe_layers,
                 num_experts=self.num_total_experts,
+                # cache_size is informational only (LRC eviction keys on
+                # hotness, not slot count). Use the representative min; the
+                # real per-layer slot count is each layer's device weight size,
+                # set per layer via the expert_map_offload.
                 cache_size=self.num_device_experts,
                 topk=self.topk,
                 recent_window=self.offload_config.cache_recent_window,
@@ -771,7 +803,8 @@ class ExpertOffloadManager:
         w13_weight_scale_fp32 from the freshly-loaded w13_weight_scale.
         """
         for i, layer in enumerate(self.moe_layers):
-            ndev = min(self.num_device_experts, layer.w13_weight.shape[0])
+            ndev = min(self.num_device_experts_for_layer(i),
+                       layer.w13_weight.shape[0])
             if hasattr(layer, 'w13_weight_scale_fp32'):
                 for j in range(ndev):
                     layer.w13_weight_scale_fp32[j].copy_(
@@ -1292,9 +1325,9 @@ class ExpertOffloadManager:
         import json
         with open(path) as f:
             hot = json.load(f)                  # {"<layer_idx>": [[eid,w],...]}
-        ndev = self.num_device_experts
         with torch_npu.npu.stream(self.load_stream):
             for layer_idx, layer in enumerate(self.moe_layers):
+                ndev = self.num_device_experts_for_layer(layer_idx)
                 pairs = hot.get(str(layer_idx))
                 if not pairs:
                     logger.warning("[HOT-PRELOAD] l=%d missing in json, skip",
