@@ -42,6 +42,13 @@ class MoERoutingParams:
     log2phy: torch.Tensor | None = None
     # Precomputed activation scales from prepare stage for quantized dispatch.
     pertoken_scale: torch.Tensor | None = None
+    # Per-layer device-resident expert count (= weight dim 0 of the w1 being
+    # multiplied). The shared moe_comm_method dispatcher cannot hold this (it is
+    # a process-wide singleton fixed to one layer's value), so it must be
+    # threaded per invocation for the AllGather decode path to size group_list
+    # to match the layer's weight. Auto-derived from w1 in
+    # build_fused_experts_input when not set explicitly.
+    num_local_experts: int = 0
 
 
 @dataclass(frozen=True, slots=True)

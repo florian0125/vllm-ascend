@@ -428,10 +428,15 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         from vllm_ascend.ascend_config import get_ascend_config
         from vllm_ascend.expert_offload.utils import init_expert_offload_config
         _offload_cfg = get_ascend_config().expert_offload_config
-        self.enable_expert_offload, _offload_emap = init_expert_offload_config(
-            _offload_cfg, moe_config.num_experts)
+        # The runner counter is incremented later in this constructor, so the
+        # next value is this layer's registration index.
+        _layer_idx = AscendMoERunner.moe_counter + 1
+        self.enable_expert_offload, _offload_emap, _ndev = \
+            init_expert_offload_config(
+                _offload_cfg, moe_config.num_experts, _layer_idx)
         if _offload_emap is not None:
             self._expert_map_offload = _offload_emap
+            self._expert_map_offload_count = _ndev
         self.top_k = moe_config.experts_per_token
         self._gate = gate
         self.hidden_size = moe_config.hidden_dim
@@ -509,7 +514,6 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             self.e_score_correction_bias.data = self.e_score_correction_bias.data.to(
                 dtype=vllm_config.model_config.dtype
             )
-
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
         self.multistream_overlap_shared_expert = (
             ascend_config.multistream_overlap_shared_expert and shared_experts is not None
@@ -558,6 +562,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # per-rank slots = device weight dim0); single-card = hottest-N slots. ---
         if self.enable_expert_offload:
             self.global_num_experts = moe_config.num_experts
+            _layer_capacity = _offload_cfg.num_device_experts_for_layer(
+                self.moe_instance_id)
             self.enable_multi_card = (
                 _offload_cfg.enable_multi_card and self.moe_config.ep_size > 1)
             from vllm_ascend.expert_offload.utils import (
@@ -565,6 +571,12 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             if self.enable_multi_card:
                 from vllm.distributed.parallel_state import get_ep_group as _gep
                 _ep = _gep()
+                if _layer_capacity % _ep.world_size != 0:
+                    raise ValueError(
+                        "num_device_experts for each multi-card MoE layer "
+                        "must be divisible by EP size; "
+                        f"layer={self.moe_instance_id}, "
+                        f"capacity={_layer_capacity}, ep_size={_ep.world_size}")
                 # NOTE: no ep_size*topk slot floor here. The device buffer is
                 # only used when it actually fits the active expert union —
                 # select_moe_comm_method routes to MC2+buffer iff
@@ -576,12 +588,12 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 # buffer-fit check in select_moe_comm_method is the correct
                 # bound. offload_threshold (= num_device_experts // topk) is set
                 # in ExpertOffloadManager.__init__.
-                _per_rank = _offload_cfg.num_device_experts // _ep.world_size
+                _per_rank = _layer_capacity // _ep.world_size
                 self.log2phy = init_log2phy_for_offload_multi_card(
                     self.global_num_experts, _per_rank, _ep.world_size,
                     _ep.rank_in_group)
                 self._expert_map = torch.arange(
-                    _offload_cfg.num_device_experts, dtype=torch.int32)
+                    _layer_capacity, dtype=torch.int32)
                 # device weight dim0 must equal per_rank slots (GMM groupList).
                 # NOTE: local_num_experts is a read-only property -> moe_config.num_local_experts;
                 # the small slot count is applied to moe_config in the offload block below
@@ -592,11 +604,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         "global_num_experts=%s num_device_experts(total)=%s "
                         "per_rank_slots=%s _expert_map.shape=%s",
                         _ep.world_size, _ep.rank_in_group, self.global_num_experts,
-                        _offload_cfg.num_device_experts, _per_rank,
+                        _layer_capacity, _per_rank,
                         tuple(self._expert_map.shape))
             else:
                 self.log2phy = init_log2phy_for_offload(
-                    self.global_num_experts, _offload_cfg.num_device_experts)
+                    self.global_num_experts, _layer_capacity)
 
         moe_config.global_redundant_expert_num = self.global_redundant_expert_num
         local_num_experts = moe_config.num_local_experts
@@ -616,9 +628,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         if self.enable_expert_offload:
             if self.enable_multi_card:
                 from vllm.distributed.parallel_state import get_ep_group as _gep
-                _offload_ne = _offload_cfg.num_device_experts // _gep().world_size
+                _offload_ne = _layer_capacity // _gep().world_size
             else:
-                _offload_ne = _offload_cfg.num_device_experts
+                _offload_ne = _layer_capacity
             self.moe_config.num_local_experts = _offload_ne
         # Keep ExpertMapManager's physical-expert map until checkpoint loading
         # finishes. The upstream loader uses it to place both original and
@@ -731,7 +743,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # fills the device weight with experts [0, ndev); num_device_experts is
         # the TOTAL slot count, so divide by ep_size. ep_size=1 (single-card) is
         # a no-op. CPU buffer still gets ALL experts (loaded above this guard).
-        ndev = mgr.num_device_experts // mgr.ep_size
+        layer_capacity = mgr.num_device_experts_for_layer(layer_moe_idx)
+        ndev = (layer_capacity // mgr.ep_size
+                if self.enable_multi_card else layer_capacity)
 
         def _offload_weight_loader(param, loaded_weight, weight_name, shard_id,
                                    expert_id, **kwargs):

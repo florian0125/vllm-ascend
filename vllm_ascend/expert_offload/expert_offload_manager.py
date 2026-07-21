@@ -66,7 +66,10 @@ class ExpertOffloadManager:
         from vllm_ascend.ascend_config import get_ascend_config
 
         self.offload_config = get_ascend_config().expert_offload_config
-        self.num_device_experts = self.offload_config.num_device_experts
+        # The minimum capacity is the conservative global dispatch threshold;
+        # actual weight and placement sizes are resolved per MoE layer.
+        self.num_device_experts = min(
+            self.offload_config.num_device_experts_list)
         # topk: 标准 MoE 用 num_experts_per_tok;Kimi-K3 用 num_experts_per_token(在 text_config)
         _hf = vllm_config.model_config.hf_config
         _tc = getattr(_hf, "text_config", None)
@@ -246,6 +249,14 @@ class ExpertOffloadManager:
     #  Lifecycle: called during model init and after weight loading       #
     # ------------------------------------------------------------------ #
 
+    def num_device_experts_for_layer(self, layer_idx: int) -> int:
+        """Per-layer device-expert buffer size (delegates to offload config).
+
+        The config is the single source of truth: a scalar broadcasts, a list
+        indexes by MoE-layer registration order.
+        """
+        return self.offload_config.num_device_experts_for_layer(layer_idx)
+
     def init_layer_cpu_buffers(self, layer, layer_moe_idx: int):
         """Allocate CPU weight + scale/offset buffers for one MoE layer.
 
@@ -412,6 +423,20 @@ class ExpertOffloadManager:
         t2 = time.perf_counter()
 
         num_moe_layers = len(self.moe_layers)
+        # Validate a per-layer num_device_experts list covers every MoE layer.
+        # Scalars and single-element lists broadcast; a multi-element list must
+        # match the registered MoE-layer count exactly.
+        nde_list = self.offload_config.num_device_experts_list
+        if len(nde_list) > 1 and len(nde_list) != num_moe_layers:
+            raise ValueError(
+                f"num_device_experts list length ({len(nde_list)}) must equal "
+                f"the number of MoE layers ({num_moe_layers}); use a scalar or "
+                f"a single-element list to broadcast, or a list of length "
+                f"{num_moe_layers}")
+        if self._debug:
+            logger.info(
+                "[OFFLOAD] num_device_experts per layer (n_layers=%d): %s",
+                num_moe_layers, nde_list if len(nde_list) > 1 else nde_list[0])
         if self.offload_config.cache_policy_enabled:
             self.cache_requests = [0 for _ in range(num_moe_layers)]
             self.cache_hits = [0 for _ in range(num_moe_layers)]
@@ -422,6 +447,10 @@ class ExpertOffloadManager:
             self.cache_policy = LRCExpertCachePolicy(
                 num_layers=num_moe_layers,
                 num_experts=self.num_total_experts,
+                # cache_size is informational only (LRC eviction keys on
+                # hotness, not slot count). Use the representative min; the
+                # real per-layer slot count is each layer's device weight size,
+                # set per layer via the expert_map_offload.
                 cache_size=self.num_device_experts,
                 topk=self.topk,
                 recent_window=self.offload_config.cache_recent_window,
@@ -971,7 +1000,8 @@ class ExpertOffloadManager:
         w13_weight_scale_fp32 from the freshly-loaded w13_weight_scale.
         """
         for i, layer in enumerate(self.moe_layers):
-            ndev = min(self.num_device_experts, _expert_weight(layer, "w13_weight").shape[0])
+            ndev = min(self.num_device_experts_for_layer(i),
+                       _expert_weight(layer, "w13_weight").shape[0])
             if hasattr(layer, 'w13_weight_scale_fp32'):
                 for j in range(ndev):
                     layer.w13_weight_scale_fp32[j].copy_(
@@ -1462,10 +1492,6 @@ class ExpertOffloadManager:
             npu_event = self._prefetch_layer_npu_event.pop(layer_idx, None)
         if npu_event is not None:
             torch_npu.npu.current_stream().wait_event(npu_event)
-        # num_device_experts is the TOTAL slot count; physical_range (the global
-        # physical-id space MC2 routes over) == total, and each rank holds
-        # num_device_experts//ep_size slots (== planner capacity per rank).
-        physical_range = self.num_device_experts
         num_tokens = topk_ids.size(0)
 
         # NOTE: the decode profile dummy must use the real dynamic placement
@@ -1492,7 +1518,8 @@ class ExpertOffloadManager:
         # (get_ep_group().cpu_group) — stream-independent, so it runs inside the
         # host callback. HCCL all_reduce CANNOT be a captured graph op, and the
         # planner needs the counts on host anyway.
-        per_rank_slots = self.num_device_experts // self.ep_size
+        layer_capacity = self.num_device_experts_for_layer(layer_idx)
+        per_rank_slots = layer_capacity // self.ep_size
         topk_ids_h = self.topk_ids_h[:num_tokens]
         log2phy_h = self.log2phy_h
         topk_ids_h.copy_(topk_ids, non_blocking=_EXTRA_CTX.capturing)
@@ -1630,14 +1657,15 @@ class ExpertOffloadManager:
         # Capacity overflow: spread log2phy so MC2 sees only valid physical ids
         # (avoids 561002). Correctness degraded for this layer but run survives.
         if placement.unassigned:
+            layer_capacity = per_rank_slots * self.ep_size
             spread = torch.arange(self.num_total_experts, dtype=torch.int32) \
-                % self.num_device_experts
+                % layer_capacity
             log2phy_h.copy_(spread)
             logger.warning(
                 "[multi_card_offload] rank=%s L=%s overflow(%d unassigned) "
                 "spread log2phy (physical_range=%s) — routing degraded",
                 self.ep_rank, layer_idx, len(placement.unassigned),
-                self.num_device_experts)
+                layer_capacity)
             return
 
         my_experts = placement.per_rank_experts[self.ep_rank]
@@ -1711,7 +1739,8 @@ class ExpertOffloadManager:
             # num_layers=1 then grow via add_layer() (LRC requires >= 1).
             self._mc_lrc = LRCExpertCachePolicy(
                 num_layers=1, num_experts=self.num_total_experts,
-                cache_size=self.num_device_experts, topk=self.topk)
+                cache_size=self.num_device_experts_for_layer(layer_idx),
+                topk=self.topk)
         while len(self._mc_lrc.layer_states) <= layer_idx:
             self._mc_lrc.add_layer()
         active = global_counts.nonzero(as_tuple=True)[0].tolist()
@@ -1903,9 +1932,9 @@ class ExpertOffloadManager:
         import json
         with open(path) as f:
             hot = json.load(f)                  # {"<layer_idx>": [[eid,w],...]}
-        ndev = self.num_device_experts
         with torch_npu.npu.stream(self.load_stream):
             for layer_idx, layer in enumerate(self.moe_layers):
+                ndev = self.num_device_experts_for_layer(layer_idx)
                 pairs = hot.get(str(layer_idx))
                 if not pairs:
                     logger.warning("[HOT-PRELOAD] l=%d missing in json, skip",
@@ -2091,7 +2120,8 @@ class ExpertOffloadManager:
         """Pick the single-card vs multi-card planner+H2D inner and its args."""
         self._is_prefetch = True
         if self.enable_multi_card:
-            per_rank_slots = self.num_device_experts // self.ep_size
+            per_rank_slots = (
+                self.num_device_experts_for_layer(next_idx) // self.ep_size)
             # mc2_mask_h=None: prefetch predicts the NEXT layer whose
             # active-token mask isn't known yet, so don't filter. Prefetch
             # placement is corrected by the next layer's reactive update

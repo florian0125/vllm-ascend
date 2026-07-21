@@ -986,6 +986,32 @@ class ExpertOffloadConfig:
             return self.config[key]
         raise AttributeError(f"Config has no attribute '{key}'")
 
+    def num_device_experts_for_layer(self, layer_idx: int) -> int:
+        """Resolve the per-layer device-expert buffer size.
+
+        A scalar config broadcasts to every MoE layer; a single-element list
+        also broadcasts; a multi-element list indexes by MoE-layer registration
+        order and must cover every registered MoE layer (length validated in
+        ExpertOffloadManager._finalize_offload).
+        """
+        val = self.config["num_device_experts"]
+        if isinstance(val, list):
+            if len(val) == 1:
+                return val[0]
+            if layer_idx >= len(val):
+                raise IndexError(
+                    f"num_device_experts list (len {len(val)}) does not cover "
+                    f"MoE layer {layer_idx}; set its length to the number of "
+                    f"MoE layers")
+            return val[layer_idx]
+        return val
+
+    @property
+    def num_device_experts_list(self) -> list[int]:
+        """num_device_experts as a list (scalar wrapped into a 1-element list)."""
+        val = self.config["num_device_experts"]
+        return val if isinstance(val, list) else [val]
+
     def _validate_config(self):
         if self.expert_map_path is not None:
             logger.info("The expert_map is %s", self.expert_map_path)
@@ -1010,10 +1036,27 @@ class ExpertOffloadConfig:
                 raise ValueError(
                     f"hot_experts_file not found or unreadable: "
                     f"{self.hot_experts_file} (resolved: {hot_path})")
-        if not isinstance(self.config["num_device_experts"], int):
-            raise TypeError("num_device_experts must be an integer")
-        if self.config["num_device_experts"] < 0:
-            raise ValueError(f"num_device_experts must >= 0; got {self.config['num_device_experts']} instead")
+        # num_device_experts may be a scalar (broadcast to every MoE layer) or
+        # a list of per-layer device-expert buffer sizes. A list must be
+        # non-empty with non-negative integer elements; its length must equal
+        # the number of MoE layers (validated in
+        # ExpertOffloadManager._finalize_offload, since num_moe_layers is only
+        # known after the model builds). A single-element list broadcasts.
+        nde = self.config["num_device_experts"]
+        if isinstance(nde, list):
+            if len(nde) == 0:
+                raise ValueError("num_device_experts list must not be empty")
+            if not all(isinstance(x, int) for x in nde):
+                raise TypeError(
+                    "num_device_experts list elements must be integers")
+            if any(x < 0 for x in nde):
+                raise ValueError(
+                    f"num_device_experts list elements must >= 0; got {nde}")
+        elif not isinstance(nde, int):
+            raise TypeError(
+                "num_device_experts must be an integer or a list of integers")
+        elif nde < 0:
+            raise ValueError(f"num_device_experts must >= 0; got {nde} instead")
         if not isinstance(self.config["num_device_layers"], int):
             raise TypeError("num_device_layers must be an integer")
         if self.config["num_device_layers"] < 1:
