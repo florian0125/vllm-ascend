@@ -315,15 +315,21 @@ class ExpertOffloadManager:
 
         num_moe_layers = len(self.moe_layers)
         # Validate a per-layer num_device_experts list covers every MoE layer.
-        # Scalars and single-element lists broadcast; a multi-element list must
-        # match the registered MoE-layer count exactly.
+        # Scalars and single-element lists broadcast; a multi-element list is
+        # indexed by MoE-layer registration order and must cover at least the
+        # layers registered so far. It may be longer to also cover MoE layers
+        # that register AFTER _finalize_offload — notably the MTP draft MoE,
+        # which loads with the drafter after the target model is finalized, so
+        # the count seen here (target layers only) is smaller than the final
+        # total. Requiring equality would reject the extra draft-layer entry.
         nde_list = self.offload_config.num_device_experts_list
-        if len(nde_list) > 1 and len(nde_list) != num_moe_layers:
+        if len(nde_list) > 1 and len(nde_list) < num_moe_layers:
             raise ValueError(
-                f"num_device_experts list length ({len(nde_list)}) must equal "
-                f"the number of MoE layers ({num_moe_layers}); use a scalar or "
-                f"a single-element list to broadcast, or a list of length "
-                f"{num_moe_layers}")
+                f"num_device_experts list length ({len(nde_list)}) must be at "
+                f"least the number of MoE layers registered so far "
+                f"({num_moe_layers}); use a scalar or a single-element list to "
+                f"broadcast, or a list of length >= {num_moe_layers} (append "
+                f"one entry per draft MoE layer, e.g. MTP)")
         if self._debug:
             logger.info(
                 "[OFFLOAD] num_device_experts per layer (n_layers=%d): %s",
