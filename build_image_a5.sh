@@ -20,6 +20,7 @@ IMAGE="${IMAGE:-vllm-ascend-a5:moe5}"
 SOC_VERSION="${SOC_VERSION:-ascend950pr_9579}"                       # confirm: npu-smi info -t board -i 0
 PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}"
 BASE_IMAGE="quay.io/ascend/cann:9.0.0-950-openeuler24.03-py3.12"
+# BASE_IMAGE="openeuler-vllm-ascend:lll-v1"
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 

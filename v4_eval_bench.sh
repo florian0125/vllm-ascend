@@ -23,7 +23,7 @@
 set -uo pipefail
 
 # ── server (unchanged from v4_eval.sh) ───────────────────────────────────────
-MODEL="${MODEL:-/mnt/data/DeepSeek-V4-Flash-w8a8-mtp}"
+MODEL="${MODEL:-/mnt/data/DeepSeek-V4-Flash-W8A8}"
 REMOE_GATE="${REMOE_GATE:-}"
 SERVED_NAME="${SERVED_NAME:-glm-5}"
 CARD="${CARD:-6}"
@@ -54,7 +54,7 @@ THINK="${THINK:-}"                      # ""=preset default, 0=Non-think, 1=Thin
 THINK_EFFORT="${THINK_EFFORT:-}"        # ""=preset default, high|max [D]
 LIMIT="${LIMIT:-}"                      # docs per task; empty = full (1319 / 12032 / 198)
 CONCURRENCY="${CONCURRENCY:-1}"         # pinned to 1 by MAX_NUM_SEQS=1
-TOKENIZER="${TOKENIZER:-/home/keyi/llms/dsv4-tokenizer}"
+TOKENIZER="${TOKENIZER:-/home/keyi/llms/benchmarks/dsv4-tokenizer}"
 OUT_DIR="${OUT_DIR:-./eval_results/$(date +%Y%m%d_%H%M%S)}"
 PROBE="${PROBE:-1}"                     # verify the served reasoning mode before running
 WAIT="${WAIT:-1000}"
@@ -98,7 +98,7 @@ preset() {
   case "$1" in
   gsm8k)          # [D] base-only benchmark; [R] validated instruct run reproduced verbatim
     P_TASK=gsm8k;                          P_ENDPOINT=completions; P_THINK=0; P_EFFORT=""
-    P_FEWSHOT=8;    P_MAXGEN=2048;         P_MAXLEN=""             # [R]
+    P_FEWSHOT=0;    P_MAXGEN=2048;         P_MAXLEN=""             # [R]
     P_REF="[R] instruct non-think 8-shot: strict 0.9431 / flexible 0.9439  |  [D] base 8-shot EM 90.8"
     ;;
   mmlu_pro)       # [D] High 86.4 is the headline and beats Max 86.2
@@ -182,6 +182,8 @@ build_serve() {
           --tensor-parallel-size "${TP}" --data-parallel-size "${DP}"
           --max-num-seqs "${MAX_NUM_SEQS}"
           --seed "${SEED}" --gpu-memory-utilization "${GPU_MEM_UTIL}"
+          --generation-config vllm
+          --override-generation-config '{"temperature":0.0,"top_p":1.0}'
           --enforce-eager --quantization ascend --enable-expert-parallel
           --trust-remote-code
           --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4

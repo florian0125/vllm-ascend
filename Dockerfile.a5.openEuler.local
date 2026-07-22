@@ -1,6 +1,6 @@
 # Dockerfile_a5.local — A5 (Ascend 950) image built from your LOCAL vllm +
-# vllm-ascend checkouts (no github clone for either). Only Mooncake is still
-# cloned from github during build, which the proxy build-args cover.
+# vllm-ascend checkouts. No github clone at all (Mooncake stage removed — it's
+# only for disaggregated / KV-transfer serving, which single-card use doesn't need).
 #
 # BUILD CONTEXT MUST BE THE PARENT DIR that contains BOTH:
 #     vllm/                and     vllm-ascend-moe5/
@@ -16,9 +16,10 @@
 #   - clean stale artifacts: rm -rf vllm-ascend-moe5/{build,csrc/build,*.egg-info}
 
 FROM quay.io/ascend/cann:9.0.0-950-openeuler24.03-py3.12
+# FROM vllm-ascend:dev-26.1.0.B060-A5-biaoka-py311-openEuler24.03-lts-x86_64
+# FROM openeuler-vllm-ascend:lll-v1
 
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-ARG MOONCAKE_TAG="v0.3.8.post1"
 
 WORKDIR /workspace
 SHELL ["/bin/bash", "-c"]
@@ -27,47 +28,41 @@ SHELL ["/bin/bash", "-c"]
 # yum, git, pip, curl, wget. Acceptable behind a trusted corporate proxy for a
 # build; remove once the proxy CA is properly trusted. ---
 ENV GIT_SSL_NO_VERIFY=true \
-    PIP_TRUSTED_HOST="mirrors.huaweicloud.com download.pytorch.org mirrors.tuna.tsinghua.edu.cn pypi.org files.pythonhosted.org repo.huaweicloud.com download-r2.pytorch.org"
+    PIP_TRUSTED_HOST="mirrors.huaweicloud.com download.pytorch.org download-r2.pytorch.org mirrors.tuna.tsinghua.edu.cn pypi.org files.pythonhosted.org repo.huaweicloud.com"
 RUN echo "sslverify=False" >> /etc/yum.conf && \
     { [ -f /etc/dnf/dnf.conf ] && echo "sslverify=False" >> /etc/dnf/dnf.conf || true; } && \
     echo "check_certificate = off" >> /etc/wgetrc && \
     echo "insecure" >> /root/.curlrc
 
-# Go: mooncake_installer.sh downloads/installs Go 1.23.8 itself. Its default URL
-# (golang.google.cn) is Google-hosted and proxy-blocked, so patch it to aliyun on
-# the HOST before building (one-time):
-#   sed -i 's#https://golang.google.cn/dl/#https://mirrors.aliyun.com/golang/#' \
-#     /home/keyi/code/vllm-ascend-moe5/tools/mooncake_installer.sh
-# These env vars put the Go it installs on PATH and route go-module fetches domestically.
-ENV PATH="/usr/local/go/bin:${PATH}" \
-    GOROOT=/usr/local/go \
-    GOPATH=/root/go \
-    GOPROXY=https://goproxy.cn,direct \
-    GOSUMDB=off \
-    GOINSECURE=*
-
-# mooncake installer script lives inside your vllm-ascend checkout
-COPY vllm-ascend-moe5/tools/mooncake_installer.sh /vllm-workspace/
-
-# clang (for triton-ascend) + Mooncake (cloned from github -> uses proxy build-arg)
+# Base build tools for the vLLM-Ascend kernel compile. (Mooncake stage removed:
+# it's only for disaggregated prefill/decode + KV transfer, which single-card
+# serving/eval doesn't use — your host install skipped it too. This also drops
+# the Go / yalantinglibs / extra -devel downloads that were failing on the proxy.)
 RUN yum update -y --setopt=sslverify=false && \
-    yum install -y --setopt=sslverify=false git vim wget net-tools gcc gcc-c++ make cmake numactl numactl-devel jemalloc clang patch && \
-    git clone --depth 1 --branch ${MOONCAKE_TAG} https://github.com/kvcache-ai/Mooncake /vllm-workspace/Mooncake && \
-    mv /vllm-workspace/mooncake_installer.sh /vllm-workspace/Mooncake/ && \
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
-    cd /vllm-workspace/Mooncake && \
-    bash mooncake_installer.sh -y && \
-    mkdir -p build && cd build && cmake .. -DUSE_ASCEND_DIRECT=ON && \
-    make -j$(nproc) && make install && \
-    rm -fr /vllm-workspace/Mooncake/build && rm -rf /var/cache/yum/*
+    yum install -y --setopt=sslverify=false git vim wget net-tools gcc gcc-c++ make cmake numactl numactl-devel jemalloc clang patch iproute tmux && \
+    rm -rf /var/cache/yum/*
 
 RUN pip config set global.index-url ${PIP_INDEX_URL} && \
+    python3 -m pip install --upgrade pip && \
     python3 -m pip install modelscope 'ray>=2.47.1,<=2.48.0' 'protobuf>3.20.0' && \
     python3 -m pip cache purge
 
+# Version pins from a5_env.sh — MUST be set BEFORE the vllm/vllm-ascend installs
+# (and they persist to runtime). vLLM reads VLLM_VERSION to stamp its version;
+# without it vLLM installs as 0.1.dev1 and vllm-ascend's version-gated imports
+# take the wrong branch (e.g. tries to import vllm ...fused_moe.expert_map_manager,
+# which only the wrong-version path expects). This mirrors the host build, where
+# `source a5_env.sh` sets these before Phase 3/4 of INSTALL_A3.md.
+ENV VLLM_VERSION=0.21.0 \
+    TORCH_VERSION=2.10.0 \
+    TORCH_NPU_VERSION=2.10.0 \
+    TORCHVISION_VERSION=0.25.0 \
+    TORCHAUDIO_VERSION=2.10.0 \
+    TRITON_ASCEND_VERSION=3.2.1
+
 # ---- vLLM from your LOCAL checkout (replaces the git clone) -----------------
 COPY vllm /vllm-workspace/vllm
-RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/[audio] --extra-index-url https://download.pytorch.org/whl/cpu/ && \
+RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /vllm-workspace/vllm/ --extra-index-url https://download.pytorch.org/whl/cpu/ && \
     python3 -m pip uninstall -y triton && \
     python3 -m pip cache purge
 
@@ -88,7 +83,48 @@ RUN export PIP_EXTRA_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pyp
     python3 -m pip install triton-ascend==3.2.1 --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi && \
     python3 -m pip cache purge
 
+# --- runtime env baked from a5_env.sh so the container matches the host even
+# without sourcing. Host-specific bits (CANN path, conda, NIC, pip indexes) are
+# NOT baked — you still `source env_a5_container.sh` for CANN set_env. ---
+ENV VLLM_USE_V1=1 \
+    VLLM_ASCEND_ENABLE_NZ=1 \
+    HCCL_OP_EXPANSION_MODE=AIV \
+    HCCL_BUFFSIZE=1024 \
+    PYTORCH_NPU_ALLOC_CONF=expandable_segments:True \
+    VLLM_ASCEND_ENABLE_FUSED_MC2=0 \
+    VLLM_SERVER_DEV_MODE=1 \
+    ASCEND_LAUNCH_BLOCKING=0 \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+    VLLM_BATCH_INVARIANT=0 \
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+    COMPILE_CUSTOM_KERNELS=1 \
+    COPY_NON_BLOCKING=1 \
+    OMP_PROC_BIND=false \
+    OMP_NUM_THREADS=10 \
+    ASCEND_CONNECT_TIMEOUT=10000 \
+    ASCEND_TRANSFER_TIMEOUT=10000 \
+    VLLM_ENGINE_READY_TIMEOUT_S=10000 \
+    VLLM_RPC_TIMEOUT=3600000 \
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=30000 \
+    USE_MULTI_BLOCK_POOL=1 \
+    USE_MULTI_GROUPS_KV_CACHE=1 \
+    VLLM_USE_MODELSCOPE=True \
+    VLLM_WORKER_MULTIPROC_METHOD=spawn
+
 RUN echo "export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:$LD_PRELOAD" >> ~/.bashrc
 RUN echo "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib" >> ~/.bashrc
 
+# --- live-edit support (Python-only edits, no rebuild) ----------------------
+# Snapshot the built vllm-ascend (compiled kernels + generated files like
+# _version.py). The entrypoint merges anything MISSING from the source tree back
+# in at container start — WITHOUT overwriting your files (cp -n). So you can
+# bind-mount your HOST vllm-ascend over /vllm-workspace/vllm-ascend
+# (run_container_a5.sh MOUNT_SRC=1) and edit its PYTHON on the host: your .py
+# comes from the mount, the .so kernels are restored from this snapshot. Kernels
+# never change for Python-only edits, so this stays valid until you rebuild.
+RUN mkdir -p /opt/va-backup && cp -a /vllm-workspace/vllm-ascend/. /opt/va-backup/ && rm -rf /opt/va-backup/.git
+RUN printf '#!/bin/bash\ncp -rn /opt/va-backup/. /vllm-workspace/vllm-ascend/ 2>/dev/null || true\nexec "$@"\n' \
+      > /usr/local/bin/va-entrypoint.sh && chmod +x /usr/local/bin/va-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/va-entrypoint.sh"]
 CMD ["/bin/bash"]
