@@ -1038,10 +1038,11 @@ class ExpertOffloadConfig:
                     f"{self.hot_experts_file} (resolved: {hot_path})")
         # num_device_experts may be a scalar (broadcast to every MoE layer) or
         # a list of per-layer device-expert buffer sizes. A list must be
-        # non-empty with non-negative integer elements; its length must equal
-        # the number of MoE layers (validated in
-        # ExpertOffloadManager._finalize_offload, since num_moe_layers is only
-        # known after the model builds). A single-element list broadcasts.
+        # non-empty with non-negative integer elements. Its length must cover
+        # at least the target MoE layers and may be longer to also cover draft
+        # MoE layers that register later (e.g. MTP); the lower bound is checked
+        # in ExpertOffloadManager._finalize_offload, since num_moe_layers is
+        # only known after the model builds. A single-element list broadcasts.
         nde = self.config["num_device_experts"]
         if isinstance(nde, list):
             if len(nde) == 0:
