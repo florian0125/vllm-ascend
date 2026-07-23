@@ -18,7 +18,7 @@
 set -uo pipefail
 
 # ─── EDIT HERE ▸ 1. WHAT TO RUN ──────────────────────────────────────────────
-MODEL="${MODEL:-/home/keyi/llms/deepseekv4-w8a8}"       # DeepSeek-V4 W8A8 checkpoint
+MODEL="${MODEL:-/home/keyi/llms/deepseekv4-w8a8}"    # Target model w4a8 qunat version, a5 only support w4a8, a3 support both
 REMOE_GATE="${REMOE_GATE:-}"
 CARD="${CARD:-6}"                                    # NPU id (your env uses 7)
 SERVED_NAME="${SERVED_NAME:-glm-5}"                  # must match server <-> bench client

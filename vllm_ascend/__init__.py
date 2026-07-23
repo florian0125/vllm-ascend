@@ -14,6 +14,16 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import torch
+def _safe_repr(t):
+    try:
+        import torch_npu
+        fmt = torch_npu.get_npu_format(t) if t.device.type == "npu" else "cpu"
+    except Exception:
+        fmt = "?"
+    return f"<Tensor {tuple(t.shape)} {t.dtype} {t.device} fmt={fmt}>"
+torch.Tensor.__repr__ = _safe_repr
+torch.nn.Parameter.__repr__ = _safe_repr
 
 import vllm_ascend.logger  # noqa: F401
 

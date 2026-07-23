@@ -13,7 +13,7 @@
 set -uo pipefail
 
 # ── server ───────────────────────────────────────────────────────────────────
-MODEL="${MODEL:-/home/keyi/llms/deepseekv4-w8a8}"
+MODEL="${MODEL:-/home/keyi/llms/deepseekv4-w8a8}"  # Target model w4a8 qunat version, a5 only support w4a8, a3 support both
 REMOE_GATE="${REMOE_GATE:-}"            # fine-tuned MoE gate dir/file; empty = off (adds moe_gate_override_path)
 SERVED_NAME="${SERVED_NAME:-glm-5}"     # lm-eval model= MUST match this
 CARD="${CARD:-6}"

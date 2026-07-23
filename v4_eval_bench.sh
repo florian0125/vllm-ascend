@@ -23,7 +23,7 @@
 set -uo pipefail
 
 # ── server (unchanged from v4_eval.sh) ───────────────────────────────────────
-MODEL="${MODEL:-/mnt/data/DeepSeek-V4-Flash-W8A8}"
+MODEL="${MODEL:-/mnt/data/DeepSeek-V4-Flash-W8A8}"  # Target model w4a8 qunat version, a5 only support w4a8, a3 support both
 REMOE_GATE="${REMOE_GATE:-}"
 SERVED_NAME="${SERVED_NAME:-glm-5}"
 CARD="${CARD:-6}"
