@@ -63,6 +63,15 @@ export no_proxy="127.0.0.1,localhost,${no_proxy:-}"; export NO_PROXY="${no_proxy
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+# read the sum of a Prometheus metric, including all label combinations
+metric_value() {
+  local file="$1" metric="$2"
+  awk -v metric="${metric}" '
+    $1 == metric || index($1, metric "{") == 1 { total += $2 }
+    END { print total + 0 }
+  ' "${file}"
+}
+
 # reap vLLM engine-core workers that outlive serve and keep holding NPU memory
 SERVE_PID=""
 reap() {
@@ -177,7 +186,42 @@ for ((i=0; i<WAIT/2; i++)); do
 done
 [[ "${ok}" == "1" ]] || die "server not ready in ${WAIT}s (see ${log})"
 
+# capture cumulative vLLM metrics immediately before lm_eval
+METRICS_BEFORE="${OUT_DIR}/metrics_before.prom"
+METRICS_AFTER="${OUT_DIR}/metrics_after.prom"
+curl -sf "http://127.0.0.1:${PORT}/metrics" > "${METRICS_BEFORE}" \
+  || die "could not read vLLM /metrics before evaluation"
+
 echo "[eval] server healthy -> running lm_eval"
 "${EVAL[@]}"; rc=$?
 echo "[eval] done rc=${rc}; results under ${OUT_DIR}"
+
+# capture cumulative vLLM metrics immediately after lm_eval
+curl -sf "http://127.0.0.1:${PORT}/metrics" > "${METRICS_AFTER}" \
+  || die "could not read vLLM /metrics after evaluation"
+
+TPOT_METRIC="vllm:request_time_per_output_token_seconds"
+before_sum=$(metric_value "${METRICS_BEFORE}" "${TPOT_METRIC}_sum")
+after_sum=$(metric_value "${METRICS_AFTER}" "${TPOT_METRIC}_sum")
+before_count=$(metric_value "${METRICS_BEFORE}" "${TPOT_METRIC}_count")
+after_count=$(metric_value "${METRICS_AFTER}" "${TPOT_METRIC}_count")
+
+awk -v bs="${before_sum}" -v as="${after_sum}" \
+    -v bc="${before_count}" -v ac="${after_count}" '
+BEGIN {
+  sum_delta = as - bs
+  count_delta = ac - bc
+
+  if (count_delta <= 0) {
+    print "[metrics] TPOT metric was not found or had no new observations."
+    exit
+  }
+
+  tpot_ms = (sum_delta / count_delta) * 1000
+  printf "────────────────────────────────────────────────────────────\n"
+  printf "[metrics] Mean TPOT: %.2f ms/token\n", tpot_ms
+  printf "[metrics] Requests measured: %d\n", count_delta
+  printf "────────────────────────────────────────────────────────────\n"
+}
+'
 exit "${rc}"
