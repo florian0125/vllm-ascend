@@ -18,6 +18,7 @@
 from collections.abc import Callable
 from typing import Any
 import time
+from contextlib import nullcontext
 
 import torch
 import torch_npu
@@ -264,38 +265,40 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             _om = ExpertOffloadManager.get_instance()
             if _om._profile_timing and not _EXTRA_CTX.capturing and x.size(0) <= _om.offload_threshold:
                 _tmgr = _om
-        if _tmgr is not None:
-            torch_npu.npu.current_stream().synchronize(); _t_router = time.perf_counter()
-
-        if self.multistream_overlap_gate:
-            fc3_context = get_flash_common3_context()
-            assert fc3_context is not None, (
-                "[vllm-ascend/W8A8_DYNAMIC] flash_common3 context is required when multistream_overlap_gate is enabled."
-            )
-            topk_weights = fc3_context.topk_weights
-            topk_ids = fc3_context.topk_ids
-        else:
-            topk_weights, topk_ids = select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                top_k=top_k,
-                use_grouped_topk=use_grouped_topk,
-                renormalize=renormalize,
-                topk_group=topk_group,
-                num_expert_group=num_expert_group,
-                custom_routing_function=custom_routing_function,
-                scoring_func=scoring_func,
-                routed_scaling_factor=routed_scaling_factor,
-                e_score_correction_bias=e_score_correction_bias,
-                mix_placement=mix_placement,
-                num_logical_experts=router_logits.shape[1],
-                num_shared_experts=n_shared_experts,
-                num_experts=num_logical_experts,
-                tid2eid=tid2eid,
-            )
-        if _tmgr is not None:
-            torch_npu.npu.current_stream().synchronize()
-            _tmgr.record_router_time(layer, (time.perf_counter() - _t_router) * 1000.0)
+                
+        _rctx = (_tmgr.time_stage("router", layer, x.size(0), accumulate=True)
+                 if _tmgr is not None else nullcontext())
+        with _rctx:
+            if self.multistream_overlap_gate:
+                fc3_context = get_flash_common3_context()
+                assert fc3_context is not None, (
+                    "[vllm-ascend/W8A8_DYNAMIC] flash_common3 context is required when multistream_overlap_gate is enabled."
+                )
+                topk_weights = fc3_context.topk_weights
+                topk_ids = fc3_context.topk_ids
+            else:
+                topk_weights, topk_ids = select_experts(
+                    hidden_states=x,
+                    router_logits=router_logits,
+                    top_k=top_k,
+                    use_grouped_topk=use_grouped_topk,
+                    renormalize=renormalize,
+                    topk_group=topk_group,
+                    num_expert_group=num_expert_group,
+                    custom_routing_function=custom_routing_function,
+                    scoring_func=scoring_func,
+                    routed_scaling_factor=routed_scaling_factor,
+                    e_score_correction_bias=e_score_correction_bias,
+                    mix_placement=mix_placement,
+                    num_logical_experts=router_logits.shape[1],
+                    num_shared_experts=n_shared_experts,
+                    num_experts=num_logical_experts,
+                    tid2eid=tid2eid,
+                )
+                
+        # if _tmgr is not None:
+        #     torch_npu.npu.current_stream().synchronize()
+        #     _tmgr.record_router_time(layer, (time.perf_counter() - _t_router) * 1000.0)
         assert topk_ids is not None
         assert topk_weights is not None
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -392,35 +395,32 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
         w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
 
-        if _tmgr is not None:
-            torch_npu.npu.current_stream().synchronize(); _t_compute = time.perf_counter()
-
-        final_hidden_states = moe_comm_method.fused_experts(
-            fused_experts_input=build_fused_experts_input(
-                hidden_states=x,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                w1=w1,
-                w2=w2,
-                quant_type=self.quant_type,
-                dynamic_eplb=self.dynamic_eplb,
-                expert_map=expert_map,
-                global_redundant_expert_num=global_redundant_expert_num,
-                mc2_mask=mc2_mask,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                log2phy=log2phy,
-                pertoken_scale=pertoken_scale,
-                activation=activation,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                w1_scale_bias=w1_scale_bias,
-                w2_scale_bias=w2_scale_bias,
-                swiglu_limit=layer.swiglu_limit,
+        _cctx = (_tmgr.time_stage("compute", layer, x.size(0), post=True)
+                 if _tmgr is not None else nullcontext())
+        with _cctx:
+            final_hidden_states = moe_comm_method.fused_experts(
+                fused_experts_input=build_fused_experts_input(
+                    hidden_states=x,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    w1=w1,
+                    w2=w2,
+                    quant_type=self.quant_type,
+                    dynamic_eplb=self.dynamic_eplb,
+                    expert_map=expert_map,
+                    global_redundant_expert_num=global_redundant_expert_num,
+                    mc2_mask=mc2_mask,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    log2phy=log2phy,
+                    pertoken_scale=pertoken_scale,
+                    activation=activation,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                    w1_scale_bias=w1_scale_bias,
+                    w2_scale_bias=w2_scale_bias,
+                    swiglu_limit=layer.swiglu_limit,
+                )
             )
-        )
-        if _tmgr is not None:
-            torch_npu.npu.current_stream().synchronize()
-            _tmgr.record_compute_time(layer, (time.perf_counter() - _t_compute) * 1000.0)
         
         # learned-predictor prefetch FINISH — see the fused_moe.py twin. The
         # routed GMM is issued, so this host block and the H2D behind it overlap it.

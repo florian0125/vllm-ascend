@@ -30,6 +30,7 @@ from itertools import islice
 import glob
 import os
 import re
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -84,9 +85,9 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 
-import time  # v10
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX  # v10
-from vllm_ascend.expert_offload.expert_offload_manager import (  # v10
+import time
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.expert_offload.expert_offload_manager import (
     has_expert_offload_manager, get_expert_offload_manager)
 
 from vllm.logger import logger
@@ -360,7 +361,7 @@ class DeepseekV4MoE(nn.Module):
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
         else:
             # router_logits: (num_tokens, n_experts)
-            # NEW (#2): external-router gate GEMM into the "router" stage. Only one of
+            # external-router gate GEMM into the "router" stage. Only one of
             # the two gate sites runs per layer; this is the fallback when the gate is
             # NOT internal. nullcontext when no offload manager / not profiling.
             _eom = get_expert_offload_manager() if has_expert_offload_manager() else None
@@ -891,11 +892,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         _ai_ctx = None
         if _eom is not None and getattr(_eom, "_ai_active", False):
-            # split by driver mode. The next-layer driver (prevpa+prevhs)
-            # only CAPTURES pre_attn[n] here; it predicts n+1 later in fused_moe
-            # after the on-demand load. The current-layer driver (pa+prevhs) keeps
-            # predicting layer ℓ here, before attention.
-            # CHANGE: both branches now return a launch ctx that is finished after
+            # both branches now return a launch ctx that is finished after
             # the attention CALL is issued. For the next-layer driver that ctx is
             # non-None only at the first covered layer (head 0), whose predict
             # targets THIS layer and therefore must complete before self.mlp();
@@ -918,12 +915,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             if (_eom._profile_timing and not _EXTRA_CTX.capturing
                     and _n_tok <= _eom.offload_threshold):
                 _atmgr = _eom
-        if _atmgr is not None:
-            torch_npu.npu.current_stream().synchronize(); _t_attn = time.perf_counter()
-        hidden_states = self.self_attn(**attn_kwargs)
-        if _atmgr is not None:
-            torch_npu.npu.current_stream().synchronize()
-            _atmgr.record_attention_time(self.mlp.experts, (time.perf_counter() - _t_attn) * 1000.0)
+        _actx = (_atmgr.time_stage("attn", self.mlp.experts, _n_tok)
+                 if _atmgr is not None else nullcontext())
+        with _actx:
+            hidden_states = self.self_attn(**attn_kwargs)
 
         if _ai_ctx is not None:
             # serves BOTH drivers now (was "current-layer driver only").

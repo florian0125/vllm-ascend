@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
 import time
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -1072,20 +1073,19 @@ class AscendFusedMoE(FusedMoE):
                 if (_m._profile_timing and not _EXTRA_CTX.capturing
                         and hidden_states.shape[0] <= _m.offload_threshold):
                     _stmgr = _m
-            if _stmgr is not None:
-                torch_npu.npu.current_stream().synchronize(); _t_shared = time.perf_counter()
-            shared_out = self._forward_shared_experts(
-                hidden_states,
-                FusedMoEEvents(
-                    after_routed_experts=after_routed_experts,
-                    before_routed_experts=before_routed_experts,
-                    before_dispatch=fused_moe_results.before_dispatch_evt,
-                    before_gmm2=fused_moe_results.before_gmm2_evt,
-                    before_combine=fused_moe_results.before_combine_evt,
-                    swiglu_limit=fused_moe_results.swiglu_limit,
-                ),
-            )
-            if _stmgr is not None:
-                torch_npu.npu.current_stream().synchronize()
-                _stmgr.record_shared_time(self, (time.perf_counter() - _t_shared) * 1000.0)
+            _sctx = (_stmgr.time_stage("shared", self, hidden_states.shape[0],
+                                       post=True)
+                     if _stmgr is not None else nullcontext())
+            with _sctx:
+                shared_out = self._forward_shared_experts(
+                    hidden_states,
+                    FusedMoEEvents(
+                        after_routed_experts=after_routed_experts,
+                        before_routed_experts=before_routed_experts,
+                        before_dispatch=fused_moe_results.before_dispatch_evt,
+                        before_gmm2=fused_moe_results.before_gmm2_evt,
+                        before_combine=fused_moe_results.before_combine_evt,
+                        swiglu_limit=fused_moe_results.swiglu_limit,
+                    ),
+                )
         return shared_out, routed_out
