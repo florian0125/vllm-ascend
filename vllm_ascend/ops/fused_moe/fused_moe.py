@@ -311,39 +311,35 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 w2_scale_bias = None
 
         # bracket the routed MoE compute with a sync'd host timer
-        if _do_compute_timing:
-            torch_npu.npu.current_stream().synchronize()
-            _ct0 = time.perf_counter()
-
-        final_hidden_states = moe_comm_method.fused_experts(
-            fused_experts_input=build_fused_experts_input(
-                hidden_states=x,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                w1=w1,
-                w2=w2,
-                w1_bias=layer.w13_bias if self.moe.has_bias else None,
-                w2_bias=layer.w2_bias if self.moe.has_bias else None,
-                quant_type=QuantType.NONE,
-                dynamic_eplb=self.dynamic_eplb,
-                expert_map=expert_map,
-                global_redundant_expert_num=global_redundant_expert_num,
-                mc2_mask=mc2_mask,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                log2phy=log2phy,
-                pertoken_scale=pertoken_scale,
-                activation=activation,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                w1_scale_bias=w1_scale_bias,
-                w2_scale_bias=w2_scale_bias,
-                swiglu_limit=layer.swiglu_limit,
+        _cctx = (_timing_mgr.time_stage("compute", layer, num_tokens, post=True)
+                 if _do_compute_timing else nullcontext())
+        with _cctx:
+            final_hidden_states = moe_comm_method.fused_experts(
+                fused_experts_input=build_fused_experts_input(
+                    hidden_states=x,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    w1=w1,
+                    w2=w2,
+                    w1_bias=layer.w13_bias if self.moe.has_bias else None,
+                    w2_bias=layer.w2_bias if self.moe.has_bias else None,
+                    quant_type=QuantType.NONE,
+                    dynamic_eplb=self.dynamic_eplb,
+                    expert_map=expert_map,
+                    global_redundant_expert_num=global_redundant_expert_num,
+                    mc2_mask=mc2_mask,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    log2phy=log2phy,
+                    pertoken_scale=pertoken_scale,
+                    activation=activation,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                    w1_scale_bias=w1_scale_bias,
+                    w2_scale_bias=w2_scale_bias,
+                    swiglu_limit=layer.swiglu_limit,
+                )
             )
-        )
-        # read compute time after the combine completes, report it.
-        if _do_compute_timing:
-            torch_npu.npu.current_stream().synchronize()
-            _timing_mgr.record_compute_time(layer, (time.perf_counter() - _ct0) * 1000.0)
+            
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
             

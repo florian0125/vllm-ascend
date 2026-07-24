@@ -195,6 +195,11 @@ class ExpertOffloadManager:
         self._t_sum_layer_sum = {m: {} for m in self._t_metrics}
         self._t_sum_layer_cnt = {m: {} for m in self._t_metrics}
         self._t_sum_stepcnt = 0
+        # per-metric step count
+        self._t_sum_stepcnt_m = {m: 0 for m in self._t_metrics}
+        # set of metrics whose count diverged from ns this run, filled
+        # in _print_summary_stats.
+        self._t_diluted: dict = {}
 
         self._dump_csv = os.environ.get("CSV", "0") not in ("0", "", "false", "False")
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2080,7 +2085,7 @@ class ExpertOffloadManager:
             if predict_ev1 is not None:
                 predict_ev1.record()
 
-        # CHANGE: no sync, no .tolist(), no _do_prefetch here. Return the same
+        # no sync, no .tolist(), no _do_prefetch here. Return the same
         # ctx shape ai_predict_start returns so ONE finish serves both drivers.
         self._ai_pending[target_idx] = {"moe_idx": target_idx, "topk_ids": topk_ids,
                                         "pri_scores": pri_scores,
@@ -2100,76 +2105,6 @@ class ExpertOffloadManager:
             self.ai_prefetch_finish(ctx)
             return None
         return ctx
-    
-    
-            
-    def _ai_predict_and_prefetch(self, target_idx, head_idx, n, pa, router_cur,
-                                 copy_event):
-        """Shared predict -> select -> prefetch for BOTH twotower paths.
-
-        Predicts head `head_idx` (already offset-mapped) on the prefetch stream,
-        selects with `target_idx`'s gate config (activation + per-layer bias +
-        grouped-topk), prefetches `target_idx`, and keys the prefetch handshake by
-        `target_idx` (consumed by update_weights at `target_idx`). Callers stage
-        `pa`/`router_cur` and record `copy_event` on the compute stream first.
-
-          - head 0 (first covered layer): current-layer predict from this layer's
-            OWN pre_attn (router_cur=None -> assemble zeros the half), issued from
-            ai_capture_pre_attn so the H2D overlaps this layer's attention;
-          - heads >= 1: next-layer predict from pre_attn[n] ‖ router_input[n],
-            issued from ai_predict_prefetch_next so the H2D overlaps this layer's GMM.
-        """
-        target_layer = self.moe_layers[target_idx]
-        _record_profiling = (self._profile_timing and self.cache_policy is not None
-                             and not self._seq_stats_done)
-        predict_ev0 = predict_ev1 = None
-        if _record_profiling:
-            predict_ev0 = torch_npu.npu.Event(enable_timing=True)
-            predict_ev1 = torch_npu.npu.Event(enable_timing=True)
-
-        self._prefetch_layer_done[target_idx] = threading.Event()
-        router_logits_prev = None
-        if "router_logits_prev" in self._predictor.input_spec:
-            router_logits_prev = self._ai_lg_buf[head_idx, :n]
-        ctx = AIPredictCtx(layer_idx=head_idx, n_tokens=n,
-                           pre_attn=pa, router_input=router_cur,
-                           router_logits_prev=router_logits_prev)
-
-        with torch_npu.npu.stream(self._prefetch_stream):
-            self._prefetch_stream.wait_event(copy_event)
-            if predict_ev0 is not None:
-                predict_ev0.record()
-            logits = self._predictor.predict_logits_npu(head_idx, ctx)     # [n, E]
-            topk_ids, pri_scores = self._ai_select_topk(target_layer, logits)
-            if predict_ev1 is not None:
-                predict_ev1.record()
-
-        # .tolist() blocks until the predict completes; the H2D issued by
-        # _do_prefetch below runs on _prefetch_stream and overlaps the caller's
-        # subsequent compute (attention for head 0, GMM for heads >= 1).
-        self._prefetch_stream.synchronize()
-        predicted = set(int(e) for e in topk_ids.flatten().tolist())
-        priority = None
-        if self._prefetch_max is not None and pri_scores is not None:
-            priority = self._order_predicted_by_score(topk_ids, pri_scores)
-
-        compute_ms = 0.0
-        if predict_ev0 is not None and predict_ev1 is not None:
-            compute_ms = predict_ev0.elapsed_time(predict_ev1)
-
-        log2phy_np = target_layer.log2phy.cpu().numpy()
-        event = self._do_prefetch(
-            target_idx, predicted, log2phy_np,
-            priority=priority,
-            use_sleep=False, record_profiling=_record_profiling,
-            compute_ms=compute_ms,
-        )
-        with self._prefetch_state_lock:
-            if event is not None:
-                self._prefetch_layer_npu_event[target_idx] = event
-        done = self._prefetch_layer_done.get(target_idx)
-        if done is not None:
-            done.set()
 
     def ai_save_router_input(self, experts, router_input: torch.Tensor):
         """Post-attention: copy this layer's gate input into ping-pong slot ℓ%2
@@ -2709,6 +2644,7 @@ class ExpertOffloadManager:
                 self._t_sum_step[m][i] += sum(t[i] for t in cs)
             self._t_sum_win[m].append(tuple(sum(t[i] for t in cs) / k for i in range(4)))
             self._t_sum_total[m] += sum(self._t_seq_total[m])
+            self._t_sum_stepcnt_m[m] += k
             for lidx, vals in self._t_seq_layer[m].items():
                 self._t_sum_layer_sum[m][lidx] = self._t_sum_layer_sum[m].get(lidx, 0.0) + sum(vals)
                 self._t_sum_layer_cnt[m][lidx] = self._t_sum_layer_cnt[m].get(lidx, 0) + len(vals)
@@ -2798,6 +2734,21 @@ class ExpertOffloadManager:
         # TIMING=0. With timing off the ms metrics never collect a sample, so this
         # block skips itself and the fraction block still prints.
         ns = self._t_sum_stepcnt
+        self._t_diluted = {
+            m: self._t_sum_stepcnt_m[m]
+            for m in self._t_metrics
+            if self._t_sum_stepcnt_m[m] not in (0, ns)
+        }
+        if self._t_diluted:
+            logger.warning(
+                "[EXPERT-OFFLOAD] over-steps denominator divergence: ns=%d, but "
+                "these stages recorded a different number of steps — their "
+                "over-steps mean and total/step are DILUTED by count/ns (multiply "
+                "by ns/count to recover the per-firing mean). Summary still printed "
+                "in full; per-layer means are unaffected (own denominators). %s",
+                ns,
+                {m: {"count": c, "ns": ns, "ratio": round(c / ns, 4) if ns else 0.0}
+                 for m, c in self._t_diluted.items()})
         if ns > 0 and any(self._t_sum_win[mt] for mt in self._t_timing_metrics):
             lines += [" Per-layer timing (ms), decode path  [eager; NPU-event device time, each stage isolated — not additive to E2E latency]"]
             # iterate timing-only metrics so the fraction metrics aren't
@@ -2809,8 +2760,10 @@ class ExpertOffloadManager:
                 nwin = len(self._t_sum_win[mt])
                 win = [sum(w[i] for w in self._t_sum_win[mt]) / nwin for i in range(4)]
                 tot = self._t_sum_total[mt] / ns
+                _tag = (" [diluted ratio=%.4f]" % (self._t_sum_stepcnt_m[mt] / ns)
+                        if mt in self._t_diluted and ns else "")
                 lines += [
-                    "   %-26s total/step=%.3f" % (self._t_label[mt] + ":", tot),
+                    "   %-26s total/step=%.3f%s" % (self._t_label[mt] + ":", tot, _tag),
                     "     over steps  : avg=%.3f median=%.3f min=%.3f max=%.3f" % tuple(step),
                     "     over windows: avg=%.3f median=%.3f min=%.3f max=%.3f" % tuple(win),
                 ]
