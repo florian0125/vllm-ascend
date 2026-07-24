@@ -322,6 +322,10 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
 
         _do_compute_timing = False
         _timing_mgr = None
+        
+        # carries the learned predictor's launch ctx to region B (see the
+        # fused_moe.py twin — both MoE method paths must behave identically).
+        _ai_pf_ctx = None
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
@@ -330,9 +334,13 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                                hidden_states=x, router_logits=router_logits)
             # cache this layer's gate output for the NEXT decode token's predict
             mgr.ai_save_router_logits(layer, router_logits)
+            # FATE trigger moved here from after fused_experts — see the
+            # fused_moe.py twin for the full rationale (GMM-length lead recovered;
+            # placement after update_weights preserves cache_policy exclusivity).
+            mgr.trigger_next_layer_prefetch(layer, x)
             # next-layer learned predictor
             if getattr(mgr, "_ai_predicts_next", False):
-                mgr.ai_predict_prefetch_next(layer, x)
+                _ai_pf_ctx = mgr.ai_predict_prefetch_next(layer, x)
             if num_tokens > mgr.offload_threshold and mgr._prefill_initialized and not mgr._skip_prefill:
                 use_prefill_pool = True
                 try:
@@ -413,14 +421,22 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         if _tmgr is not None:
             torch_npu.npu.current_stream().synchronize()
             _tmgr.record_compute_time(layer, (time.perf_counter() - _t_compute) * 1000.0)
+        
+        # learned-predictor prefetch FINISH — see the fused_moe.py twin. The
+        # routed GMM is issued, so this host block and the H2D behind it overlap it.
+        if _ai_pf_ctx is not None:
+            mgr.ai_prefetch_finish(_ai_pf_ctx)
+            
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
-        # Trigger next-layer expert prefetch AFTER GMM kernel submission
-        # so compute_event captures real GMM work for true overlap.
-        if (getattr(layer, 'enable_expert_offload', False)
-                and not use_prefill_pool
-                and num_tokens <= mgr.offload_threshold):
-            mgr.trigger_next_layer_prefetch(layer, x)
+        # REMOVED: `mgr.trigger_next_layer_prefetch(layer, x)` moved to region A
+        # (right after update_weights). The `not use_prefill_pool` and
+        # `num_tokens <= mgr.offload_threshold` guards moved into the function.
+        # Restore decode-path expert count after prefill override
+        # if (getattr(layer, 'enable_expert_offload', False)
+        #         and not use_prefill_pool
+        #         and num_tokens <= mgr.offload_threshold):
+        #     mgr.trigger_next_layer_prefetch(layer, x)
         # Restore decode-path expert count after prefill override
         if use_prefill_pool:
             layer.moe_config.num_local_experts = _saved_nle

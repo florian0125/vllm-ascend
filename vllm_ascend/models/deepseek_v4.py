@@ -883,7 +883,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                                     accumulate=True, post=post)
                     if _eom is not None else nullcontext())
 
-        with _hc():  # NEW (#2): residual clone + hc_pre(attn) + input_layernorm
+        with _hc():  # residual clone + hc_pre(attn) + input_layernorm
             residual = hidden_states.clone()
             hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
             hidden_states = self.input_layernorm(hidden_states)
@@ -895,8 +895,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             # only CAPTURES pre_attn[n] here; it predicts n+1 later in fused_moe
             # after the on-demand load. The current-layer driver (pa+prevhs) keeps
             # predicting layer ℓ here, before attention.
+            # CHANGE: both branches now return a launch ctx that is finished after
+            # the attention CALL is issued. For the next-layer driver that ctx is
+            # non-None only at the first covered layer (head 0), whose predict
+            # targets THIS layer and therefore must complete before self.mlp();
+            # heads >= 1 are launched and finished inside fused_moe/w8a8.
             if getattr(_eom, "_ai_predicts_next", False):
-                _eom.ai_capture_pre_attn(self.mlp.experts, hidden_states)
+                _ai_ctx = _eom.ai_capture_pre_attn(self.mlp.experts, hidden_states)
             else:
                 _ai_ctx = _eom.ai_predict_start(self.mlp.experts, hidden_states)
 
@@ -907,7 +912,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         if _eom is not None:
             _eom.quiesce_for_timing(self.mlp.experts, _n_tok)
 
-        # v10: per-layer attention timing (MoE layers only, decode path, eager).
+        # per-layer attention timing (MoE layers only, decode path, eager).
         _atmgr = None
         if _eom is not None:
             if (_eom._profile_timing and not _EXTRA_CTX.capturing
@@ -921,12 +926,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             _atmgr.record_attention_time(self.mlp.experts, (time.perf_counter() - _t_attn) * 1000.0)
 
         if _ai_ctx is not None:
-            # Current-layer driver only; _ai_ctx stays None for the next-layer driver.
+            # serves BOTH drivers now (was "current-layer driver only").
+            # The attention call above is already issued, so the host block inside
+            # ai_prefetch_finish overlaps attention and the H2D it enqueues on
+            # _prefetch_stream overlaps the rest of it.
             _eom.ai_prefetch_finish(_ai_ctx)
 
-        with _hc():  # NEW (#2): hc_post(attn)
+        with _hc():  # hc_post(attn)
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        with _hc():  # NEW (#2): residual clone + hc_pre(ffn) + post_attention_layernorm
+        with _hc():  # residual clone + hc_pre(ffn) + post_attention_layernorm
             residual = hidden_states.clone()
             hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
             hidden_states = self.post_attention_layernorm(hidden_states)

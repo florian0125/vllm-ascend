@@ -190,6 +190,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # compute-timing gate, default off so non-offload paths are
         _do_compute_timing = False
         _timing_mgr = None
+        
+        # carries the learned predictor's launch ctx from here to region B.
+        # None on every non-AI path, so region B is a no-op there.
+        _ai_pf_ctx = None
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
@@ -202,12 +206,18 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                                hidden_states=x, router_logits=router_logits)
             # cache this layer's gate output for the NEXT decode token's predict
             mgr.ai_save_router_logits(layer, router_logits)
-            # next-layer learned predictor (predicts_next_layer). After layer
-            # n's on-demand load is done, predict n+1 from pre_attn[n] ‖ router_input[n]
-            # (=x) and prefetch it so the H2D overlaps this layer's GMM. Self-gates
-            # (eager+decode, covered layer); no-op for FATE and the pa+prevhs driver.
+            # FATE trigger moved here from after fused_experts. `x` is the
+            # MoE input and is already resident, so the prediction never needed to
+            # wait for the GMM — waiting cost a whole GMM of prefetch lead. Placed
+            # AFTER update_weights on purpose: that guarantees the worker's
+            # cache_policy.choose_victim(n+1) can never run concurrently with this
+            # layer's cache_policy.observe(n), and update_weights(n+1) still waits
+            # on _prefetch_layer_done[n+1] before touching the policy again.
+            # No-op for the learned predictors (the function returns early when
+            # _ai_active) and for prefill batches (it self-gates on n > threshold).
+            mgr.trigger_next_layer_prefetch(layer, x)
             if getattr(mgr, "_ai_predicts_next", False):
-                mgr.ai_predict_prefetch_next(layer, x)
+                _ai_pf_ctx = mgr.ai_predict_prefetch_next(layer, x)
             if num_tokens > mgr.offload_threshold and mgr._prefill_initialized and not mgr._skip_prefill:
                 use_prefill_pool = True
                 try:
@@ -335,10 +345,16 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             _timing_mgr.record_compute_time(layer, (time.perf_counter() - _ct0) * 1000.0)
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
-        # Trigger next-layer expert prefetch AFTER GMM kernel submission
-        # so compute_event captures real GMM work for true overlap.
-        if getattr(layer, 'enable_expert_offload', False) and not use_prefill_pool:
-            mgr.trigger_next_layer_prefetch(layer, x)
+            
+        # learned-predictor prefetch FINISH. Placed here because the routed
+        # GMM above is already ISSUED on the compute stream, so the host block
+        # inside ai_prefetch_finish waits on the predictor while the GMM runs, and
+        # the expert H2D it enqueues on _prefetch_stream overlaps the GMM tail plus
+        # the next layer's attention. _ai_pf_ctx is None under TIMING=1 and on
+        # every non-AI path, so this line is inert there.
+        if _ai_pf_ctx is not None:
+            mgr.ai_prefetch_finish(_ai_pf_ctx)
+
         # Restore decode-path expert count after prefill override
         if use_prefill_pool:
             layer.moe_config.num_local_experts = _saved_nle

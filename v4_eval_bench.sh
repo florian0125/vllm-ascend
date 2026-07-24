@@ -23,7 +23,7 @@
 set -uo pipefail
 
 # ── server (unchanged from v4_eval.sh) ───────────────────────────────────────
-MODEL="${MODEL:-/mnt/data/DeepSeek-V4-Flash-W8A8}"  # Target model w4a8 qunat version, a5 only support w4a8, a3 support both
+MODEL="${MODEL:-/mnt/nvme0n1_data/DeepSeek-V4-Flash-W8A8}"
 REMOE_GATE="${REMOE_GATE:-}"
 SERVED_NAME="${SERVED_NAME:-glm-5}"
 CARD="${CARD:-6}"
@@ -54,7 +54,7 @@ THINK="${THINK:-}"                      # ""=preset default, 0=Non-think, 1=Thin
 THINK_EFFORT="${THINK_EFFORT:-}"        # ""=preset default, high|max [D]
 LIMIT="${LIMIT:-}"                      # docs per task; empty = full (1319 / 12032 / 198)
 CONCURRENCY="${CONCURRENCY:-1}"         # pinned to 1 by MAX_NUM_SEQS=1
-TOKENIZER="${TOKENIZER:-/home/keyi/llms/benchmarks/dsv4-tokenizer}"
+TOKENIZER="${TOKENIZER:-/mnt/nvme1n1_data/TRT_HeteroCompute/keyi/benchmarks/dsv4-tokenizer}"
 OUT_DIR="${OUT_DIR:-./eval_results/$(date +%Y%m%d_%H%M%S)}"
 PROBE="${PROBE:-1}"                     # verify the served reasoning mode before running
 WAIT="${WAIT:-1000}"
@@ -62,15 +62,15 @@ DRY_RUN="${DRY_RUN:-0}"
 
 # ── constants (sources in APPENDIX A) ────────────────────────────────────────
 THINK_KEY="${THINK_KEY:-thinking}"   # [D][R][N]
-MAX_RETRIES=10                       # [R]
+MAX_RETRIES=3                        # [R]
 API_TIMEOUT=60000                    # [R]
-THINK_MAX_GEN_TOKS=16384             # [N] — overrides the yaml budgets, which assume no trace
+THINK_MAX_GEN_TOKS=270000            # [N] — overrides the yaml budgets, which assume no trace
 CHAT_TEMPERATURE=1.0                 # [D] — chat path only; the gsm8k completions path sends
 CHAT_TOP_P=0.95                      #       no gen_kwargs at all, to reproduce [R] exactly
 THINK_DROP_STOPS=1                   # [!] the one deviation — see APPENDIX A.5
 
 # ── dataset cache (pre-seeded; no download) ──────────────────────────────────
-export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/home/keyi/llms/benchmarks/hf_cache}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/mnt/nvme1n1_data/TRT_HeteroCompute/keyi/benchmarks/hf_cache}"
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export USE_MODELSCOPE_HUB=0
 export VLLM_BATCH_INVARIANT=0
@@ -80,6 +80,15 @@ export no_proxy="127.0.0.1,localhost,${no_proxy:-}"; export NO_PROXY="${no_proxy
 
 # =============================================================================
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+# read the sum of a Prometheus metric, including all label combinations
+metric_value() {
+  local file="$1" metric="$2"
+  awk -v metric="${metric}" '
+    $1 == metric || index($1, metric "{") == 1 { total += $2 }
+    END { print total + 0 }
+  ' "${file}"
+}
 
 [[ -z "${THINK}" || "${THINK}" =~ ^[01]$ ]] || die "THINK must be empty (use the preset), 0 or 1"
 [[ -z "${THINK_EFFORT}" || "${THINK_EFFORT}" =~ ^(high|max)$ ]] \
@@ -98,7 +107,7 @@ preset() {
   case "$1" in
   gsm8k)          # [D] base-only benchmark; [R] validated instruct run reproduced verbatim
     P_TASK=gsm8k;                          P_ENDPOINT=completions; P_THINK=0; P_EFFORT=""
-    P_FEWSHOT=0;    P_MAXGEN=2048;         P_MAXLEN=""             # [R]
+    P_FEWSHOT="";    P_MAXGEN=2048;         P_MAXLEN=""             # [R]
     P_REF="[R] instruct non-think 8-shot: strict 0.9431 / flexible 0.9439  |  [D] base 8-shot EM 90.8"
     ;;
   mmlu_pro)       # [D] High 86.4 is the headline and beats Max 86.2
@@ -182,8 +191,6 @@ build_serve() {
           --tensor-parallel-size "${TP}" --data-parallel-size "${DP}"
           --max-num-seqs "${MAX_NUM_SEQS}"
           --seed "${SEED}" --gpu-memory-utilization "${GPU_MEM_UTIL}"
-          --generation-config vllm
-          --override-generation-config '{"temperature":0.0,"top_p":1.0}'
           --enforce-eager --quantization ascend --enable-expert-parallel
           --trust-remote-code
           --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4
@@ -267,6 +274,92 @@ preflight() {
   }
 }
 
+resolve_tpot_metric() {
+  local file="$1" m
+  for m in vllm:request_time_per_output_token_seconds \
+           vllm:inter_token_latency_seconds \
+           vllm:time_per_output_token_seconds; do
+    if grep -q "^${m}_count" "${file}"; then
+      printf '%s' "${m}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+fetch_metrics() {
+  local dest="$1" label="${2:-}"
+  if curl -sf -m 30 "http://127.0.0.1:${PORT}/metrics" > "${dest}"; then
+    return 0
+  fi
+  echo "[metrics] WARN: could not read /metrics ${label} (port ${PORT})" >&2
+  : > "${dest}"   # leave a readable empty file so metric_value() still returns 0
+  return 1
+}
+
+report_tpot() {
+  local label="$1"
+
+  if [[ "${METRICS_OK}" != "1" ]]; then
+    echo "[metrics] ${label}: skipped, no baseline snapshot for this task." >&2
+    return 0
+  fi
+  # NEW: distinguish "server died mid-eval" from "curl failed". Without this both
+  # report identically and you go looking in the wrong place.
+  if ! kill -0 "${SERVE_PID}" 2>/dev/null; then
+    echo "[metrics] ${label}: skipped, vLLM server (pid ${SERVE_PID}) is gone; see ${log}." >&2
+    return 0
+  fi
+  fetch_metrics "${METRICS_AFTER}" "after ${label}" || return 0
+
+  # NOTE: `local metric` is declared on its own line, NOT as
+  # `local metric="$(resolve_tpot_metric ...)"`. In bash, `local` supplies the exit
+  # status of the whole statement, so the `||` fallback would never fire and a failed
+  # lookup would silently yield an empty string. Verified on bash 5.2.
+  local metric unit
+  metric="$(resolve_tpot_metric "${METRICS_AFTER}")" || metric=""
+  if [[ -z "${metric}" ]]; then
+    echo "[metrics] ${label}: no known TPOT histogram. Histograms this build exposes:" >&2
+    grep -E '^# TYPE vllm:.* histogram' "${METRICS_AFTER}" | awk '{print "           " $3}' >&2
+    return 0
+  fi
+
+  # NEW: a request-level histogram counts requests; an interval-level one counts
+  # inter-token intervals. Label it for what it actually is.
+  if [[ "${metric}" == "vllm:request_time_per_output_token_seconds" ]]; then
+    unit="Requests"
+  else
+    unit="Inter-token intervals"
+  fi
+
+  local before_sum after_sum before_count after_count
+  before_sum=$(metric_value "${METRICS_BEFORE}" "${metric}_sum")
+  after_sum=$(metric_value "${METRICS_AFTER}" "${metric}_sum")
+  before_count=$(metric_value "${METRICS_BEFORE}" "${metric}_count")
+  after_count=$(metric_value "${METRICS_AFTER}" "${metric}_count")
+
+  awk -v bs="${before_sum}" -v as="${after_sum}" \
+      -v bc="${before_count}" -v ac="${after_count}" \
+      -v metric="${metric}" -v unit="${unit}" -v task="${label}" '
+  BEGIN {
+    sum_delta = as - bs
+    count_delta = ac - bc
+
+    if (count_delta <= 0) {
+      print "[metrics] " task ": " metric " recorded no new observations."
+      exit
+    }
+
+    tpot_ms = (sum_delta / count_delta) * 1000
+    printf "────────────────────────────────────────────────────────────\n"
+    printf "[metrics] %s — Mean TPOT: %.2f ms/token   (source: %s)\n", task, tpot_ms, metric
+    printf "[metrics] %s measured: %d\n", unit, count_delta
+    printf "────────────────────────────────────────────────────────────\n"
+  }
+  '
+  return 0
+}
+
 # ── run ──────────────────────────────────────────────────────────────────────
 TASK_LIST="$(echo "${TASKS}" | tr ',' ' ')"
 P_FORCED_CHAT=0
@@ -293,6 +386,7 @@ for t in ${TASK_LIST}; do build_eval "${t}"; printf '+ %q ' "${EVAL[@]}"; echo; 
 
 preflight
 mkdir -p "${OUT_DIR}" ./bench_results
+for t in ${TASK_LIST}; do mkdir -p "${OUT_DIR}/${t}"; done
 trap reap EXIT
 
 log="./bench_results/serve_$(date +%Y%m%d_%H%M%S).log"
@@ -313,12 +407,29 @@ probe_thinking
 rc=0
 for t in ${TASK_LIST}; do
   build_eval "${t}"
+
+  # capture cumulative vLLM metrics immediately before lm_eval
+  METRICS_BEFORE="${OUT_DIR}/${t}/metrics_before.prom"
+  METRICS_AFTER="${OUT_DIR}/${t}/metrics_after.prom"
+  # CHANGE: was `curl -sf ... > "${METRICS_BEFORE}" || die "could not read vLLM
+  # /metrics before evaluation"`. That die() is what killed the reported run: the
+  # directory did not exist yet (fixed in Group 1), and the abort landed before the
+  # first lm_eval, discarding the whole multi-task run. METRICS_OK gates the report.
+  METRICS_OK=0
+  fetch_metrics "${METRICS_BEFORE}" "before ${t}" && METRICS_OK=1
+
   echo "[eval] === ${t}: ${P_TASK}  mode=$([[ ${P_THINK} == 1 ]] && echo "Think ${P_EFFORT}" || echo "Non-think")  target: ${P_REF} ==="
   "${EVAL[@]}"; trc=$?
   echo "[eval] ${t} rc=${trc} -> ${OUT_DIR}/${t}"
+  # CHANGE: moved up from the bottom of the loop body. It used to sit *after* the
+  # metrics block, so a die() in that block lost this task's non-zero rc entirely.
+  # Recording it immediately after lm_eval makes rc independent of anything below.
   [[ ${trc} -ne 0 ]] && rc=${trc}
+
+  report_tpot "${t}"
 done
 echo "[eval] done rc=${rc}; results under ${OUT_DIR}"
+
 exit "${rc}"
 
 # =============================================================================
