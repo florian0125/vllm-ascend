@@ -461,8 +461,6 @@ class AscendFusedMoE(FusedMoE):
         else:
             self.enable_expert_substitution = _offload_cfg.expert_substitution_enabled
         self.log2phy = None
-        logger.info(f"[SUBSTITUTION] Enable Expert Substitution: {self.enable_expert_substitution}")
-        logger.info(f"[SUBSTITUTION] Expert Substitution Threshold: {self.expert_substitution_threshold}")
 
         if not self.enable_expert_offload:
             self._expert_map = None
