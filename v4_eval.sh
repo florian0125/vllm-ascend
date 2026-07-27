@@ -33,6 +33,8 @@ EXPERT_PREFETCH_MAX="${EXPERT_PREFETCH_MAX:-}"
 ON_DEMAND_LOAD_MAX="${ON_DEMAND_LOAD_MAX:-}"
 PREDICTOR="${PREDICTOR:-fate}"
 PREDICTOR_CKPT="${PREDICTOR_CKPT:-}"    # only used when PREDICTOR != fate
+EXPERT_SUBSTITUTION="${EXPERT_SUBSTITUTION:-1}"
+EXPERT_SUBSTITUTION_THRESHOLD="${EXPERT_SUBSTITUTION_THRESHOLD:-0.25}"
 
 # ── eval ─────────────────────────────────────────────────────────────────────
 TASKS="${TASKS:-gsm8k}"
@@ -48,7 +50,7 @@ MOE_DEBUG="${MOE_DEBUG:-0}"                     # 1 -> moe_offload_debug:true (v
 CPU_BIND="${CPU_BIND:-0}" 
 
 # ── dataset cache (pre-seeded; no download) ──────────────────────────────────
-export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/home/keyi/llms/benchmarks/hf_cache}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/mnt/nvme1n1_data/TRT_HeteroCompute/keyi/benchmarks//hf_cache}"
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export USE_MODELSCOPE_HUB=0
 export VLLM_BATCH_INVARIANT=0
@@ -94,6 +96,10 @@ offload_json() {
     # so an empty EXPERT_PREFETCH_MAX reproduces the previous JSON byte-for-byte.
     [[ -n "${EXPERT_PREFETCH_MAX}" ]] && p="${p},\"expert_prefetch_max\":${EXPERT_PREFETCH_MAX}"
   }
+  [[ "${EXPERT_SUBSTITUTION}" == "1" ]] && {
+    p="${p},\"expert_substitution_enabled\":true,\"expert_substitution_threshold\":${EXPERT_SUBSTITUTION_THRESHOLD}"
+  }
+  printf '{"expert_offload_config":{%s}}' "${p}"
   p="${p},\"moe_offload_debug\":$([[ ${MOE_DEBUG} == 1 ]] && echo true || echo false)"
   p="${p},\"seq_stats_num_seqs\":${SEQ_STATS_NUM_SEQS}"
   p="${p},\"cache_profile_timing\":$([[ ${TIMING} == 1 ]] && echo true || echo false)"

@@ -26,6 +26,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 from vllm_ascend.utils import get_weight_prefetch_method
 
+from vllm.logger import logger
 
 def select_experts(
     hidden_states: torch.Tensor,
@@ -136,6 +137,71 @@ def select_experts(
 
     return topk_weights, topk_ids
 
+def substitute_experts(
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    log2phy: torch.Tensor,
+    renormalize: bool = False,
+    expert_substitution_threshold: float = 0.25,
+    scoring_func: str = "softmax",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, K = topk_ids.shape
+    
+    if scoring_func == "softmax":
+        scores = router_logits.softmax(dim=-1)
+    elif scoring_func == "sigmoid":
+        scores = router_logits.sigmoid()
+    elif scoring_func == "sqrtsoftplus":
+        scores = F.softplus(router_logits).sqrt()
+    else:
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+    sorted_scores, _ = scores.sort(dim=-1, descending=True)
+    
+    midscore = sorted_scores[:, K].clamp(min=0)
+    upper = midscore * (1 + expert_substitution_threshold)
+    lower = midscore * (1 - expert_substitution_threshold)
+
+    selected_scores = torch.gather(scores, 1, topk_ids)
+    low_confidence = selected_scores < upper.unsqueeze(1)
+
+    in_cache = log2phy[topk_ids] >= 0
+    needs_sub = low_confidence & ~in_cache
+    if not needs_sub.any():
+        return topk_weights, topk_ids
+    
+    cached_list = torch.where(log2phy >= 0)[0].tolist()
+    cached_set: set[int] = set(cached_list)
+
+    out_ids: torch.Tensor = topk_ids.clone()
+    out_weights: torch.Tensor = topk_weights.clone()
+
+    for t in range(M):
+        rows = needs_sub[t].nonzero(as_tuple=True)[0]
+        if not rows.numel():
+            continue
+        needs_sub_positions = sorted(rows.tolist(), key=lambda idx: selected_scores[t][idx].item())
+
+        token_scores = scores[t]
+
+        in_range = (token_scores >= lower[t]) & (token_scores < midscore[t])
+        pool = set(torch.where(in_range)[0].tolist()) & cached_set
+        pool.difference_update(out_ids[t].tolist())
+
+        sorted_pool = sorted(pool, key=lambda e: token_scores[e].item(), reverse=True)
+
+        for pos in needs_sub_positions:
+            if not sorted_pool:
+                break
+            sub = sorted_pool.pop(0)
+            out_ids[t, pos] = sub
+            out_weights[t, pos] = token_scores[sub].item()
+
+    if renormalize:
+        out_weights = out_weights / out_weights.sum(dim=-1, keepdim=True)
+        
+    return out_weights, out_ids
 
 def check_npu_moe_gating_top_k(
     hidden_states: torch.Tensor,

@@ -819,6 +819,8 @@ class ExpertOffloadConfig:
         # router score; the remaining (lowest-score) missing experts are
         # substituted by resident-inactive experts already in this layer's cache
         "on_demand_load_max": None,
+        "expert_substitution_enabled": False,
+        "expert_substitution_threshold": 0.25,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -881,6 +883,10 @@ class ExpertOffloadConfig:
             raise TypeError("moe_offload_debug must be a boolean")
         if not isinstance(self.config["expert_prefetch_enabled"], bool):
             raise TypeError("expert_prefetch_enabled must be a boolean")
+        if not isinstance(self.config["expert_substitution_enabled"], bool):
+            raise TypeError("expert_substitution_enabled must be a boolean")
+        if not isinstance(self.config["expert_substitution_threshold"], float):
+            raise TypeError("expert_substitution_threshold must be a float")
 
         if not isinstance(self.config["seq_stats_num_seqs"], int):
             raise TypeError("seq_stats_num_seqs must be an integer")

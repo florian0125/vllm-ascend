@@ -154,6 +154,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         global_redundant_expert_num: int = 0,
         pertoken_scale: torch.Tensor | None = None,
         mc2_mask: torch.Tensor | None = None,
+        enable_expert_substitution: bool = False,
+        expert_substitution_threshold: float = 0.25,
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
@@ -166,7 +168,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             num_experts,
             global_redundant_expert_num=global_redundant_expert_num,
             num_shared_experts=num_shared_experts,
-        )
+        )    
+
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -203,8 +206,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             # (not just the top-k in topk_weights) for SMoE substitution candidate
             # ranking. No-op unless on_demand_load_max is set. router_logits here
             # is the real gate output for both internal- and external-router paths.
-            mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
-                               hidden_states=x, router_logits=router_logits)
+            mgr.update_weights(layer, topk_ids, log2phy, topk_weights, hidden_states=x, router_logits=router_logits,
+                               enable_expert_substitution=enable_expert_substitution,
+                               expert_substitution_threshold=expert_substitution_threshold,
+                               renormalize=renormalize, scoring_func=scoring_func)
             # cache this layer's gate output for the NEXT decode token's predict
             mgr.ai_save_router_logits(layer, router_logits)
             # FATE trigger moved here from after fused_experts. `x` is the
@@ -466,6 +471,15 @@ class AscendFusedMoE(FusedMoE):
 
         AscendFusedMoE.moe_counter += 1
         self.moe_instance_id = AscendFusedMoE.moe_counter
+
+        self.enable_expert_substitution = False
+        self.expert_substitution_threshold = _offload_cfg.expert_substitution_threshold
+
+        if not self.enable_expert_offload:
+            self._expert_map = None
+        else:
+            self.enable_expert_substitution = _offload_cfg.expert_substitution_enabled
+        self.log2phy = None
 
         if not self.enable_expert_offload:
             self._expert_map = None
@@ -820,7 +834,6 @@ class AscendFusedMoE(FusedMoE):
                     input_ids=input_ids,
                     tid2eid=self.tid2eid,
                 )
-
                 if isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl):
                     topk_weights = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(topk_weights, True, True)
                     topk_ids = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(topk_ids, True, True)
@@ -867,6 +880,8 @@ class AscendFusedMoE(FusedMoE):
             log2phy=self.log2phy,
             global_redundant_expert_num=self.global_redundant_expert_num,
             mc2_mask=mc2_mask,
+            enable_expert_substitution=self.enable_expert_substitution,
+            expert_substitution_threshold=self.expert_substitution_threshold,
         )
 
         if self.dynamic_eplb:
