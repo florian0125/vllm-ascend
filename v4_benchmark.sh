@@ -93,6 +93,9 @@ PREDICTOR_CKPT="${PREDICTOR_CKPT:-/path/pa+prevhs_prompt_std_dist_lowrank_w=2048
 # PREDICTOR_CKPT="${PREDICTOR_CKPT:-/path/pa+prevhs+ptlg_prompt_std_dist_lowrank_w=2048_miss=0.pt}"
 # PREDICTOR_CKPT="${PREDICTOR_CKPT:-/path/prevpa+prevhs+ptlg_prompt_std_dist_lowrank_w=2048_miss=0.pt}"
 
+EXPERT_SUBSTITUTION="${EXPERT_SUBSTITUTION:-1}"
+EXPERT_SUBSTITUTION_THRESHOLD="${EXPERT_SUBSTITUTION_THRESHOLD:-0.25}"
+
 # end-of-test hit-rate summary ([EXPERT-OFFLOAD-FINAL]). Requires the
 # seq-stats patch on the build AND CACHE_POLICY=1. Serve window: warmup=0,
 # num=NUM (at MAX_NUM_SEQS=1, 1 request = 1 sequence).
@@ -193,7 +196,7 @@ build_additional_config() {
       seq_keys=",\"seq_stats_num_seqs\":${SEQ_NUM}"
       [[ "${TIMING}" == "1" ]] && seq_keys="${seq_keys},\"cache_profile_timing\":true"
     fi
-    parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${subst_key}${prefetch_key}${predictor_key}${prefetch_max_key},\"moe_offload_debug\":$(bool "${CACHE_DEBUG}")${seq_keys}}" )
+    parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${subst_key}${prefetch_key}${predictor_key}${prefetch_max_key},\"moe_offload_debug\":$(bool "${CACHE_DEBUG}")${seq_keys},\"expert_substitution_enabled\":$(bool "${EXPERT_SUBSTITUTION}"),\"expert_substitution_threshold\":${EXPERT_SUBSTITUTION_THRESHOLD}}" )
   fi
   [[ "${WPREFETCH}" == "1" ]] && parts+=( "\"weight_prefetch_config\":{\"enabled\":true}" )
   # ReMoE fine-tuned router-gate override. When REMOE_GATE is a non-empty

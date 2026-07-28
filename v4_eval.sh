@@ -99,7 +99,6 @@ offload_json() {
   [[ "${EXPERT_SUBSTITUTION}" == "1" ]] && {
     p="${p},\"expert_substitution_enabled\":true,\"expert_substitution_threshold\":${EXPERT_SUBSTITUTION_THRESHOLD}"
   }
-  printf '{"expert_offload_config":{%s}}' "${p}"
   p="${p},\"moe_offload_debug\":$([[ ${MOE_DEBUG} == 1 ]] && echo true || echo false)"
   p="${p},\"seq_stats_num_seqs\":${SEQ_STATS_NUM_SEQS}"
   p="${p},\"cache_profile_timing\":$([[ ${TIMING} == 1 ]] && echo true || echo false)"

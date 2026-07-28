@@ -47,6 +47,8 @@ EXPERT_PREFETCH_MAX="${EXPERT_PREFETCH_MAX:-}"
 ON_DEMAND_LOAD_MAX="${ON_DEMAND_LOAD_MAX:-}"
 PREDICTOR="${PREDICTOR:-fate}"
 PREDICTOR_CKPT="${PREDICTOR_CKPT:-}"    # only used when PREDICTOR != fate
+EXPERT_SUBSTITUTION="${EXPERT_SUBSTITUTION:-1}"
+EXPERT_SUBSTITUTION_THRESHOLD="${EXPERT_SUBSTITUTION_THRESHOLD:-0.25}"
 TIMING="${TIMING:-0}"
 SEQ_STATS_NUM_SEQS="${SEQ_STATS_NUM_SEQS:-0}"
 MOE_DEBUG="${MOE_DEBUG:-0}"
@@ -190,6 +192,9 @@ offload_json() {
     p="${p},\"expert_prefetch_enabled\":true,\"expert_predictor\":\"${PREDICTOR}\""
     [[ "${PREDICTOR}" != "fate" && -n "${PREDICTOR_CKPT}" ]] && p="${p},\"expert_predictor_ckpt\":\"${PREDICTOR_CKPT}\""
     [[ -n "${EXPERT_PREFETCH_MAX}" ]] && p="${p},\"expert_prefetch_max\":${EXPERT_PREFETCH_MAX}"
+  }
+  [[ "${EXPERT_SUBSTITUTION}" == "1" ]] && {
+    p="${p},\"expert_substitution_enabled\":true,\"expert_substitution_threshold\":${EXPERT_SUBSTITUTION_THRESHOLD}"
   }
   p="${p},\"moe_offload_debug\":$([[ ${MOE_DEBUG} == 1 ]] && echo true || echo false)"
   p="${p},\"seq_stats_num_seqs\":${SEQ_STATS_NUM_SEQS}"
