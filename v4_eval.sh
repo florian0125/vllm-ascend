@@ -50,7 +50,7 @@ MOE_DEBUG="${MOE_DEBUG:-0}"                     # 1 -> moe_offload_debug:true (v
 CPU_BIND="${CPU_BIND:-0}" 
 
 # ── dataset cache (pre-seeded; no download) ──────────────────────────────────
-export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/mnt/nvme1n1_data/TRT_HeteroCompute/keyi/benchmarks//hf_cache}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/home/keyi/llms/benchmarks/hf_cache}"
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export USE_MODELSCOPE_HUB=0
 export VLLM_BATCH_INVARIANT=0
