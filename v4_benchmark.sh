@@ -67,7 +67,7 @@ PREFETCH="${PREFETCH:-1}"                            # 1 = enable proactive expe
 # 2 = top-2; etc. Emitted into expert_offload_config only when PREFETCH=1 and
 # non-empty, so PREFETCH=0 baselines and pre-cap builds start unchanged.
 EXPERT_PREFETCH_MAX="${EXPERT_PREFETCH_MAX:-}"
-ON_DEMAND_LOAD_MAX="${ON_DEMAND_LOAD_MAX:-}"
+ON_DEMAND_LOAD_MAX="${ON_DEMAND_LOAD_MAX:-}"  # deprecated, this conflicts SMoE expert substitution
 
 # PREDICTOR — which next-layer expert predictor the prefetch path uses,
 # i.e. the expert_offload_config "expert_predictor" enum. Default is the
@@ -93,7 +93,7 @@ PREDICTOR_CKPT="${PREDICTOR_CKPT:-/path/pa+prevhs_prompt_std_dist_lowrank_w=2048
 # PREDICTOR_CKPT="${PREDICTOR_CKPT:-/path/pa+prevhs+ptlg_prompt_std_dist_lowrank_w=2048_miss=0.pt}"
 # PREDICTOR_CKPT="${PREDICTOR_CKPT:-/path/prevpa+prevhs+ptlg_prompt_std_dist_lowrank_w=2048_miss=0.pt}"
 
-EXPERT_SUBSTITUTION="${EXPERT_SUBSTITUTION:-1}"
+EXPERT_SUBSTITUTION="${EXPERT_SUBSTITUTION:-0}"
 EXPERT_SUBSTITUTION_THRESHOLD="${EXPERT_SUBSTITUTION_THRESHOLD:-0.25}"
 
 # end-of-test hit-rate summary ([EXPERT-OFFLOAD-FINAL]). Requires the
