@@ -315,6 +315,7 @@ class ExpertOffloadManager:
         self._ai_lg_buf = None
         self._ai_lg_dirty = False
         self._ai_pending: dict[int, dict] = {}
+        self._ai_launch_ctx = None
         # pinned host landing buffers for the prefetch predict result.
         self._ai_topk_h = None             # pinned [max_tokens, top_k] int64
         self._ai_topk_np = None
@@ -979,7 +980,41 @@ class ExpertOffloadManager:
     # ------------------------------------------------------------------ #
     #  Forward path: page in experts based on topk_ids                    #
     # ------------------------------------------------------------------ #
+    def _await_prefetch(self, layer_idx: int) -> None:
+        """Block until this layer's in-flight prefetch is safe to consume.
 
+        This is verbatim the block that used to appear TWICE in
+        update_weights (once at the top, once after the staging copies). The
+        second copy was unreachable, because the first one already `del`s the
+        threading.Event and `pop`s the NPU event — so the "wait after the
+        staging D2Hs" optimisation described in the comment there never ran.
+
+        IDEMPOTENT by construction: the second call sees `.get(...) -> None`
+        and `.pop(..., None) -> None` and does nothing. That is what lets
+        update_weights call it early (only when substitution needs it) and
+        again unconditionally later, without a flag.
+
+        Two waits, both required:
+          * the threading.Event, for the FATE worker thread (host-side);
+          * the NPU event, so the compute stream orders itself behind the
+            prefetch stream's H2D + log2phy write-back.
+        """
+        # Wait for any pending threaded prefetch for this layer to complete.
+        # In graph mode there is no background thread; only the NPU event
+        # stored by the host callback needs to be waited on.
+        layer_done = self._prefetch_layer_done.get(layer_idx)
+        if layer_done is not None:
+            layer_done.wait()           # Block until prefetch thread finishes
+            layer_done.clear()
+            del self._prefetch_layer_done[layer_idx]
+
+        # Wait for prefetch NPU copies to complete before using the weights.
+        # Use stream wait (graphable) instead of host synchronize.
+        with self._prefetch_state_lock:
+            npu_event = self._prefetch_layer_npu_event.pop(layer_idx, None)
+        if npu_event is not None:
+            torch_npu.npu.current_stream().wait_event(npu_event)
+    
     def update_weights(self, layer, topk_ids: torch.Tensor,
                         log2phy: torch.Tensor,
                         topk_weights: torch.Tensor | None = None,
@@ -1026,23 +1061,10 @@ class ExpertOffloadManager:
         except ValueError:
             return 0
 
-        # Wait for any pending threaded prefetch for this layer to complete.
-        # In graph mode there is no background thread; only the NPU event
-        # stored by the host callback needs to be waited on.
-        layer_done = self._prefetch_layer_done.get(layer_idx)
-        if layer_done is not None:
-            layer_done.wait()           # Block until prefetch thread finishes
-            layer_done.clear()
-            del self._prefetch_layer_done[layer_idx]
-
-        # Wait for prefetch NPU copies to complete before using the weights.
-        # Use stream wait (graphable) instead of host synchronize.
-        with self._prefetch_state_lock:
-            npu_event = self._prefetch_layer_npu_event.pop(layer_idx, None)
-        if npu_event is not None:
-            torch_npu.npu.current_stream().wait_event(npu_event)
-
+        # the unconditional wait block that used to sit here is
+        # gone; it is now self._await_prefetch(layer_idx), called in exactly two places. 
         if enable_expert_substitution:
+            self._await_prefetch(layer_idx)
             gt_topk_ids = topk_ids.clone()
             subbed_weights, subbed_ids = substitute_experts(router_logits, topk_weights[:][:self.topk],
                                                             topk_ids[:][:self.topk], log2phy,
@@ -1082,32 +1104,8 @@ class ExpertOffloadManager:
         log2phy_h = self.log2phy_h
         log2phy_np = self.log2phy_np
         topk_ids_h.copy_(topk_ids, non_blocking=_EXTRA_CTX.capturing)
-        # the two prefetch waits below MOVED here from the top of the
-        # decode path (they used to sit immediately after the layer_idx lookup).
-        # The staging copies above are blocking D2H in eager mode, so the first
-        # of them already drains attention + gate + select_experts. Waiting for
-        # the prefetch AFTER that drain hands the in-flight H2D that whole window
-        # for free; waiting before it threw the window away. Nothing between the
-        # old and new position reads log2phy, _log2phy_mirror, or any prefetch
-        # state — only the routing tensors select_experts just produced. The wait
-        # must still precede the log2phy read below, because _do_prefetch writes
-        # next_layer.log2phy on the prefetch stream.
-        #
-        # Wait for any pending threaded prefetch for this layer to complete.
-        # In graph mode there is no background thread; only the NPU event
-        # stored by the host callback needs to be waited on.
-        layer_done = self._prefetch_layer_done.get(layer_idx)
-        if layer_done is not None:
-            layer_done.wait()           # Block until prefetch thread finishes
-            layer_done.clear()
-            del self._prefetch_layer_done[layer_idx]
-
-        # Wait for prefetch NPU copies to complete before using the weights.
-        # Use stream wait (graphable) instead of host synchronize.
-        with self._prefetch_state_lock:
-            npu_event = self._prefetch_layer_npu_event.pop(layer_idx, None)
-        if npu_event is not None:
-            torch_npu.npu.current_stream().wait_event(npu_event)
+        
+        self._await_prefetch(layer_idx)
 
         log2phy_h.copy_(log2phy, non_blocking=_EXTRA_CTX.capturing)
 
@@ -1138,7 +1136,15 @@ class ExpertOffloadManager:
                 args,
             )
         else:
-            self._update_weights(args)
+            # _update_weights now returns an NPU event recorded on
+            # load_stream instead of host-blocking on load_stream.synchronize().
+            # The only consumer of the on-demand weights is the GMM on THIS
+            # stream, so a stream-order wait is sufficient and lets the host
+            # keep issuing while the H2D drains. Returns None when
+            # _update_weights kept the host sync (graph capture or TIMING=1).
+            _load_evt = self._update_weights(args)
+            if _load_evt is not None:
+                current_compute_stream.wait_event(_load_evt)
             # apply the expert substitution plan produced by _update_weights.
             subst = self._pending_subst.pop(layer_idx, None)
             if subst:
@@ -1328,14 +1334,14 @@ class ExpertOffloadManager:
                     dev_tensor = getattr(layer, attr_name, None)
                     if dev_tensor is None:
                         continue
-                    dev_tensor.data[slot].copy_(buffers[layer_idx][eid])
+                    dev_tensor.data[slot].copy_(buffers[layer_idx][eid], non_blocking=True)
                 for attr_name, buffers in self.offset_cpu_buffers.items():
                     if layer_idx >= len(buffers) or eid >= len(buffers[layer_idx]):
                         continue
                     dev_tensor = getattr(layer, attr_name, None)
                     if dev_tensor is None:
                         continue
-                    dev_tensor.data[slot].copy_(buffers[layer_idx][eid])
+                    dev_tensor.data[slot].copy_(buffers[layer_idx][eid], non_blocking=True)
                 # Refresh derived fp32 scale if present (W8A8_DYNAMIC)
                 if hasattr(layer, 'w13_weight_scale_fp32'):
                     layer.w13_weight_scale_fp32[slot].copy_(
@@ -1358,7 +1364,12 @@ class ExpertOffloadManager:
             # publish this layer's post-update mapping to the host mirror.
             self._log2phy_mirror[layer_idx] = log2phy_np
             
-            self.load_stream.synchronize()
+            _load_evt = None
+            if _EXTRA_CTX.capturing or self._profile_timing:
+                self.load_stream.synchronize()
+            else:
+                _load_evt = torch_npu.npu.Event()
+                self.load_stream.record_event(_load_evt)
 
             if gt_topk_ids_h is not None:
                 token_count, _ = topk_ids_h.shape
@@ -1374,6 +1385,8 @@ class ExpertOffloadManager:
             if _time_miss_load:
                 copy_ms = (time.perf_counter() - _tc0) * 1000.0 if n_copies else 0.0
                 self._t_step["miss_load"][layer_idx] = copy_ms
+                
+            return _load_evt
 
     # ------------------------------------------------------------------ #
     #  Next-layer expert prefetch                                          #
@@ -2054,6 +2067,20 @@ class ExpertOffloadManager:
             if done is not None:
                 done.set()
             self._ai_pending.pop(moe_idx, None)
+            
+    def ai_prefetch_finish_pending(self):
+        """Finish the launch parked by ai_predict_prefetch_next, if any.
+
+        apply() no longer owns the launch ctx (the launch moved to
+        DeepseekV4DecoderLayer.forward), so it consumes the ctx through the
+        manager instead of a local. Clears the slot BEFORE finishing so a raise
+        inside the finish cannot leave a stale ctx behind. No-op under TIMING=1
+        (the launch already finished inline) and on every non-AI path.
+        """
+        ctx = self._ai_launch_ctx
+        self._ai_launch_ctx = None
+        if ctx is not None:
+            self.ai_prefetch_finish(ctx)
         
     def ai_capture_pre_attn(self, experts, pre_attn: torch.Tensor):
         """Before attention (next-layer driver): stash pre_attn[n] for the heads>=1
@@ -2108,6 +2135,16 @@ class ExpertOffloadManager:
         """
         if not self._ai_active or not self._ai_predicts_next or _EXTRA_CTX.capturing:
             return None
+        
+        if self._ai_launch_ctx is not None:
+            stale = self._ai_launch_ctx
+            self._ai_launch_ctx = None
+            logger.warning(
+                "[AI-PRED] launch ctx for layer %s was never finished; "
+                "finishing it now. apply() is missing its "
+                "ai_prefetch_finish_pending() call.", stale.get("moe_idx"))
+            self.ai_prefetch_finish(stale)
+            
         predictor = self._predictor
         if not getattr(predictor, "ready", False):
             return None
@@ -2143,7 +2180,10 @@ class ExpertOffloadManager:
         # stream reads them (FIFO on the same stream).
         copy_event = torch_npu.npu.current_stream().record_event()
         ctx = self._ai_predict_launch(next_idx, head_idx, n, pa, router_cur, copy_event)
-        return self._ai_maybe_finish_now(ctx)
+        
+        ctx = self._ai_maybe_finish_now(ctx)
+        self._ai_launch_ctx = ctx
+        return ctx
         
     def _ai_predict_launch(self, target_idx, head_idx, n, pa, router_cur,
                            copy_event):

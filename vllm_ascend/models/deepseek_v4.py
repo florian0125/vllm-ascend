@@ -907,12 +907,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             # non-None only at the first covered layer (head 0), whose predict
             # targets THIS layer and therefore must complete before self.mlp();
             # heads >= 1 are launched and finished inside fused_moe/w8a8.
-            _pa_for_pred = (sequence_parallel_chunk(hidden_states)
+            _ri_for_pred = (sequence_parallel_chunk(hidden_states)
                             if _sp_moe else hidden_states)
             if getattr(_eom, "_ai_predicts_next", False):
-                _ai_ctx = _eom.ai_capture_pre_attn(self.mlp.experts, _pa_for_pred)
+                _eom.ai_predict_prefetch_next(self.mlp.experts, _ri_for_pred)
             else:
-                _ai_ctx = _eom.ai_predict_start(self.mlp.experts, _pa_for_pred)
+                # only the current-layer driver saves router_input here (for the NEXT layer's predict).
+                _eom.ai_save_router_input(self.mlp.experts, _ri_for_pred)
 
         # pure-isolation prerequisite. Drain the prefetch/load streams (and,
         # for FATE, the background worker for this layer) so the stage timers below

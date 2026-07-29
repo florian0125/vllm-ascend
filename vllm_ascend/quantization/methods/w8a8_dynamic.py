@@ -330,7 +330,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         
         # carries the learned predictor's launch ctx to region B (see the
         # fused_moe.py twin — both MoE method paths must behave identically).
-        _ai_pf_ctx = None
+        _ai_pf_mgr = None
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
@@ -347,7 +347,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             mgr.trigger_next_layer_prefetch(layer, x)
             # next-layer learned predictor
             if getattr(mgr, "_ai_predicts_next", False):
-                _ai_pf_ctx = mgr.ai_predict_prefetch_next(layer, x)
+                _ai_pf_mgr = mgr
             if num_tokens > mgr.offload_threshold and mgr._prefill_initialized and not mgr._skip_prefill:
                 use_prefill_pool = True
                 try:
@@ -428,8 +428,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         
         # learned-predictor prefetch FINISH — see the fused_moe.py twin. The
         # routed GMM is issued, so this host block and the H2D behind it overlap it.
-        if _ai_pf_ctx is not None:
-            mgr.ai_prefetch_finish(_ai_pf_ctx)
+        if _ai_pf_mgr is not None:
+            _ai_pf_mgr.ai_prefetch_finish_pending()
             
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result

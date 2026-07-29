@@ -197,7 +197,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         
         # carries the learned predictor's launch ctx from here to region B.
         # None on every non-AI path, so region B is a no-op there.
-        _ai_pf_ctx = None
+        _ai_pf_mgr = None
         if getattr(layer, 'enable_expert_offload', False):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
@@ -222,8 +222,15 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             # No-op for the learned predictors (the function returns early when
             # _ai_active) and for prefill batches (it self-gates on n > threshold).
             mgr.trigger_next_layer_prefetch(layer, x)
+            
+            # was `_ai_pf_ctx = mgr.ai_predict_prefetch_next(layer, x)`.
+            # The launch ran here only because `x` was the nearest available
+            # router-input proxy; it now runs in the decoder layer, one gate GEMM
+            # + select_experts + update_weights earlier, from the model's own bf16
+            # gate input. All that remains here is remembering that a launch may
+            # be pending so region B can finish it.
             if getattr(mgr, "_ai_predicts_next", False):
-                _ai_pf_ctx = mgr.ai_predict_prefetch_next(layer, x)
+                _ai_pf_mgr = mgr
             if num_tokens > mgr.offload_threshold and mgr._prefill_initialized and not mgr._skip_prefill:
                 use_prefill_pool = True
                 try:
@@ -354,8 +361,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # the expert H2D it enqueues on _prefetch_stream overlaps the GMM tail plus
         # the next layer's attention. _ai_pf_ctx is None under TIMING=1 and on
         # every non-AI path, so this line is inert there.
-        if _ai_pf_ctx is not None:
-            mgr.ai_prefetch_finish(_ai_pf_ctx)
+        if _ai_pf_mgr is not None:
+            _ai_pf_mgr.ai_prefetch_finish_pending()
 
         # Restore decode-path expert count after prefill override
         if use_prefill_pool:
