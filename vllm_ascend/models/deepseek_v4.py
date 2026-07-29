@@ -878,6 +878,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         if has_expert_offload_manager() and hasattr(self.mlp, "experts"):
             _eom = get_expert_offload_manager()
         _n_tok = hidden_states.shape[0]
+        
+        # when the MoE runs sequence-parallel, self.mlp chunks its input at
+        # DeepseekV4MoE.forward before fused_moe sees it. Every AI-predictor hook
+        # below must stage from the SAME slice, otherwise pre_attn (staged here,
+        # full sequence) and router_input (read in fused_moe, chunked) describe
+        # different tokens on every rank except 0 — and if the full length
+        # exceeds offload_threshold while the chunk does not, the capture hook
+        # silently skips and the next-layer driver reads a stale _ai_pa_buf.
+        # No-op when sequence parallelism is off (the common TP=1 case).
+        _sp_moe = getattr(self.mlp, "is_sequence_parallel", False)
 
         def _hc(post=False):
             return (_eom.time_stage("hc", self.mlp.experts, _n_tok,
@@ -897,10 +907,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             # non-None only at the first covered layer (head 0), whose predict
             # targets THIS layer and therefore must complete before self.mlp();
             # heads >= 1 are launched and finished inside fused_moe/w8a8.
+            _pa_for_pred = (sequence_parallel_chunk(hidden_states)
+                            if _sp_moe else hidden_states)
             if getattr(_eom, "_ai_predicts_next", False):
-                _ai_ctx = _eom.ai_capture_pre_attn(self.mlp.experts, hidden_states)
+                _ai_ctx = _eom.ai_capture_pre_attn(self.mlp.experts, _pa_for_pred)
             else:
-                _ai_ctx = _eom.ai_predict_start(self.mlp.experts, hidden_states)
+                _ai_ctx = _eom.ai_predict_start(self.mlp.experts, _pa_for_pred)
 
         # pure-isolation prerequisite. Drain the prefetch/load streams (and,
         # for FATE, the background worker for this layer) so the stage timers below
@@ -939,7 +951,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             # NEXT layer's predict). The next-layer driver reads the current
             # router_input directly in fused_moe (= x), so it skips this save.
             if not getattr(_eom, "_ai_predicts_next", False):
-                _eom.ai_save_router_input(self.mlp.experts, hidden_states)
+                # chunk under sequence parallelism, for the same reason as
+                # _pa_for_pred — this buffer is paired with pre_attn one layer
+                # later, so both must describe the same tokens.
+                _ri_for_pred = (sequence_parallel_chunk(hidden_states)
+                                if _sp_moe else hidden_states)
+                _eom.ai_save_router_input(self.mlp.experts, _ri_for_pred)
 
         hidden_states = self.mlp(hidden_states)
         # hc_post(ffn) runs AFTER mlp (i.e. after the cache-hit point), so

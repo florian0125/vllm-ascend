@@ -77,9 +77,9 @@ THINK_KEY="${THINK_KEY:-thinking}"   # [D][R][N]
 MAX_RETRIES=10                       # [R]
 API_TIMEOUT=60000                    # [R]
 THINK_MAX_GEN_TOKS=32768             # [N]
-NONTHINK_MAX_GEN_TOKS=2048
+NONTHINK_MAX_GEN_TOKS=16384
 CHAT_MAX_LENGTH=32768
-CHAT_TEMPERATURE=1.0                 # [D]
+CHAT_TEMPERATURE=0.6                 # [D]
 CHAT_TOP_P=0.95                      # [N]
 THINK_DROP_STOPS=1                   # [!] see A.5
 
@@ -129,8 +129,8 @@ preset() {
   P_FORCED_CHAT=0
   case "$1" in
   gsm8k)          # [D] base-only benchmark; [R] validated instruct run reproduced
-    P_TASK=gsm8k;                          P_ENDPOINT=completions; P_THINK=0; P_EFFORT=""
-    P_FEWSHOT=8;    P_MAXGEN=2048;         P_MAXLEN=""             # [R] 8-shot/0-shot by HQ
+    P_TASK=gsm8k;                           P_ENDPOINT=completions; P_THINK=0; P_EFFORT=""
+    P_FEWSHOT="";    P_MAXGEN=2048;         P_MAXLEN=""             # [R] 8-shot/0-shot by HQ
     P_REF="[R] instruct non-think 8-shot: strict 0.9431 / flexible 0.9439  |  [D] base 8-shot EM 90.8"
     ;;
   mmlu_pro)       # [D] High 86.4 is the headline and beats Max 86.2

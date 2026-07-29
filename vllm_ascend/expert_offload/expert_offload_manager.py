@@ -315,6 +315,11 @@ class ExpertOffloadManager:
         self._ai_lg_buf = None
         self._ai_lg_dirty = False
         self._ai_pending: dict[int, dict] = {}
+        # pinned host landing buffers for the prefetch predict result.
+        self._ai_topk_h = None             # pinned [max_tokens, top_k] int64
+        self._ai_topk_np = None
+        self._ai_score_h = None            # pinned [E] fp32 (only when capping)
+        self._ai_score_np = None
 
     # ------------------------------------------------------------------ #
     #  Lifecycle: called during model init and after weight loading       #
@@ -537,6 +542,23 @@ class ExpertOffloadManager:
                     self._ai_lg_buf = torch.zeros(
                         [self._predictor.L, mt, e_ckpt],
                         dtype=torch.float32, device="npu")
+                    
+                # pinned landing buffers for the predict RESULT (see __init__).
+                # int64 deliberately — _ai_select_topk returns .topk().indices,
+                # which is int64, so a matching dtype avoids a cast kernel on the
+                # prefetch stream. Sized [mt, top_k] = at most 3x8 int64 = 192 B.
+                # register_from_model above has already populated top_k / E.
+                self._ai_topk_h = torch.zeros(
+                    [mt, self._predictor.top_k],
+                    dtype=torch.int64, device="cpu", pin_memory=True)
+                self._ai_topk_np = self._ai_topk_h.numpy()
+                # Priority scores are only needed when a prefetch cap is active
+                # (self._prefetch_max), matching _ai_select_topk's want_scores.
+                if self._prefetch_max is not None:
+                    self._ai_score_h = torch.zeros(
+                        [self._predictor.E],
+                        dtype=torch.float32, device="cpu", pin_memory=True)
+                    self._ai_score_np = self._ai_score_h.numpy()
         t7 = time.perf_counter()
         logger.info(
             "[OFFLOAD] finalize breakdown: process_weights=%.1fs "
@@ -1060,6 +1082,33 @@ class ExpertOffloadManager:
         log2phy_h = self.log2phy_h
         log2phy_np = self.log2phy_np
         topk_ids_h.copy_(topk_ids, non_blocking=_EXTRA_CTX.capturing)
+        # the two prefetch waits below MOVED here from the top of the
+        # decode path (they used to sit immediately after the layer_idx lookup).
+        # The staging copies above are blocking D2H in eager mode, so the first
+        # of them already drains attention + gate + select_experts. Waiting for
+        # the prefetch AFTER that drain hands the in-flight H2D that whole window
+        # for free; waiting before it threw the window away. Nothing between the
+        # old and new position reads log2phy, _log2phy_mirror, or any prefetch
+        # state — only the routing tensors select_experts just produced. The wait
+        # must still precede the log2phy read below, because _do_prefetch writes
+        # next_layer.log2phy on the prefetch stream.
+        #
+        # Wait for any pending threaded prefetch for this layer to complete.
+        # In graph mode there is no background thread; only the NPU event
+        # stored by the host callback needs to be waited on.
+        layer_done = self._prefetch_layer_done.get(layer_idx)
+        if layer_done is not None:
+            layer_done.wait()           # Block until prefetch thread finishes
+            layer_done.clear()
+            del self._prefetch_layer_done[layer_idx]
+
+        # Wait for prefetch NPU copies to complete before using the weights.
+        # Use stream wait (graphable) instead of host synchronize.
+        with self._prefetch_state_lock:
+            npu_event = self._prefetch_layer_npu_event.pop(layer_idx, None)
+        if npu_event is not None:
+            torch_npu.npu.current_stream().wait_event(npu_event)
+
         log2phy_h.copy_(log2phy, non_blocking=_EXTRA_CTX.capturing)
 
         gt_topk_ids_h = None
@@ -1265,10 +1314,12 @@ class ExpertOffloadManager:
                     break  # no free slots — should not happen in normal usage
                 # Copy weights from CPU to NPU
                 layer.w13_weight.data.untyped_storage()[slot * self.w13_expert_size_bytes : (slot + 1) * self.w13_expert_size_bytes].copy_(
-                    self.w13_weights_cpu[layer_idx][eid].untyped_storage()
+                    self.w13_weights_cpu[layer_idx][eid].untyped_storage(),
+                    non_blocking=True
                 )
                 layer.w2_weight.data.untyped_storage()[slot * self.w2_expert_size_bytes : (slot + 1) * self.w2_expert_size_bytes].copy_(
-                    self.w2_weights_cpu[layer_idx][eid].untyped_storage()
+                    self.w2_weights_cpu[layer_idx][eid].untyped_storage(),
+                    non_blocking=True
                 )
                 # Copy scales/offsets from CPU to NPU
                 for attr_name, buffers in self.scale_cpu_buffers.items():
@@ -1629,14 +1680,14 @@ class ExpertOffloadManager:
             return None  # all resident experts are protected — skip
         
         if self._debug:
-                logger.info("[PREFETCH-W] l=%d prefetch_expert_hit=%s prefetch_expert_miss=%s hit_rate=%.2f",
-                            next_idx, sorted(already_there),
-                            sorted(need_to_load), len(already_there) / 6)
-                if need_to_load and len(need_to_load) > len(reusable_slots):
-                    logger.info("[PREFETCH-W] l=%d SHORTFALL: need %d load but only %d slots, "
-                                "to_load=%s",
-                                next_idx, len(need_to_load), len(reusable_slots),
-                                sorted(need_to_load)[:20])
+            logger.info("[PREFETCH-W] l=%d prefetch_expert_hit=%s prefetch_expert_miss=%s hit_rate=%.2f",
+                        next_idx, sorted(already_there),
+                        sorted(need_to_load), len(already_there) / 6)
+            if need_to_load and len(need_to_load) > len(reusable_slots):
+                logger.info("[PREFETCH-W] l=%d SHORTFALL: need %d load but only %d slots, "
+                            "to_load=%s",
+                            next_idx, len(need_to_load), len(reusable_slots),
+                            sorted(need_to_load)[:20])
 
         # NPU Events on the PREFETCH stream replace the perf_counter
         _pf_ev0 = _pf_ev1 = None
@@ -1680,7 +1731,8 @@ class ExpertOffloadManager:
                     slot * self.w13_expert_size_bytes
                     : (slot + 1) * self.w13_expert_size_bytes
                 ].copy_(
-                    self.w13_weights_cpu[next_idx][eid].untyped_storage())
+                    self.w13_weights_cpu[next_idx][eid].untyped_storage(),
+                    non_blocking=True)
 
                 if use_sleep:
                     time.sleep(0.00025)  # 0.25ms delay, avoid burst in thread mode
@@ -1690,7 +1742,8 @@ class ExpertOffloadManager:
                     slot * self.w2_expert_size_bytes
                     : (slot + 1) * self.w2_expert_size_bytes
                 ].copy_(
-                    self.w2_weights_cpu[next_idx][eid].untyped_storage())
+                    self.w2_weights_cpu[next_idx][eid].untyped_storage(),
+                    non_blocking=True)
 
                 # Copy scales/offsets from CPU to NPU (W8A8)
                 for attr_name, buffers in self.scale_cpu_buffers.items():
@@ -1701,7 +1754,7 @@ class ExpertOffloadManager:
                     dev_tensor = getattr(next_layer, attr_name, None)
                     if dev_tensor is not None:
                         dev_tensor.data[slot].copy_(
-                            buffers[next_idx][eid])
+                            buffers[next_idx][eid], non_blocking=True)
                 for attr_name, buffers in self.offset_cpu_buffers.items():
                     if next_idx >= len(buffers):
                         continue
@@ -1710,7 +1763,7 @@ class ExpertOffloadManager:
                     dev_tensor = getattr(next_layer, attr_name, None)
                     if dev_tensor is not None:
                         dev_tensor.data[slot].copy_(
-                            buffers[next_idx][eid])
+                            buffers[next_idx][eid], non_blocking=True)
 
                 # Refresh fp32 scale (W8A8_DYNAMIC)
                 if hasattr(next_layer, 'w13_weight_scale_fp32'):
@@ -1909,35 +1962,64 @@ class ExpertOffloadManager:
             topk_ids, pri_scores = self._ai_select_topk(experts, logits)  # [n,k], [E]|None
             if predict_ev1 is not None:
                 predict_ev1.record()
+            # land the RESULT in pinned host memory with a D2H issued HERE,
+            # on _prefetch_stream, so ai_prefetch_finish never touches a device
+            # tensor. Placed AFTER predict_ev1.record() so pf_compute stays pure
+            # predict time. non_blocking=True is safe for this D2H only because
+            # the finish always calls _prefetch_stream.synchronize() before
+            # reading the buffer (D2H requires an explicit sync — see
+            # https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html).
+            self._ai_topk_h[:n].copy_(topk_ids, non_blocking=True)
+            if pri_scores is not None:
+                self._ai_score_h.copy_(pri_scores, non_blocking=True)
+        # n_tokens is now needed by the finish to slice the pinned buffer.
         self._ai_pending[moe_idx] = {"moe_idx": moe_idx, "topk_ids": topk_ids,
                                     "pri_scores": pri_scores,
+                                    "n_tokens": n,
                                     "predict_ev0": predict_ev0,
                                     "predict_ev1": predict_ev1}
         return self._ai_pending[moe_idx]
     
     def ai_prefetch_finish(self, ctx):
-        """After the attention CALL is issued: D2H topk (hidden behind attention),
-        reuse _do_prefetch for eviction + H2D, record the handshake update_weights
-        waits on. Folds the predictor's NPU compute time into pf_compute. Eager only."""
+        """After the attention CALL is issued: read the predicted topk from the
+        pinned host buffer (no compute-stream touch), reuse _do_prefetch for
+        eviction + H2D, record the handshake update_weights waits on. Folds the
+        predictor's NPU compute time into pf_compute. Eager only."""
         if ctx is None:
             return
         moe_idx = ctx["moe_idx"]
-        topk_ids = ctx["topk_ids"]
-        
-        # .tolist() blocks until the predict finishes -> by the line after, the
-        # predict's NPU timing events are complete and elapsed_time() won't block.
+        n = ctx["n_tokens"]
+
         try:
-            # .tolist() blocks until the predict finishes -> by the line after, the
-            # predict's NPU timing events are complete and elapsed_time() won't block.
+            # This sync waits for the PREDICT and for the small result D2H the
+            # launch queued behind it — both on _prefetch_stream only. It does
+            # NOT touch the compute stream, so the attention / routed GMM issued
+            # before this call keeps running underneath.
             self._prefetch_stream.synchronize()
-            predicted = set(int(e) for e in topk_ids.flatten().tolist())
+            # was `set(int(e) for e in topk_ids.flatten().tolist())`.
+            # That .tolist() ran outside any stream context, so its D2H was
+            # issued on the COMPUTE stream and drained everything queued there —
+            # measured at 36.8 ms of a 50 ms queue (npu_copy_sync_probe test 6).
+            # For the next-layer drivers that meant draining the routed GMM
+            # before the shared-expert MLP had even been issued. The pinned
+            # buffer was filled by a D2H on _prefetch_stream in the launch and
+            # the synchronize() above guarantees it has landed.
+            predicted = set(self._ai_topk_np[:n].reshape(-1).tolist())
 
             # highest-score-first order for the prefetch cap (no-op when uncapped —
             # pri_scores is None unless self._prefetch_max is set).
+            # was _order_predicted_by_score(), which ran torch.unique
+            # (dynamic output shape -> device sync), an argsort and a gather on
+            # the COMPUTE stream, then a second .tolist(). `predicted` is already
+            # the unique set and is at most offload_threshold*top_k = 24 ids, so
+            # ranking it on the host against the pinned score vector is exact and
+            # costs microseconds. With expert_prefetch_max=1 this path runs on
+            # every covered layer, so it was not a rare cost.
             priority = None
             pri_scores = ctx.get("pri_scores")
             if self._prefetch_max is not None and pri_scores is not None:
-                priority = self._order_predicted_by_score(topk_ids, pri_scores)
+                _sc = self._ai_score_np
+                priority = sorted(predicted, key=lambda e: _sc[e], reverse=True)
 
             compute_ms = 0.0
             ev0 = ctx.get("predict_ev0")
@@ -1949,7 +2031,7 @@ class ExpertOffloadManager:
             _record_profiling = (self._profile_timing and self.cache_policy is not None
                                 and not self._seq_stats_done)
 
-            # CHANGE: read the mapping from the host mirror. Was
+            # read the mapping from the host mirror. Was
             # `next_layer.log2phy.cpu().numpy()`, a BLOCKING D2H on the MAIN
             # thread's compute stream — one full drain per covered layer per step,
             # which defeated the attention/GMM overlap this function exists to get.
@@ -2118,11 +2200,21 @@ class ExpertOffloadManager:
             topk_ids, pri_scores = self._ai_select_topk(target_layer, logits)
             if predict_ev1 is not None:
                 predict_ev1.record()
+            # same pinned-buffer landing as ai_predict_start — the D2H is
+            # issued on _prefetch_stream so the finish reads host memory instead
+            # of calling .tolist() on a device tensor (which would drain the
+            # COMPUTE stream, i.e. the routed GMM this launch is meant to hide
+            # behind). After predict_ev1 so pf_compute stays pure predict time.
+            self._ai_topk_h[:n].copy_(topk_ids, non_blocking=True)
+            if pri_scores is not None:
+                self._ai_score_h.copy_(pri_scores, non_blocking=True)
 
         # no sync, no .tolist(), no _do_prefetch here. Return the same
         # ctx shape ai_predict_start returns so ONE finish serves both drivers.
+        # n_tokens is now needed by the finish to slice the pinned buffer.
         self._ai_pending[target_idx] = {"moe_idx": target_idx, "topk_ids": topk_ids,
                                         "pri_scores": pri_scores,
+                                        "n_tokens": n,
                                         "predict_ev0": predict_ev0,
                                         "predict_ev1": predict_ev1}
         return self._ai_pending[target_idx]
@@ -2446,20 +2538,22 @@ class ExpertOffloadManager:
         policy_step = -1
         if self.cache_policy is not None:
             policy_step = self.cache_policy.layer_step(layer_idx)
-        logger.info(
-            "[EXPERT-OFFLOAD-CACHE] layer=%d cache_step=%d calls=%d policy_step=%d "
-            "hit_rate=%.4f hits=%d misses=%d last_hit=%s last_miss=%s resident=%s",
-            layer_idx,
-            self.cache_calls[layer_idx],
-            self.cache_calls[layer_idx],
-            policy_step,
-            hit_rate,
-            self.cache_hits[layer_idx],
-            self.cache_misses[layer_idx],
-            self.last_hit_experts[layer_idx],
-            self.last_miss_experts[layer_idx],
-            sorted(on_device),
-        )
+        
+        if self._debug:
+            logger.info(
+                "[EXPERT-OFFLOAD-CACHE] layer=%d cache_step=%d calls=%d policy_step=%d "
+                "hit_rate=%.4f hits=%d misses=%d last_hit=%s last_miss=%s resident=%s",
+                layer_idx,
+                self.cache_calls[layer_idx],
+                self.cache_calls[layer_idx],
+                policy_step,
+                hit_rate,
+                self.cache_hits[layer_idx],
+                self.cache_misses[layer_idx],
+                self.last_hit_experts[layer_idx],
+                self.last_miss_experts[layer_idx],
+                sorted(on_device),
+            )
 
     def _record_layer_time(self, metric: str, layer, ms: float):
         """Generic per-(layer, step) timing record.
