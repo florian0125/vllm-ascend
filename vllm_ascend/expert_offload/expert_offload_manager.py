@@ -476,10 +476,9 @@ class ExpertOffloadManager:
         # by update_weights and read by _update_weights to (a) sort the misses by
         # score and (b) rank resident-inactive substitute candidates. Allocated
         # only when substitution is enabled
-        if self._on_demand_load_max is not None:
-            self.router_logits_h = torch.zeros(
-                [self.offload_threshold, ntotal],
-                dtype=torch.float32, device="cpu", pin_memory=True)
+        self.router_logits_h = torch.zeros(
+            [self.offload_threshold, ntotal],
+            dtype=torch.float32, device="cpu", pin_memory=True)
         t4 = time.perf_counter()
 
         self.refresh_fp32_scales()
@@ -1061,16 +1060,13 @@ class ExpertOffloadManager:
         except ValueError:
             return 0
 
+        # enable expert substitution if current layer is not a hash layer
+        do_expert_sub = enable_expert_substitution and layer_idx > 2
+
         # the unconditional wait block that used to sit here is
         # gone; it is now self._await_prefetch(layer_idx), called in exactly two places. 
-        if enable_expert_substitution:
+        if do_expert_sub:
             self._await_prefetch(layer_idx)
-            gt_topk_ids = topk_ids.clone()
-            subbed_weights, subbed_ids = substitute_experts(router_logits, topk_weights[:][:self.topk],
-                                                            topk_ids[:][:self.topk], log2phy,
-                                                            renormalize, expert_substitution_threshold, scoring_func)
-            topk_weights[:][:self.topk] = subbed_weights
-            topk_ids[:][:self.topk] = subbed_ids
 
         topk_ids_h = self.topk_ids_h[:num_tokens]        
         topk_weights_h = None
@@ -1083,7 +1079,7 @@ class ExpertOffloadManager:
         router_scores_h = None
         subst_enabled = (self._on_demand_load_max is not None
                          and not _EXTRA_CTX.capturing)
-        if subst_enabled and router_logits is not None:
+        if (subst_enabled or do_expert_sub) and router_logits is not None:
             if router_logits.shape[-1] == self.num_total_experts:
                 router_scores_h = self.router_logits_h[:num_tokens]
                 router_scores_h.copy_(router_logits, non_blocking=_EXTRA_CTX.capturing)
@@ -1099,7 +1095,7 @@ class ExpertOffloadManager:
             logger.warning_once(
                 "[SUBST] on_demand_load_max set but router_logits is None — "
                 "did fused_moe.apply pass router_logits=router_logits to "
-                "update_weights? Substitution DISABLED.")   
+                "update_weights? Substitution DISABLED.")
         
         log2phy_h = self.log2phy_h
         log2phy_np = self.log2phy_np
@@ -1110,9 +1106,13 @@ class ExpertOffloadManager:
         log2phy_h.copy_(log2phy, non_blocking=_EXTRA_CTX.capturing)
 
         gt_topk_ids_h = None
-        if enable_expert_substitution:
-            gt_topk_ids_h = self.gt_topk_ids_h[:num_tokens]
-            gt_topk_ids_h.copy_(gt_topk_ids, non_blocking=_EXTRA_CTX.capturing)
+        if do_expert_sub:
+            gt_topk_ids_h = topk_ids_h.clone()
+            subbed_weights, subbed_ids = substitute_experts(router_scores_h, topk_weights_h[:][:self.topk],
+                                                            topk_ids_h[:][:self.topk], log2phy_h,
+                                                            renormalize, expert_substitution_threshold, scoring_func)
+            topk_weights_h[:][:self.topk] = subbed_weights
+            topk_ids_h[:][:self.topk] = subbed_ids
 
         current_compute_stream = torch_npu.npu.current_stream()
         subscribed_compute_streams = get_subscribed_compute_streams()
