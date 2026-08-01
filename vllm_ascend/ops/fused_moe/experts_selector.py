@@ -145,6 +145,7 @@ def substitute_experts(
     renormalize: bool = False,
     expert_substitution_threshold: float = 0.25,
     scoring_func: str = "softmax",
+    e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M, K = topk_ids.shape
     
@@ -157,6 +158,8 @@ def substitute_experts(
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
 
+    if e_score_correction_bias is not None:
+            scores = scores + e_score_correction_bias.unsqueeze(0)
     sorted_scores, _ = scores.sort(dim=-1, descending=True)
     
     midscore = sorted_scores[:, K].clamp(min=0)

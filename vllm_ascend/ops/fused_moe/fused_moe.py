@@ -209,7 +209,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             mgr.update_weights(layer, topk_ids, log2phy, topk_weights, hidden_states=x, router_logits=router_logits,
                                enable_expert_substitution=enable_expert_substitution,
                                expert_substitution_threshold=expert_substitution_threshold,
-                               renormalize=renormalize, scoring_func=scoring_func)
+                               renormalize=renormalize, scoring_func=scoring_func, e_score_correction_bias=e_score_correction_bias)
             # cache this layer's gate output for the NEXT decode token's predict
             mgr.ai_save_router_logits(layer, router_logits)
             # FATE trigger moved here from after fused_experts. `x` is the
