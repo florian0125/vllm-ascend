@@ -168,6 +168,11 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
 from vllm_ascend.models.glm5next.cache_views import view_glm5_next_cache
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
 from vllm_ascend.ops.fused_moe.force_eplb import build_force_eplb_topk
+from vllm_ascend.expert_offload.expert_offload_manager import (
+    maybe_init_expert_offload_manager,
+    has_expert_offload_manager,
+    get_expert_offload_manager,
+)
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -380,10 +385,10 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.group_len = self._make_buffer(
             vllm_config.scheduler_config.max_num_batched_tokens , dtype=torch.int32
-        )        
+        )
         self.group_key_idx = self._make_buffer(
            vllm_config.scheduler_config.max_num_batched_tokens , dtype=torch.int32
-        )        
+        )
         self.group_key_cache_idx = self._make_buffer(
             vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.int32
         )
@@ -413,6 +418,11 @@ class NPUModelRunner(GPUModelRunner):
         self.use_score_encoder_cache = is_score_encoder_cache_manager(self.vllm_config)
 
         self.kvpp = KVPPRuntime()
+
+        if self.ascend_config.expert_offload_config.expert_offload:
+            maybe_init_expert_offload_manager(self.vllm_config)
+            if has_expert_offload_manager():
+                self.offload_manager = get_expert_offload_manager()
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
@@ -453,7 +463,7 @@ class NPUModelRunner(GPUModelRunner):
         self.enable_sparse_li_c8 = vllm_config.attention_config.indexer_kv_dtype in ["fp8", "int8"]
         if self.enable_sparse_li_c8:
             self.c8_k_cache_dtype = kv_cache_dtype_str_to_dtype(
-                vllm_config.attention_config.indexer_kv_dtype, 
+                vllm_config.attention_config.indexer_kv_dtype,
                 vllm_config.model_config
             )
             if self.c8_k_cache_dtype == torch.float8_e4m3fn:
@@ -462,7 +472,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.c8_k_scale_cache_dtype = torch.float16
         if self.enable_sparse_sfa_c8:
             self.c8_cache_dtype = kv_cache_dtype_str_to_dtype(
-                vllm_config.cache_config.cache_dtype, 
+                vllm_config.cache_config.cache_dtype,
                 vllm_config.model_config
             )
 
@@ -2249,7 +2259,7 @@ class NPUModelRunner(GPUModelRunner):
         # _copy_draft_token_ids_to_cpu()/take_draft_token_ids(), and the
         # scheduler output is updated by EngineCore in its own process
         # (Scheduler.update_draft_token_ids_in_output). Nothing below mutates
-        # scheduler_output in the worker, so no copy is needed. 
+        # scheduler_output in the worker, so no copy is needed.
         pp_group = get_pp_group()
         if pp_group.world_size > 1 and not pp_group.is_last_rank:
             cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -4415,10 +4425,23 @@ class NPUModelRunner(GPUModelRunner):
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
             mc2_tokens_capacity, self.vllm_config
         ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
-            # Use a call-scoped bypass because skip_compiled would require runner-specific ForwardContext plumbing.
+            # Disable prefill pool during profile run — the kernel is
+            # configured for decode expert counts and cannot handle
+            # full-expert-count prefill tensors.
+            if hasattr(self, 'offload_manager'):
+                self.offload_manager._skip_prefill = True
             with disable_compilation(self.get_model()):
                 self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
+            if hasattr(self, 'offload_manager'):
+                self.offload_manager._skip_prefill = False
+        # Offload: disable prefill pool during the framework profile_run (the
+        # kernel is configured for decode expert counts). pcp max_num_tokens
+        # splitting is handled by the framework's profile_run itself.
+        if hasattr(self, 'offload_manager'):
+            self.offload_manager._skip_prefill = True
         super().profile_run()
+        if hasattr(self, 'offload_manager'):
+            self.offload_manager._skip_prefill = False
 
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:
@@ -4487,6 +4510,8 @@ class NPUModelRunner(GPUModelRunner):
                 if "sink" in name:
                     self._has_sinks = True
                     break
+            if hasattr(self, 'offload_manager'):
+                self._finalize_offload_setup()
             if self.drafter:
                 logger.info("Loading drafter model...")
                 with get_tp_context(self.drafter):
@@ -4656,6 +4681,13 @@ class NPUModelRunner(GPUModelRunner):
             self._debugger_started = False
 
         self.debugger.step(**kwargs)
+
+    def _finalize_offload_setup(self):
+        """Post-weight-loading finalization for expert offload."""
+        t_a = time.perf_counter()
+        self.offload_manager._finalize_offload(self.model)
+        t_b = time.perf_counter()
+        logger.info("offload finalize: %.1fs", t_b - t_a)
 
     def initialize_kv_cache(
         self,
@@ -6295,6 +6327,41 @@ class NPUModelRunner(GPUModelRunner):
             set_graph_params(capture_sizes)
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
+
+    def profile_cudagraph_memory(self) -> int:
+        parent_module_name = _get_gpu_model_runner_module_name(self)
+        # This runs a throwaway eager forward (npugraph_ex fx_run_eagerly) on
+        # dummy inputs to estimate graph memory. Expert weights aren't
+        # reactively loaded yet → GMM yields NaN hidden_states → prefetch
+        # prediction degenerates to [0..topk] and would fire wasteful H2D
+        # copies + pollute the expert cache. Skip prefetch side-effects for
+        # the whole estimate, same as profile_run. The real graph used at
+        # decode is captured/replayed elsewhere with _skip_prefill=False.
+        if hasattr(self, 'offload_manager'):
+            self.offload_manager._skip_prefill = True
+        try:
+            with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+                result = GPUModelRunner.profile_cudagraph_memory(self)
+        finally:
+            if hasattr(self, 'offload_manager'):
+                self.offload_manager._skip_prefill = False
+
+        reset_graph_params()
+
+        # NOTE: This is a serious problem that we maintain two extra copies of the KV cache as the instance
+        # variable of the attention layers, when they are local variables in the upstream vLLM code.
+        # We have to manually clear them here to release memory after profiling.
+        for layer in self.compilation_config.static_forward_context.values():
+            if hasattr(layer, "impl"):
+                if hasattr(layer.impl, "key_cache"):
+                    layer.impl.key_cache = None
+                if hasattr(layer.impl, "value_cache"):
+                    layer.impl.value_cache = None
+
+        gc.collect()
+        torch.accelerator.empty_cache()
+
+        return result
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""

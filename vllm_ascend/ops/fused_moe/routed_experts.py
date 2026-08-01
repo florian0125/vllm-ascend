@@ -414,6 +414,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if not self._use_v2_model_runner:
             self.init_eplb(n_shared_experts)
         self.return_with_event = False
+        self._init_expert_offload()
 
         runner_type = getattr(vllm_config.model_config, "runner_type", None)
         if runner_type is None:
@@ -422,6 +423,107 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             if vllm_config.model_config.runner_type == "draft":
                 draft_model_config = vllm_config.speculative_config.draft_model_config
                 draft_model_config.draft_moe_quant_type = self.quant_type
+
+    def _init_expert_offload(self):
+        from vllm_ascend.expert_offload import ExpertOffloadManager
+        from vllm_ascend.expert_offload.utils import (
+            init_expert_offload_config, init_log2phy_for_offload,
+            init_log2phy_for_offload_multi_card,
+        )
+
+        cfg = get_ascend_config().expert_offload_config
+        self.enable_expert_offload, expert_map = init_expert_offload_config(cfg, self.moe_config.num_logical_experts)
+        self.enable_expert_offload = self.enable_expert_offload and self.quant_type != QuantType.NONE
+        self.enable_multi_card = False
+        if not self.enable_expert_offload:
+            return
+        if self._use_v2_model_runner or self.dynamic_eplb:
+            raise ValueError("Expert offload requires the v1 model runner with dynamic EPLB disabled")
+        mgr = ExpertOffloadManager.get_instance()
+        self.offload_layer_idx = len(mgr.moe_layers)
+        self.global_num_experts = self.moe_config.num_logical_experts
+        self.enable_multi_card = cfg.enable_multi_card and self.moe_config.ep_size > 1
+        slots = cfg.num_device_experts
+        if self.enable_multi_card:
+            if slots % self.moe_config.ep_size:
+                raise ValueError("num_device_experts must be divisible by the expert parallel size")
+            slots //= self.moe_config.ep_size
+            self.log2phy = init_log2phy_for_offload_multi_card(
+                self.global_num_experts, slots, self.moe_config.ep_size, self.ep_rank)
+            self.ascend_expert_map = torch.arange(cfg.num_device_experts, dtype=torch.int32)
+        else:
+            self.log2phy = init_log2phy_for_offload(self.global_num_experts, slots)
+            self.ascend_expert_map = expert_map
+        self.moe_config.num_local_experts = slots
+        self._wrap_weight_loader_for_offload()
+        self.quant_method.create_weights(
+            layer=self, num_experts=slots, hidden_size=self.moe_config.hidden_dim,
+            intermediate_size_per_partition=self.moe_config.intermediate_size_per_partition,
+            params_dtype=self.params_dtype, weight_loader=self.weight_loader,
+        )
+        mgr.init_layer_cpu_buffers(self, self.offload_layer_idx)
+
+    def _wrap_weight_loader_for_offload(self):
+        """Wrap weight_loader to intercept w13/w2 weights and store them on CPU.
+
+        Also intercepts scale/offset parameters for quantized models (W8A8).
+        Uses weight_name substring matching to distinguish param types:
+        - "weight_scale" → scale params
+        - "weight_offset" → offset params
+        - otherwise → weight params
+        """
+        from vllm_ascend.expert_offload import ExpertOffloadManager
+        mgr = ExpertOffloadManager.get_instance()
+        layer_moe_idx = self.offload_layer_idx
+        # v0.25.1: weight_loader lives on routed_experts (RoutedExperts), not the
+        # runner. Wrap it there so checkpoint loading of expert params (which hold
+        # a reference to routed_experts.weight_loader set at create_weights time)
+        # goes through the offload interceptor. Re-create weights after this so
+        # the new params capture the wrapped loader.
+        orig_wl = self.weight_loader
+        # ndev = per-rank device slot count (== device weight dim0). The loader
+        # fills the device weight with experts [0, ndev); num_device_experts is
+        # the TOTAL slot count, so divide by ep_size. ep_size=1 (single-card) is
+        # a no-op. CPU buffer still gets ALL experts (loaded above this guard).
+        ndev = mgr.num_device_experts // mgr.ep_size
+
+        def _offload_weight_loader(param, loaded_weight, weight_name, shard_id,
+                                   expert_id, **kwargs):
+            # --- Handle scale/offset/scale_bias params (quantized models) ---
+            if "weight_scale" in weight_name:
+                mgr._load_scale_shard(layer_moe_idx, expert_id,
+                                      "w13_weight_scale" if shard_id in ("w1", "w3")
+                                      else "w2_weight_scale",
+                                      shard_id, loaded_weight)
+                if expert_id >= ndev:
+                    return None
+            elif "weight_offset" in weight_name:
+                mgr._load_scale_shard(layer_moe_idx, expert_id,
+                                      "w13_weight_offset" if shard_id in ("w1", "w3")
+                                      else "w2_weight_offset",
+                                      shard_id, loaded_weight)
+                if expert_id >= ndev:
+                    return None
+            elif "scale_bias" in weight_name:
+                mgr._load_scale_shard(layer_moe_idx, expert_id,
+                                      "w13_scale_bias" if shard_id in ("w1", "w3")
+                                      else "w2_scale_bias",
+                                      shard_id, loaded_weight)
+                if expert_id >= ndev:
+                    return None
+            else:
+                # --- Handle weight params (existing logic) ---
+                if shard_id in ("w1", "w3"):
+                    mgr.load_w13(layer_moe_idx, expert_id, loaded_weight, shard_id)
+                elif shard_id == "w2":
+                    mgr.load_w2(layer_moe_idx, expert_id, loaded_weight)
+                # Only load to device if expert_id < num_device_experts
+                if shard_id in ("w1", "w2", "w3") and expert_id >= ndev:
+                    return None
+            return orig_wl(param, loaded_weight, weight_name, shard_id,
+                           expert_id, **kwargs)
+
+        self.weight_loader = _offload_weight_loader
 
     def get_expert_weights(self) -> Iterable[torch.Tensor]:
         try:
@@ -617,7 +719,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             router_logits=router_logits,
             input_ids=input_ids,
         )
-        if self.log2phy is not None:
+        if self.log2phy is not None and not self.enable_expert_offload:
             topk_ids = self.log2phy[topk_ids]
 
         num_shared_experts = self.n_shared_experts
@@ -702,14 +804,19 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         self.ascend_pertoken_scale = pertoken_scale
         self.ascend_mc2_mask = mc2_mask
         try:
-            fused_experts_results: FusedExpertsResult = self.quant_method.apply(
-                layer=self,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=None,
-                shared_experts_input=None,
-            )
+            if self.enable_expert_offload:
+                from vllm_ascend.expert_offload.routed_experts import apply_offloaded_experts
+
+                fused_experts_results = apply_offloaded_experts(self, hidden_states, topk_weights, topk_ids)
+            else:
+                fused_experts_results: FusedExpertsResult = self.quant_method.apply(
+                    layer=self,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=None,
+                    shared_experts_input=None,
+                )
         finally:
             self.ascend_pertoken_scale = None
             self.ascend_mc2_mask = None

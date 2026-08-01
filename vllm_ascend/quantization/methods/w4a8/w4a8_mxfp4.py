@@ -43,6 +43,24 @@ from ..registry import register_scheme
 SITU_MX_DST_TYPE_E4M3FN = 36
 
 
+def apply_mxfp4_weight_scale_layout(scale: torch.Tensor,
+                                    view_uint8: bool = False) -> torch.Tensor:
+    """MXFP4 weight-scale layout transform: ``reshape(...,n,k//2,2).transpose(-3,-2)``.
+
+    Works on a full tensor ``[g, n, k]`` or a single-expert slice ``[n, k]``
+    (the leading ``g`` dim collapses). ``view_uint8`` mirrors the DeepSeek-V4
+    DS subclass path where the loaded e8m0 scale is viewed as uint8 before the
+    transpose. Shared by the device-side ``process_weights_after_loading`` and
+    by the expert-offload manager so the CPU buffer holds the post-process byte
+    layout (avoids layout drift between the two paths).
+    """
+    *leading, n, k = scale.shape
+    out = scale.reshape(*leading, n, k // 2, 2)
+    if view_uint8:
+        out = out.view(torch.uint8)
+    return out.transpose(-3, -2)
+
+
 @register_scheme("W4A8_MXFP", "linear")
 class AscendW4A8MXFPDynamicLinearMethod(AscendLinearScheme):
     """Linear method for Ascend W4A8_MXFP (Microscaling) quantization."""
@@ -244,6 +262,13 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         Records the original shapes and marks the layer transformed so
         ``restore_weights_for_rl_loading`` can reverse it before an RL reload.
         """
+        if getattr(layer, "enable_expert_offload", False):
+            layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
+            layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
+            layer.w13_weight_scale.data = apply_mxfp4_weight_scale_layout(layer.w13_weight_scale.data)
+            layer.w2_weight_scale.data = apply_mxfp4_weight_scale_layout(layer.w2_weight_scale.data)
+            layer._mxfp4_transformed = True
+            return
         if getattr(layer, "_mxfp4_transformed", False):
             return
         if not hasattr(layer, "_mxfp4_original_shapes"):
@@ -483,11 +508,7 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
         )
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
-        g, n, k = layer.w13_weight_scale.shape
-        layer.w13_weight_scale.data = (
-            layer.w13_weight_scale.data.reshape(g, n, k // 2, 2).view(torch.uint8).transpose(-3, -2)
-        )
-        g, n, k = layer.w2_weight_scale.shape
-        layer.w2_weight_scale.data = (
-            layer.w2_weight_scale.data.reshape(g, n, k // 2, 2).view(torch.uint8).transpose(-3, -2)
-        )
+        layer.w13_weight_scale.data = apply_mxfp4_weight_scale_layout(
+            layer.w13_weight_scale.data, view_uint8=True)
+        layer.w2_weight_scale.data = apply_mxfp4_weight_scale_layout(
+            layer.w2_weight_scale.data, view_uint8=True)

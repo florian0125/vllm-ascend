@@ -112,6 +112,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
 
         self.quant_type = routed_experts.quant_type
         self.routed_experts.router = router
+        object.__setattr__(self.routed_experts, "gate", gate)
 
         self.moe_config.tp_group = get_tp_group()
         self.moe_config.dp_group = get_dp_group()
