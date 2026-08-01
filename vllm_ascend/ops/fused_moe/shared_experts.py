@@ -17,6 +17,8 @@
 from enum import Enum, auto
 from functools import wraps
 
+from functools import lru_cache
+
 import torch
 import torch.nn.functional as F
 import torch_npu
@@ -38,6 +40,22 @@ from vllm_ascend.utils import npu_stream_switch, shared_experts_calculation_stre
 
 # CANN uses 36 to select FP8 E4M3FN output for situ_mx_quant.
 SITU_MX_DST_TYPE_E4M3FN = 36
+
+
+@lru_cache(maxsize=None)
+def _c_ascend_op_has_kwarg(op_name: str, kwarg: str) -> bool:
+    """True if torch.ops._C_ascend.<op_name> accepts ``kwarg``.
+
+    Some _C_ascend ops (npu_swiglu_group_quant / npu_dequant_swiglu_quant)
+    gained glu_alpha/glu_beta only after a custom op recompile. The stock op
+    rejects those kwargs, so gate them on schema support: the same call site
+    then works on the stock op (V4, no glu) and the recompiled op (Kimi-K3).
+    """
+    try:
+        op = getattr(torch.ops._C_ascend, op_name, None)
+        return op is not None and kwarg in str(op._schema)
+    except Exception:
+        return False
 
 
 class SharedExpertParallelMode(Enum):
@@ -407,7 +425,8 @@ class AscendSharedExperts:
                 clamp_limit=self.swiglu_limit,
                 **(
                     {}
-                    if not get_current_hardware_profile().supports(HardwareCapability.FUSED_SWIGLU_TUNING_ARGS)
+                    if not (get_current_hardware_profile().supports(HardwareCapability.FUSED_SWIGLU_TUNING_ARGS)
+                            and _c_ascend_op_has_kwarg("npu_dequant_swiglu_quant", "glu_alpha"))
                     else {"glu_alpha": self.swiglu_alpha, "glu_bias": self.swiglu_beta}
                 ),
             )
@@ -463,6 +482,8 @@ class AscendSharedExperts:
                 dst_type=torch.float8_e4m3fn,
                 quant_mode=2,
                 clamp_value=self.swiglu_limit,
+                **({"glu_alpha": self.swiglu_alpha, "glu_bias": self.swiglu_beta}
+                   if _c_ascend_op_has_kwarg("npu_swiglu_group_quant", "glu_alpha") else {}),
             )
         self._wait_for_routed_stage(
             milestones,
