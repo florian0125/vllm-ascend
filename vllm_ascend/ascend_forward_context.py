@@ -416,9 +416,21 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig) -> MoECommT
         # is unnecessary — and pad-token garbage that used to inflate the
         # union is filtered by mc2_mask (51a6d644). num_device_experts is now
         # a free knob: smaller => more batches take the full-expert pool.
-        _ndev = get_ascend_config().expert_offload_config.num_device_experts
-        _topk = getattr(vllm_config.model_config.hf_config,
-                        "num_experts_per_tok", 1)
+        _offload_config = get_ascend_config().expert_offload_config
+        # Communication selection is process-wide rather than layer-specific,
+        # so use the smallest configured layer capacity as the safe bound.
+        _ndev = min(_offload_config.num_device_experts_list)
+        _hf = getattr(vllm_config.model_config, "hf_config", None)
+        if _hf is None:
+            _hf = vllm_config.model_config.hf_text_config
+        _text_config = getattr(_hf, "text_config", None)
+        _topk = (
+            getattr(_hf, "num_experts_per_tok", None)
+            or getattr(_hf, "num_experts_per_token", None)
+            or getattr(_text_config, "num_experts_per_tok", None)
+            or getattr(_text_config, "num_experts_per_token", None)
+            or 1
+        )
         _buffer_fits = num_tokens * _topk <= _ndev
         if (num_tokens <= mc2_tokens_capacity and num_tokens <= 512
                 and _buffer_fits):

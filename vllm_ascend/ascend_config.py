@@ -1006,6 +1006,35 @@ class ExpertOffloadConfig:
             return val[layer_idx]
         return val
 
+    def num_device_experts_for_rank(self, layer_idx: int,
+                                    ep_size: int = 1) -> int:
+        """Return the physical expert slots held by one EP rank.
+
+        ``num_device_experts`` is the global capacity for a layer. Single-card
+        execution passes ``ep_size=1``; multi-card execution splits that
+        capacity evenly across EP ranks.
+        """
+        if ep_size < 1:
+            raise ValueError(f"ep_size must be >= 1; got {ep_size}")
+        capacity = self.num_device_experts_for_layer(layer_idx)
+        if capacity % ep_size != 0:
+            raise ValueError(
+                "num_device_experts for each multi-card MoE layer must be "
+                "divisible by EP size; "
+                f"layer={layer_idx}, capacity={capacity}, ep_size={ep_size}")
+        return capacity // ep_size
+
+    def validate_num_moe_layers(self, num_moe_layers: int) -> None:
+        """Validate current target layers while allowing later MTP layers."""
+        nde_list = self.num_device_experts_list
+        if len(nde_list) > 1 and len(nde_list) < num_moe_layers:
+            raise ValueError(
+                f"num_device_experts list length ({len(nde_list)}) must be at "
+                f"least the number of MoE layers registered so far "
+                f"({num_moe_layers}); use a scalar or a single-element list to "
+                f"broadcast, or a list of length >= {num_moe_layers} (append "
+                f"one entry per draft MoE layer, e.g. MTP)")
+
     @property
     def num_device_experts_list(self) -> list[int]:
         """num_device_experts as a list (scalar wrapped into a 1-element list)."""

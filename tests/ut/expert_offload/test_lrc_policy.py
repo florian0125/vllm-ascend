@@ -160,3 +160,23 @@ def test_choose_victim_loading_excludes_and_falls_back():
     # filter (loading ignored), so the baseline victim 3 is chosen again.
     assert policy.choose_victim(
         0, slot_owner, protected={5, 6}, loading={1, 2, 3, 4}) == 3
+
+
+def test_seed_layer_hotness_protects_offline_preloaded_experts():
+    policy = LRCExpertCachePolicy(
+        num_layers=1,
+        num_experts=8,
+        cache_size=4,
+        topk=2,
+        recent_window=8,
+        age_weight=0.0,
+    )
+
+    policy.seed_layer_hotness(0, {1: 0.9, 2: 0.3})
+    state = policy.layer_states[0]
+
+    assert state.freq[1] == 8
+    assert state.freq[2] == 3
+    assert state.router_score[1] == 0.9
+    assert state.last_used[1] == state.step
+    assert policy.hotness(0, 1) > policy.hotness(0, 3)

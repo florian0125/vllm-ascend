@@ -571,12 +571,6 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             if self.enable_multi_card:
                 from vllm.distributed.parallel_state import get_ep_group as _gep
                 _ep = _gep()
-                if _layer_capacity % _ep.world_size != 0:
-                    raise ValueError(
-                        "num_device_experts for each multi-card MoE layer "
-                        "must be divisible by EP size; "
-                        f"layer={self.moe_instance_id}, "
-                        f"capacity={_layer_capacity}, ep_size={_ep.world_size}")
                 # NOTE: no ep_size*topk slot floor here. The device buffer is
                 # only used when it actually fits the active expert union —
                 # select_moe_comm_method routes to MC2+buffer iff
@@ -588,7 +582,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 # buffer-fit check in select_moe_comm_method is the correct
                 # bound. offload_threshold (= num_device_experts // topk) is set
                 # in ExpertOffloadManager.__init__.
-                _per_rank = _layer_capacity // _ep.world_size
+                _per_rank = _offload_cfg.num_device_experts_for_rank(
+                    self.moe_instance_id, _ep.world_size)
                 self.log2phy = init_log2phy_for_offload_multi_card(
                     self.global_num_experts, _per_rank, _ep.world_size,
                     _ep.rank_in_group)
@@ -628,7 +623,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         if self.enable_expert_offload:
             if self.enable_multi_card:
                 from vllm.distributed.parallel_state import get_ep_group as _gep
-                _offload_ne = _layer_capacity // _gep().world_size
+                _offload_ne = _offload_cfg.num_device_experts_for_rank(
+                    self.moe_instance_id, _gep().world_size)
             else:
                 _offload_ne = _layer_capacity
             self.moe_config.num_local_experts = _offload_ne
@@ -685,6 +681,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             self.routed_experts.global_num_experts = self.global_num_experts
             self.routed_experts.enable_expert_offload = self.enable_expert_offload
             self.routed_experts.enable_multi_card = self.enable_multi_card
+            # The offload manager stores routed_experts rather than this
+            # runner. Keep the model gate on the stored layer so learned and
+            # hash routing prefetch work for both DeepSeek and Kimi K3.
+            self.routed_experts.gate = self._gate
             # Propagate log2phy onto routed_experts (same tensor object — the
             # planner rewrites it in place via copy_) so pregate's
             # next_layer.log2phy resolves: moe_layers stores routed_experts in
@@ -743,9 +743,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # fills the device weight with experts [0, ndev); num_device_experts is
         # the TOTAL slot count, so divide by ep_size. ep_size=1 (single-card) is
         # a no-op. CPU buffer still gets ALL experts (loaded above this guard).
-        layer_capacity = mgr.num_device_experts_for_layer(layer_moe_idx)
-        ndev = (layer_capacity // mgr.ep_size
-                if self.enable_multi_card else layer_capacity)
+        ndev = mgr.offload_config.num_device_experts_for_rank(
+            layer_moe_idx, mgr.ep_size if self.enable_multi_card else 1)
 
         def _offload_weight_loader(param, loaded_weight, weight_name, shard_id,
                                    expert_id, **kwargs):

@@ -432,13 +432,7 @@ class ExpertOffloadManager:
         # the count seen here (target layers only) is smaller than the final
         # total. Requiring equality would reject the extra draft-layer entry.
         nde_list = self.offload_config.num_device_experts_list
-        if len(nde_list) > 1 and len(nde_list) < num_moe_layers:
-            raise ValueError(
-                f"num_device_experts list length ({len(nde_list)}) must be at "
-                f"least the number of MoE layers registered so far "
-                f"({num_moe_layers}); use a scalar or a single-element list to "
-                f"broadcast, or a list of length >= {num_moe_layers} (append "
-                f"one entry per draft MoE layer, e.g. MTP)")
+        self.offload_config.validate_num_moe_layers(num_moe_layers)
         if self._debug:
             logger.info(
                 "[OFFLOAD] num_device_experts per layer (n_layers=%d): %s",
@@ -858,21 +852,25 @@ class ExpertOffloadManager:
     #  Weight-load entry points (called by the safetensors loader)        #
     # ------------------------------------------------------------------ #
 
-    def register_gate_weights(self, model):
+    def register_gate_weights(self, _model):
         """Store an fp32 NPU copy of gate.weight for each MoE layer.
 
         Called from _finalize_offload() after all MoE layers are registered.
         Used by predict_next_layer_experts_npu() so prediction runs on-device
         and can be captured in a CUDA/NPU graph.
         """
-        from vllm_ascend.models.deepseek_v4 import DeepseekV4MoE
-        moe_wrappers = [m for m in model.modules()
-                        if isinstance(m, DeepseekV4MoE)]
-        for wrapper in moe_wrappers:
-            gate_param = wrapper.gate.weight.data
-            # fp32 clone on the gate's own device for on-device,
-            # graph-capturable prediction.
-            self._gate_weights_npu.append(gate_param.float().clone())
+        # moe_layers is the authoritative registration order used by every
+        # per-layer offload array. Its entries are RoutedExperts objects, so
+        # the runner propagates the owning model gate onto each entry. This is
+        # model-agnostic (DeepSeek and Kimi K3 use different wrapper classes)
+        # and keeps missing gates represented by None rather than shifting all
+        # later layer indices.
+        self._gate_weights_npu = []
+        for layer in self.moe_layers:
+            gate = getattr(layer, "gate", None)
+            gate_param = getattr(gate, "weight", None)
+            self._gate_weights_npu.append(
+                None if gate_param is None else gate_param.data.float().clone())
         logger.info("[PREFETCH] registered gate weights for %d MoE layers",
                     len(self._gate_weights_npu))
 
@@ -885,19 +883,18 @@ class ExpertOffloadManager:
         predict_next_layer_experts_npu can look up
         _gate_weights_npu[next_idx] for every registered layer.
 
-        No-op before _finalize_offload has built the cache policy (the
-        target layers are covered in bulk there); mirrors the
-        _extend_cache_for_layer() sentinel.
+        No-op before _finalize_offload has built the runtime buffers (the
+        target layers are covered in bulk there). A missing gate is appended
+        as None to preserve index alignment.
         """
         if not self.offload_config.expert_prefetch_enabled:
             return
-        if self.cache_policy is None:
+        if not hasattr(self, "topk_ids_h"):
             return
         gate = getattr(layer, 'gate', None)
-        if gate is None:
-            return
-        gate_param = gate.weight.data
-        self._gate_weights_npu.append(gate_param.float().clone())
+        gate_param = getattr(gate, 'weight', None)
+        self._gate_weights_npu.append(
+            None if gate_param is None else gate_param.data.float().clone())
         logger.info(
             "[PREFETCH] registered gate weight for post-finalize layer "
             "(total gates=%d, moe_layers=%d)",
@@ -1524,8 +1521,8 @@ class ExpertOffloadManager:
         # (get_ep_group().cpu_group) — stream-independent, so it runs inside the
         # host callback. HCCL all_reduce CANNOT be a captured graph op, and the
         # planner needs the counts on host anyway.
-        layer_capacity = self.num_device_experts_for_layer(layer_idx)
-        per_rank_slots = layer_capacity // self.ep_size
+        per_rank_slots = self.offload_config.num_device_experts_for_rank(
+            layer_idx, self.ep_size)
         topk_ids_h = self.topk_ids_h[:num_tokens]
         log2phy_h = self.log2phy_h
         topk_ids_h.copy_(topk_ids, non_blocking=_EXTRA_CTX.capturing)
@@ -1938,31 +1935,72 @@ class ExpertOffloadManager:
         import json
         with open(path) as f:
             hot = json.load(f)                  # {"<layer_idx>": [[eid,w],...]}
+        if self.enable_multi_card and self.cache_policy is not None:
+            # Multi-card decode uses _mc_lrc; share the already configured
+            # per-layer policy so offline seeds and runtime observations evolve
+            # from the same state.
+            self._mc_lrc = self.cache_policy
         with torch_npu.npu.stream(self.load_stream):
             for layer_idx, layer in enumerate(self.moe_layers):
-                ndev = self.num_device_experts_for_layer(layer_idx)
                 pairs = hot.get(str(layer_idx))
                 if not pairs:
                     logger.warning("[HOT-PRELOAD] l=%d missing in json, skip",
                                    layer_idx)
                     continue
-                pairs = pairs[:ndev]                        # top-ndev hottest
-                log2phy_np = self.log2phy_np
-                log2phy_np[:] = -1
-                weights = {}
-                for slot, (eid, w) in enumerate(pairs):
-                    self._load_expert_weights_into_slot(
-                        layer, layer_idx, eid, slot)
-                    log2phy_np[eid] = slot
-                    weights[eid] = w
+                if self.enable_multi_card:
+                    from vllm_ascend.expert_offload.multi_card_planner import (
+                        plan_hot_preload)
+                    per_rank_slots = (
+                        self.offload_config.num_device_experts_for_rank(
+                            layer_idx, self.ep_size))
+                    force_shard = (getattr(self, '_shard_size', None)
+                                   if self.offload_config.shard_per_rank
+                                   else None)
+                    placement = plan_hot_preload(
+                        pairs,
+                        global_num_experts=self.num_total_experts,
+                        ep_size=self.ep_size,
+                        num_device_experts=per_rank_slots,
+                        force_shard=force_shard,
+                    )
+                    my_experts = placement.per_rank_experts[self.ep_rank]
+                    for slot, eid in enumerate(my_experts):
+                        if eid >= 0:
+                            self._load_expert_weights_into_slot(
+                                layer, layer_idx, eid, slot)
+                    self.log2phy_h.copy_(placement.log2phy)
+                    self._mc_prev_log2phy[layer_idx] = (
+                        placement.log2phy.clone())
+                    self._mc_resident[layer_idx] = {
+                        slot: int(eid)
+                        for slot, eid in enumerate(my_experts) if eid >= 0
+                    }
+                    pair_weights = {int(eid): float(weight)
+                                    for eid, weight in pairs}
+                    weights = {
+                        eid: pair_weights[eid]
+                        for eid, physical_id in enumerate(
+                            placement.log2phy.tolist())
+                        if physical_id >= 0
+                    }
+                else:
+                    ndev = self.num_device_experts_for_layer(layer_idx)
+                    selected_pairs = pairs[:ndev]
+                    self.log2phy_np[:] = -1
+                    weights = {}
+                    for slot, (eid, weight) in enumerate(selected_pairs):
+                        self._load_expert_weights_into_slot(
+                            layer, layer_idx, eid, slot)
+                        self.log2phy_np[eid] = slot
+                        weights[eid] = weight
                 layer.log2phy.copy_(self.log2phy_h)         # H2D writeback
                 if self.cache_policy is not None:
                     self.cache_policy.seed_layer_hotness(layer_idx, weights)
                 if self._debug:
                     logger.info("[HOT-PRELOAD] l=%d loaded %d hot experts, "
                                 "ids=%s",
-                                layer_idx, len(pairs),
-                                [p[0] for p in pairs[:20]])
+                                layer_idx, len(weights),
+                                list(weights)[:20])
             self.load_stream.synchronize()
 
     def predict_next_layer_experts_npu(
@@ -2126,8 +2164,8 @@ class ExpertOffloadManager:
         """Pick the single-card vs multi-card planner+H2D inner and its args."""
         self._is_prefetch = True
         if self.enable_multi_card:
-            per_rank_slots = (
-                self.num_device_experts_for_layer(next_idx) // self.ep_size)
+            per_rank_slots = self.offload_config.num_device_experts_for_rank(
+                next_idx, self.ep_size)
             # mc2_mask_h=None: prefetch predicts the NEXT layer whose
             # active-token mask isn't known yet, so don't filter. Prefetch
             # placement is corrected by the next layer's reactive update

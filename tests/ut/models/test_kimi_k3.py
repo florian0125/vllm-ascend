@@ -345,6 +345,7 @@ def test_kimi_k3_passes_situ_parameters_through_activation_config(monkeypatch):
     KimiK3MoE(config, prefix="model.layers.1.block_sparse_moe")
 
     activation = fused_moe_kwargs["activation"]
+    assert fused_moe_kwargs["gate"] is not None
     assert isinstance(activation, SituActivationConfig)
     assert activation.beta == 4.0
     assert activation.linear_beta == 25.0

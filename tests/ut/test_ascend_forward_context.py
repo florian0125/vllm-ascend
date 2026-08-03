@@ -244,6 +244,54 @@ def test_select_moe_comm_method_uses_allgather_without_effective_expert_parallel
 
 
 @pytest.mark.parametrize(
+    ("hf_config", "num_tokens", "expected"),
+    [
+        (SimpleNamespace(num_experts_per_tok=2), 4, MoECommType.MC2),
+        (SimpleNamespace(num_experts_per_tok=2), 5, MoECommType.ALLTOALL),
+        (
+            SimpleNamespace(
+                text_config=SimpleNamespace(num_experts_per_token=4)),
+            2,
+            MoECommType.MC2,
+        ),
+        (
+            SimpleNamespace(
+                text_config=SimpleNamespace(num_experts_per_token=4)),
+            3,
+            MoECommType.ALLTOALL,
+        ),
+    ],
+)
+def test_multi_card_offload_capacity_supports_deepseek_and_kimi_k3(
+    monkeypatch,
+    hf_config,
+    num_tokens,
+    expected,
+):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A3,
+        capacity=128,
+        ep_world_size=2,
+    )
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(
+            expert_offload_config=SimpleNamespace(
+                expert_offload=True,
+                enable_multi_card=True,
+                num_device_experts_list=[8, 16],
+            ),
+        ),
+    )
+    vllm_config = _make_vllm_config()
+    vllm_config.model_config.hf_config = hf_config
+
+    assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
+
+
+@pytest.mark.parametrize(
     ("num_tokens", "expected"),
     [
         (128, MoECommType.MC2),

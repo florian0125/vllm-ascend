@@ -103,6 +103,41 @@ def test_single_rank():
     _check(0 in p.unassigned, "expert 0 in unassigned")
 
 
+def test_hot_preload_single_card_keeps_hottest_prefix():
+    pairs = [(5, 0.9), (1, 0.8), (7, 0.7), (3, 0.6)]
+
+    placement = mcp.plan_hot_preload(
+        pairs, global_num_experts=8, ep_size=1, num_device_experts=2)
+
+    _check(placement.per_rank_experts == [[5, 1]],
+           f"single-card hottest prefix retained: {placement.per_rank_experts}")
+    _check(int(placement.log2phy[5]) == 0, "hottest expert uses slot 0")
+    _check(int(placement.log2phy[1]) == 1, "second expert uses slot 1")
+
+
+def test_hot_preload_multi_card_respects_shard_ownership():
+    # Global ranking is skewed toward rank 0. Passing the complete ranking must
+    # still fill rank 1 with its own hottest experts when CPU weights are
+    # shard-per-rank.
+    pairs = [(0, 0.9), (1, 0.8), (2, 0.7), (3, 0.6),
+             (4, 0.5), (5, 0.4), (6, 0.3), (7, 0.2)]
+
+    placement = mcp.plan_hot_preload(
+        pairs,
+        global_num_experts=8,
+        ep_size=2,
+        num_device_experts=2,
+        force_shard=4,
+    )
+
+    _check(placement.per_rank_experts[0] == [0, 1],
+           f"rank0 gets shard-hot experts: {placement.per_rank_experts[0]}")
+    _check(placement.per_rank_experts[1] == [4, 5],
+           f"rank1 gets shard-hot experts: {placement.per_rank_experts[1]}")
+    _check(int(placement.log2phy[4]) == 2,
+           "rank1 slot0 is encoded after rank0 physical range")
+
+
 def test_local_expert_counts():
     print("test_local_expert_counts")
     topk_ids = torch.tensor([[0, 2], [2, 5], [0, 0]])  # expert 0 x3, 2 x2, 5 x1
