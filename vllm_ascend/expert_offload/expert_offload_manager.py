@@ -470,6 +470,18 @@ class ExpertOffloadManager:
         self.topk_weights_h = torch.zeros(
             [self.offload_threshold, self.topk],
             dtype=torch.float32, device="cpu", pin_memory=True)
+        # NPU staging buffer for graph-safe writeback of substituted
+        # topk_weights. The old writeback did
+        # topk_weights_h[...].to(topk_weights.dtype) (a CPU cast) which built a
+        # pageable tensor that EE1016 rejects under graph capture. Instead copy
+        # pinned f32 -> this NPU f32 buffer (same-dtype async copy that records
+        # into the graph), then copy_ casts to topk_weights.dtype on device.
+        # dtype stays f32 (matching topk_weights_h), so no model-specific dtype
+        # inference is needed.
+        _tw_dev = _expert_weight(self.moe_layers[0], "w13_weight").device
+        self.topk_weights_dev = torch.zeros(
+            [self.offload_threshold, self.topk],
+            dtype=torch.float32, device=_tw_dev)
         self.router_logits_h = None
         self.e_score_correction_bias_h = None
         if self.offload_config.expert_substitution_enabled:
@@ -1518,9 +1530,14 @@ class ExpertOffloadManager:
         if do_substitution:
             topk_ids[:, :self.topk].copy_(topk_ids_h[:, :self.topk],
                                           non_blocking=True)
+            # pinned f32 -> NPU f32 (graph-safe) -> device cast. Avoids
+            # topk_weights_h.to(dtype) which built a pageable CPU tensor and
+            # tripped EE1016 (pageable copy under graph capture).
+            topk_w_dev = self.topk_weights_dev[:num_tokens]
+            topk_w_dev[:, :self.topk].copy_(
+                topk_weights_h[:, :self.topk], non_blocking=True)
             topk_weights[:, :self.topk].copy_(
-                topk_weights_h[:, :self.topk].to(topk_weights.dtype),
-                non_blocking=True)
+                topk_w_dev[:, :self.topk], non_blocking=True)
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
 
     def _mc_handle_prefill_regime(self, layer_idx) -> bool:
@@ -1675,9 +1692,14 @@ class ExpertOffloadManager:
         if do_substitution:
             topk_ids[:, :self.topk].copy_(
                 topk_ids_h[:, :self.topk], non_blocking=True)
+            # pinned f32 -> NPU f32 (graph-safe) -> device cast. Avoids
+            # topk_weights_h.to(dtype) which built a pageable CPU tensor and
+            # tripped EE1016 (pageable copy under graph capture).
+            topk_w_dev = self.topk_weights_dev[:num_tokens]
+            topk_w_dev[:, :self.topk].copy_(
+                topk_weights_h[:, :self.topk], non_blocking=True)
             topk_weights[:, :self.topk].copy_(
-                topk_weights_h[:, :self.topk].to(topk_weights.dtype),
-                non_blocking=True)
+                topk_w_dev[:, :self.topk], non_blocking=True)
         # Copy the (host-func-mutated) log2phy_h back to the NPU tensor so the
         # MC2 dispatcher reads the fresh placement.
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
