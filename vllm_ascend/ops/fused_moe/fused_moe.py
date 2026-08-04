@@ -428,15 +428,26 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         from vllm_ascend.ascend_config import get_ascend_config
         from vllm_ascend.expert_offload.utils import init_expert_offload_config
         _offload_cfg = get_ascend_config().expert_offload_config
-        # The runner counter is incremented later in this constructor, so the
-        # next value is this layer's registration index.
-        _layer_idx = AscendMoERunner.moe_counter + 1
-        self.enable_expert_offload, _offload_emap, _ndev = \
-            init_expert_offload_config(
-                _offload_cfg, moe_config.num_experts, _layer_idx)
-        if _offload_emap is not None:
-            self._expert_map_offload = _offload_emap
-            self._expert_map_offload_count = _ndev
+        # Expert offload targets the main model's MoE layers. MTP / draft-model
+        # MoE layers live under the "mtp" prefix namespace (e.g. "mtp.0.mlp.
+        # experts"); the single MTP layer is tiny and must not offload. Skipping
+        # it also avoids an IndexError when num_device_experts is a per-layer
+        # list sized only for the main model's MoE layers.
+        if "mtp" in layer_name.split("."):
+            self.enable_expert_offload = False
+            logger.info(
+                "[OFFLOAD] skipping expert offload for MTP/draft MoE layer "
+                "%r (not part of the offload target set).", layer_name)
+        else:
+            # The runner counter is incremented later in this constructor, so
+            # the next value is this layer's registration index.
+            _layer_idx = AscendMoERunner.moe_counter + 1
+            self.enable_expert_offload, _offload_emap, _ndev = \
+                init_expert_offload_config(
+                    _offload_cfg, moe_config.num_experts, _layer_idx)
+            if _offload_emap is not None:
+                self._expert_map_offload = _offload_emap
+                self._expert_map_offload_count = _ndev
         self.top_k = moe_config.experts_per_token
         self._gate = gate
         self.hidden_size = moe_config.hidden_dim

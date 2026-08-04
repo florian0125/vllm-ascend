@@ -645,6 +645,18 @@ class ExpertOffloadManager:
         cast landed on the transposed shape). Slot bytes are refreshed by
         decode/prefill H2D at runtime (CPU buffer holds the matching NZ bytes);
         this call fixes the format + layout metadata.
+
+        Fallback: some NPU devices/drivers only allow base format
+        (allow_internal_format=False) and reject the format-29 cast at the ACL
+        layer (device error 361001). This call only stamps format *metadata* on
+        the resident slots — the bytes themselves are refreshed by decode/prefill
+        H2D at runtime, and the fused-swiglu GMM path (DeepSeek-V4) reads them
+        via raw storage, so skipping it is safe for V4. The SiTU raw
+        npu_grouped_matmul path (Kimi-K3) checks the format and would reject
+        fp4_e2m1 on base format (EZ1001); such models are unsupported on these
+        devices. On the first cast failure we warn once and return, leaving the
+        slots in base format. w.data is reassigned only after a successful cast,
+        so a raised exception never leaves a slot half-mutated.
         """
         for layer in self.moe_layers:
             for name in ("w13_weight", "w2_weight"):
@@ -652,11 +664,20 @@ class ExpertOffloadManager:
                 if w is None:
                     continue
                 d = w.data.transpose(1, 2).contiguous()
-                d = torch_npu.npu_format_cast(
-                    d.view(torch.uint8), 29,
-                    customize_dtype=torch.float8_e4m3fn,
-                    input_dtype=torch_npu.float4_e2m1fn_x2,
-                )
+                try:
+                    d = torch_npu.npu_format_cast(
+                        d.view(torch.uint8), 29,
+                        customize_dtype=torch.float8_e4m3fn,
+                        input_dtype=torch_npu.float4_e2m1fn_x2,
+                    )
+                except RuntimeError as e:
+                    logger.warning(
+                        "[OFFLOAD] npu_format_cast to format-29 (mxfp4 NZ) "
+                        "failed on layer slot %r; leaving expert slots in base "
+                        "format. Safe for DeepSeek-V4 (fused-swiglu GMM reads "
+                        "raw storage); breaks the Kimi-K3 SiTU "
+                        "npu_grouped_matmul path. Error: %s", name, e)
+                    return
                 w.data = d.transpose(1, 2)
 
     def _process_scale_bias_cpu_buffers(self):

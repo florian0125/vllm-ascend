@@ -1,0 +1,4 @@
+performance
+vm.swappiness = 0
+kernel.numa_balancing = 0
+sysctl: cannot stat /proc/sys/kernel/sched_migration_cost_ns: No such file or directory
