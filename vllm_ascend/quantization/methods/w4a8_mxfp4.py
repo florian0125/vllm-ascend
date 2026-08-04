@@ -259,7 +259,19 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                 )
                 prefill_regime = forward_context.moe_comm_type != MoECommType.MC2
             else:
-                mgr.update_weights(layer, topk_ids, log2phy, topk_weights, hidden_states=x)
+                mgr.update_weights(
+                    layer,
+                    topk_ids,
+                    log2phy,
+                    topk_weights,
+                    hidden_states=x,
+                    router_logits=router_logits,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias,
+                    routed_scaling_factor=routed_scaling_factor,
+                    is_hash_routed=tid2eid is not None,
+                )
                 prefill_regime = num_tokens > mgr.offload_threshold
 
             if (

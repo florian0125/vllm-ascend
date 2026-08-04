@@ -569,8 +569,19 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                                               topk_weights, hidden_states=x,
                                               mc2_mask=mc2_mask)
             else:
-                mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
-                                   hidden_states=x)
+                mgr.update_weights(
+                    layer,
+                    topk_ids,
+                    log2phy,
+                    topk_weights,
+                    hidden_states=x,
+                    router_logits=router_logits,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias,
+                    routed_scaling_factor=routed_scaling_factor,
+                    is_hash_routed=tid2eid is not None,
+                )
             # Prefill regime: num_tokens > offload_threshold.
             #  - single-card: pool holds all experts, identity log2phy.
             #  - multi-card:  pool holds this rank's EP shard (loaded by

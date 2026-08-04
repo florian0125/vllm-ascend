@@ -14,6 +14,7 @@ from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
+from vllm_ascend.ops.fused_moe.experts_selector import substitute_experts
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 
@@ -469,6 +470,14 @@ class ExpertOffloadManager:
         self.topk_weights_h = torch.zeros(
             [self.offload_threshold, self.topk],
             dtype=torch.float32, device="cpu", pin_memory=True)
+        self.router_logits_h = None
+        self.e_score_correction_bias_h = None
+        if self.offload_config.expert_substitution_enabled:
+            self.router_logits_h = torch.zeros(
+                [self.offload_threshold, ntotal],
+                dtype=torch.float32, device="cpu", pin_memory=True)
+            self.e_score_correction_bias_h = torch.zeros(
+                ntotal, dtype=torch.float32, device="cpu", pin_memory=True)
         # Per-rank active-token mask (1=real, 0=pad), mirrored to pinned CPU so
         # the multi-card host callback can drop pad rows before counting. Under
         # single-batch TP, ranks past the real-token count route zero-hidden
@@ -1381,7 +1390,13 @@ class ExpertOffloadManager:
     def update_weights(self, layer, topk_ids: torch.Tensor,
                         log2phy: torch.Tensor,
                         topk_weights: torch.Tensor | None = None,
-                        hidden_states: torch.Tensor | None = None) -> int:
+                        hidden_states: torch.Tensor | None = None,
+                        router_logits: torch.Tensor | None = None,
+                        renormalize: bool = False,
+                        scoring_func: str = "softmax",
+                        e_score_correction_bias: torch.Tensor | None = None,
+                        routed_scaling_factor: float = 1.0,
+                        is_hash_routed: bool = False) -> int:
         """Incrementally page in needed experts, overwriting unused slots.
 
         Routes to prefill pool (full-overwrite) when num_tokens exceeds
@@ -1433,11 +1448,39 @@ class ExpertOffloadManager:
             torch_npu.npu.current_stream().wait_event(npu_event)
 
         topk_ids_h = self.topk_ids_h[:num_tokens]
+        do_substitution = (
+            self.offload_config.expert_substitution_enabled
+            and not is_hash_routed
+            and router_logits is not None
+            and topk_weights is not None
+            and router_logits.shape[-1] == self.num_total_experts
+        )
+        if (self.offload_config.expert_substitution_enabled
+                and not is_hash_routed and router_logits is not None
+                and router_logits.shape[-1] != self.num_total_experts):
+            logger.warning_once(
+                "[SUBST] router_logits width %d != num_total_experts %d; "
+                "expert substitution is disabled for this layer",
+                router_logits.shape[-1], self.num_total_experts)
+
         topk_weights_h = None
-        if (self.cache_policy is not None and topk_weights is not None 
-                and self.offload_config.cache_router_weight != 0):
+        if topk_weights is not None and (
+            do_substitution or (
+                self.cache_policy is not None
+                and self.offload_config.cache_router_weight != 0)):
             topk_weights_h = self.topk_weights_h[:num_tokens]
             topk_weights_h.copy_(topk_weights.to(dtype=torch.float32), non_blocking=_EXTRA_CTX.capturing)
+        router_logits_h = None
+        correction_bias_h = None
+        if do_substitution:
+            router_logits_h = self.router_logits_h[:num_tokens]
+            router_logits_h.copy_(router_logits.to(dtype=torch.float32),
+                                  non_blocking=_EXTRA_CTX.capturing)
+            if e_score_correction_bias is not None:
+                correction_bias_h = self.e_score_correction_bias_h
+                correction_bias_h.copy_(
+                    e_score_correction_bias.to(dtype=torch.float32),
+                    non_blocking=_EXTRA_CTX.capturing)
         log2phy_h = self.log2phy_h
         log2phy_np = self.log2phy_np
         topk_ids_h.copy_(topk_ids, non_blocking=_EXTRA_CTX.capturing)
@@ -1456,6 +1499,12 @@ class ExpertOffloadManager:
             layer_idx,
             topk_weights_h,
             self._is_prefetch,
+            do_substitution,
+            router_logits_h,
+            renormalize,
+            scoring_func,
+            correction_bias_h,
+            routed_scaling_factor,
         )
         if _EXTRA_CTX.capturing:
             torch_npu.npu._launch_host_func(
@@ -1466,6 +1515,12 @@ class ExpertOffloadManager:
         else:
             self._update_weights(args)
 
+        if do_substitution:
+            topk_ids[:, :self.topk].copy_(topk_ids_h[:, :self.topk],
+                                          non_blocking=True)
+            topk_weights[:, :self.topk].copy_(
+                topk_weights_h[:, :self.topk].to(topk_weights.dtype),
+                non_blocking=True)
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
 
     def _mc_handle_prefill_regime(self, layer_idx) -> bool:
@@ -1840,14 +1895,34 @@ class ExpertOffloadManager:
             {s: e for s, e in misses}, is_prefetch)
 
     def _update_weights(self, args):
-        (
-            topk_ids_h,
-            log2phy_np,
-            layer,
-            layer_idx,
-            topk_weights_h,
-            is_prefetch,
-        ) = args
+        if len(args) == 6:
+            (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
+             is_prefetch) = args
+            do_substitution = False
+            router_logits_h = None
+            renormalize = False
+            scoring_func = "softmax"
+            correction_bias_h = None
+            routed_scaling_factor = 1.0
+        else:
+            (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
+             is_prefetch, do_substitution, router_logits_h, renormalize,
+             scoring_func, correction_bias_h, routed_scaling_factor) = args
+        if do_substitution:
+            substituted_weights, substituted_ids = substitute_experts(
+                router_logits_h,
+                topk_weights_h[:, :self.topk],
+                topk_ids_h[:, :self.topk],
+                torch.from_numpy(log2phy_np),
+                renormalize=renormalize,
+                expert_substitution_threshold=(
+                    self.offload_config.expert_substitution_threshold),
+                scoring_func=scoring_func,
+                e_score_correction_bias=correction_bias_h,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+            topk_weights_h[:, :self.topk].copy_(substituted_weights)
+            topk_ids_h[:, :self.topk].copy_(substituted_ids)
         with torch_npu.npu.stream(self.load_stream):
             # Hotness observation only on the reactive (non-prefetch) H2D path
             # with LRC policy enabled.

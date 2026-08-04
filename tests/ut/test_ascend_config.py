@@ -514,6 +514,24 @@ class TestAscendConfig(TestBase):
 
 
 class TestExpertOffloadConfig(TestBase):
+    def test_expert_substitution_defaults_and_override(self):
+        default = ExpertOffloadConfig({})
+        enabled = ExpertOffloadConfig({
+            "expert_substitution_enabled": True,
+            "expert_substitution_threshold": 0.1,
+        })
+
+        self.assertFalse(default.expert_substitution_enabled)
+        self.assertEqual(default.expert_substitution_threshold, 0.25)
+        self.assertTrue(enabled.expert_substitution_enabled)
+        self.assertEqual(enabled.expert_substitution_threshold, 0.1)
+
+    def test_expert_substitution_config_validation(self):
+        with self.assertRaisesRegex(TypeError, "must be a boolean"):
+            ExpertOffloadConfig({"expert_substitution_enabled": 1})
+        with self.assertRaisesRegex(ValueError, "must be >= 0"):
+            ExpertOffloadConfig({"expert_substitution_threshold": -0.1})
+
     def test_scalar_and_single_element_capacity_broadcast(self):
         scalar = ExpertOffloadConfig({"num_device_experts": 32})
         single = ExpertOffloadConfig({"num_device_experts": [48]})

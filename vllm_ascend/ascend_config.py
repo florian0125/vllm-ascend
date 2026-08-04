@@ -966,6 +966,8 @@ class ExpertOffloadConfig:
         "enable_multi_card": False,
         "hot_expert_preload": False,
         "hot_experts_file": "",
+        "expert_substitution_enabled": False,
+        "expert_substitution_threshold": 0.25,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -1126,6 +1128,13 @@ class ExpertOffloadConfig:
                 f"got {self.config['expert_prefetch_num']} instead")
         if not isinstance(self.config["enable_multi_card"], bool):
             raise TypeError("enable_multi_card must be a boolean")
+        if not isinstance(self.config["expert_substitution_enabled"], bool):
+            raise TypeError("expert_substitution_enabled must be a boolean")
+        if not isinstance(self.config["expert_substitution_threshold"],
+                          (int, float)):
+            raise TypeError("expert_substitution_threshold must be a number")
+        if self.config["expert_substitution_threshold"] < 0:
+            raise ValueError("expert_substitution_threshold must be >= 0")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

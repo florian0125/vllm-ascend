@@ -131,6 +131,96 @@ def select_experts(
     return topk_weights, topk_ids
 
 
+def substitute_experts(
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    log2phy: torch.Tensor,
+    renormalize: bool = False,
+    expert_substitution_threshold: float = 0.25,
+    scoring_func: str = "softmax",
+    e_score_correction_bias: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Replace low-confidence cache misses with nearby resident experts.
+
+    All inputs are expected to be CPU tensors. Selection confidence follows
+    the router's scoring function and optional correction bias, while the
+    returned routing weight uses the unbiased score (matching grouped-topk
+    routers that use correction bias only for expert selection).
+    """
+    num_tokens, top_k = topk_ids.shape
+    num_experts = router_logits.shape[-1]
+    if num_tokens == 0 or top_k == 0 or top_k >= num_experts:
+        return topk_weights, topk_ids
+
+    if scoring_func == "softmax":
+        routing_scores = router_logits.softmax(dim=-1)
+    elif scoring_func == "sigmoid":
+        routing_scores = router_logits.sigmoid()
+    elif scoring_func == "sqrtsoftplus":
+        routing_scores = F.softplus(router_logits).sqrt()
+    else:
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+    selection_scores = routing_scores
+    if e_score_correction_bias is not None:
+        selection_scores = routing_scores + e_score_correction_bias.unsqueeze(0)
+
+    sorted_scores = selection_scores.sort(dim=-1, descending=True).values
+    boundary = sorted_scores[:, top_k].clamp(min=0)
+    upper = boundary * (1 + expert_substitution_threshold)
+    lower = boundary * (1 - expert_substitution_threshold)
+
+    selected_scores = selection_scores.gather(1, topk_ids.long())
+    low_confidence = selected_scores < upper.unsqueeze(1)
+    in_cache = log2phy[topk_ids.long()] >= 0
+    needs_substitution = low_confidence & ~in_cache
+    if not needs_substitution.any():
+        return topk_weights, topk_ids
+
+    cached_experts = set(torch.where(log2phy >= 0)[0].tolist())
+    out_ids = topk_ids.clone()
+    out_weights = topk_weights.clone()
+
+    for token_idx in range(num_tokens):
+        positions = needs_substitution[token_idx].nonzero(
+            as_tuple=True)[0]
+        if positions.numel() == 0:
+            continue
+        # Replace the weakest selected expert first.
+        positions = sorted(
+            positions.tolist(),
+            key=lambda pos: selected_scores[token_idx, pos].item(),
+        )
+        token_selection_scores = selection_scores[token_idx]
+        in_range = ((token_selection_scores >= lower[token_idx])
+                    & (token_selection_scores < boundary[token_idx]))
+        candidates = (set(torch.where(in_range)[0].tolist())
+                      & cached_experts)
+        candidates.difference_update(out_ids[token_idx].tolist())
+        candidates = sorted(
+            candidates,
+            key=lambda expert_id: token_selection_scores[expert_id].item(),
+            reverse=True,
+        )
+
+        for position in positions:
+            if not candidates:
+                break
+            substitute_id = candidates.pop(0)
+            out_ids[token_idx, position] = substitute_id
+            out_weights[token_idx, position] = (
+                routing_scores[token_idx, substitute_id]
+                * routed_scaling_factor)
+
+    if renormalize:
+        denominator = out_weights.sum(dim=-1, keepdim=True).clamp_min(
+            torch.finfo(out_weights.dtype).eps)
+        out_weights = (out_weights / denominator) * routed_scaling_factor
+    return out_weights, out_ids
+
+
 def check_npu_moe_gating_top_k(
     hidden_states: torch.Tensor,
     top_k: int,
