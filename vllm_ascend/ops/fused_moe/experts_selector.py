@@ -139,14 +139,12 @@ def select_experts(
 
 def substitute_experts(
     router_logits: torch.Tensor,
-    topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     log2phy: torch.Tensor,
-    renormalize: bool = False,
     expert_substitution_threshold: float = 0.25,
     scoring_func: str = "softmax",
     e_score_correction_bias: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     M, K = topk_ids.shape
     
     if scoring_func == "softmax":
@@ -172,14 +170,12 @@ def substitute_experts(
     in_cache = log2phy[topk_ids] >= 0
     needs_sub = low_confidence & ~in_cache
     if not needs_sub.any():
-        return topk_weights, topk_ids
+        return topk_ids
     
     cached_list = torch.where(log2phy >= 0)[0].tolist()
     cached_set: set[int] = set(cached_list)
 
     out_ids: torch.Tensor = topk_ids.clone()
-    out_weights: torch.Tensor = topk_weights.clone()
-
     for t in range(M):
         rows = needs_sub[t].nonzero(as_tuple=True)[0]
         if not rows.numel():
@@ -188,7 +184,7 @@ def substitute_experts(
 
         token_scores = scores[t]
 
-        in_range = (token_scores >= lower[t]) & (token_scores < midscore[t])
+        in_range = (token_scores >= lower[t]) & (token_scores <= midscore[t])
         pool = set(torch.where(in_range)[0].tolist()) & cached_set
         pool.difference_update(out_ids[t].tolist())
 
@@ -199,12 +195,8 @@ def substitute_experts(
                 break
             sub = sorted_pool.pop(0)
             out_ids[t, pos] = sub
-            out_weights[t, pos] = token_scores[sub].item()
-
-    if renormalize:
-        out_weights = out_weights / out_weights.sum(dim=-1, keepdim=True)
         
-    return out_weights, out_ids
+    return out_ids
 
 def check_npu_moe_gating_top_k(
     hidden_states: torch.Tensor,

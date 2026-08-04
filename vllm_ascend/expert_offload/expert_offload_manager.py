@@ -1021,7 +1021,6 @@ class ExpertOffloadManager:
                         router_logits: torch.Tensor | None = None,
                         enable_expert_substitution: bool = False,
                         expert_substitution_threshold: float = 0.25,
-                        renormalize: bool = False,
                         scoring_func: str = "softmax",
                         e_score_correction_bias: torch.Tensor | None = None,) -> int:
         """Incrementally page in needed experts, overwriting unused slots.
@@ -1062,7 +1061,7 @@ class ExpertOffloadManager:
             return 0
 
         # enable expert substitution if current layer is not a hash layer
-        do_expert_sub = enable_expert_substitution and layer_idx > 2
+        do_expert_sub = enable_expert_substitution and layer_idx >= self._num_hash_layers
 
         topk_ids_h = self.topk_ids_h[:num_tokens]        
         topk_weights_h = None
@@ -1104,14 +1103,9 @@ class ExpertOffloadManager:
         gt_topk_ids_h = None
         if do_expert_sub:
             gt_topk_ids_h = topk_ids_h.clone()
-            subbed_weights, subbed_ids = substitute_experts(router_scores_h, topk_weights_h[:, :self.topk],
-                                                            topk_ids_h[:, :self.topk], log2phy_h,
-                                                            renormalize, expert_substitution_threshold,
-                                                            scoring_func, e_score_correction_bias.cpu())
-            topk_weights_h[:, :self.topk] = subbed_weights
+            subbed_ids = substitute_experts(router_scores_h, topk_ids_h[:, :self.topk], log2phy_h,
+                                            expert_substitution_threshold, scoring_func, e_score_correction_bias.cpu())
             topk_ids_h[:, :self.topk] = subbed_ids
-
-            topk_weights[:, :self.topk].copy_(topk_weights_h, non_blocking=True)
             topk_ids[:, :self.topk].copy_(topk_ids_h, non_blocking=True)
 
         current_compute_stream = torch_npu.npu.current_stream()
