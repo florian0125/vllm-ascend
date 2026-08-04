@@ -1894,6 +1894,38 @@ class ExpertOffloadManager:
             self.ep_rank, sorted(resident_map.values()),
             {s: e for s, e in misses}, is_prefetch)
 
+    def _log_expert_substitution(
+        self,
+        layer_idx: int,
+        original_ids: torch.Tensor,
+        substituted_ids: torch.Tensor,
+    ) -> None:
+        """Log CPU-side expert replacements when offload debug is enabled."""
+        if not self._debug:
+            return
+
+        changed = original_ids != substituted_ids
+        changed_positions = changed.nonzero(as_tuple=False)
+        replacements = [
+            {
+                "token": int(token_idx),
+                "position": int(position),
+                "original": int(original_ids[token_idx, position]),
+                "substitute": int(substituted_ids[token_idx, position]),
+            }
+            for token_idx, position in changed_positions.tolist()
+        ]
+        logger.info(
+            "[SUBST] layer=%d replacement_count=%d threshold=%.4f "
+            "replacements=%s original_ids=%s substituted_ids=%s",
+            layer_idx,
+            len(replacements),
+            self.offload_config.expert_substitution_threshold,
+            replacements,
+            original_ids.tolist(),
+            substituted_ids.tolist(),
+        )
+
     def _update_weights(self, args):
         if len(args) == 6:
             (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
@@ -1909,6 +1941,10 @@ class ExpertOffloadManager:
              is_prefetch, do_substitution, router_logits_h, renormalize,
              scoring_func, correction_bias_h, routed_scaling_factor) = args
         if do_substitution:
+            original_ids = (
+                topk_ids_h[:, :self.topk].clone()
+                if self._debug else None
+            )
             substituted_weights, substituted_ids = substitute_experts(
                 router_logits_h,
                 topk_weights_h[:, :self.topk],
@@ -1921,6 +1957,9 @@ class ExpertOffloadManager:
                 e_score_correction_bias=correction_bias_h,
                 routed_scaling_factor=routed_scaling_factor,
             )
+            if original_ids is not None:
+                self._log_expert_substitution(
+                    layer_idx, original_ids, substituted_ids)
             topk_weights_h[:, :self.topk].copy_(substituted_weights)
             topk_ids_h[:, :self.topk].copy_(substituted_ids)
         with torch_npu.npu.stream(self.load_stream):

@@ -98,6 +98,35 @@ def test_kimi_k3_learned_router_prefetch_uses_gate_logits():
     assert torch.allclose(weights, expected_weights)
 
 
+def test_expert_substitution_log_is_controlled_by_debug():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "expert_substitution_enabled": True,
+        "expert_substitution_threshold": 0.25,
+    })
+    original_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    substituted_ids = torch.tensor([[1, 5], [6, 4]], dtype=torch.int32)
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
+    ) as log_info:
+        manager._debug = False
+        manager._log_expert_substitution(
+            7, original_ids, substituted_ids)
+        log_info.assert_not_called()
+
+        manager._debug = True
+        manager._log_expert_substitution(
+            7, original_ids, substituted_ids)
+
+    log_args = log_info.call_args.args
+    assert log_args[1:4] == (7, 2, 0.25)
+    assert log_args[4] == [
+        {"token": 0, "position": 1, "original": 2, "substitute": 5},
+        {"token": 1, "position": 0, "original": 3, "substitute": 6},
+    ]
+
+
 def test_prefetch_dispatch_uses_single_or_per_layer_multi_card_capacity():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager.offload_config = ExpertOffloadConfig(
