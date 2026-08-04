@@ -235,9 +235,16 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             mgr = ExpertOffloadManager.get_instance()
             num_tokens = topk_ids.size(0)
             if getattr(layer, 'enable_multi_card', False):
-                mgr.update_weights_multi_card(layer, topk_ids, log2phy,
-                                              topk_weights, hidden_states=x,
-                                              mc2_mask=mc2_mask)
+                mgr.update_weights_multi_card(
+                    layer, topk_ids, log2phy, topk_weights,
+                    hidden_states=x, mc2_mask=mc2_mask,
+                    router_logits=router_logits,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias,
+                    routed_scaling_factor=routed_scaling_factor,
+                    is_hash_routed=self.tid2eid is not None,
+                )
             else:
                 mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
                                    hidden_states=x)

@@ -177,8 +177,36 @@ def test_multi_card_decode_uses_multi_card_weight_update():
     assert update_call.args[3] is result.topk_weights
     assert update_call.kwargs["hidden_states"] is result.x
     assert update_call.kwargs["mc2_mask"] is mc2_mask
+    assert update_call.kwargs["router_logits"].shape == (2, NUM_EXPERTS)
+    assert update_call.kwargs["renormalize"] is True
+    assert update_call.kwargs["scoring_func"] == "softmax"
+    assert update_call.kwargs["e_score_correction_bias"] is None
+    assert update_call.kwargs["routed_scaling_factor"] == 1.0
+    assert update_call.kwargs["is_hash_routed"] is False
     manager.trigger_next_layer_prefetch.assert_called_once_with(layer, result.x)
     assert result.build_input.call_args.kwargs["log2phy"] is result.log2phy
+
+
+def test_multi_card_hash_routed_layer_disables_substitution():
+    method = _make_method()
+    layer = _make_layer(multi_card=True)
+    manager = _make_manager(layer)
+    comm_method = Mock(token_dispatcher=SimpleNamespace(
+        num_experts_local=4))
+    tid2eid = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+
+    _run_apply(
+        method,
+        layer,
+        manager,
+        comm_method,
+        MoECommType.MC2,
+        num_tokens=2,
+        tid2eid=tid2eid,
+    )
+
+    assert manager.update_weights_multi_card.call_args.kwargs[
+        "is_hash_routed"] is True
 
 
 def test_hash_routed_layer_disables_substitution_without_layer_index_hardcode():

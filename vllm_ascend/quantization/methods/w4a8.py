@@ -565,9 +565,16 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             mgr = ExpertOffloadManager.get_instance()
             is_mc = getattr(layer, 'enable_multi_card', False)
             if is_mc:
-                mgr.update_weights_multi_card(layer, topk_ids, log2phy,
-                                              topk_weights, hidden_states=x,
-                                              mc2_mask=mc2_mask)
+                mgr.update_weights_multi_card(
+                    layer, topk_ids, log2phy, topk_weights,
+                    hidden_states=x, mc2_mask=mc2_mask,
+                    router_logits=router_logits,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias,
+                    routed_scaling_factor=routed_scaling_factor,
+                    is_hash_routed=tid2eid is not None,
+                )
             else:
                 mgr.update_weights(
                     layer,

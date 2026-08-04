@@ -1549,7 +1549,13 @@ class ExpertOffloadManager:
 
     def update_weights_multi_card(self, layer, topk_ids, log2phy,
                                   topk_weights=None, hidden_states=None,
-                                  mc2_mask=None):
+                                  mc2_mask=None,
+                                  router_logits=None,
+                                  renormalize=False,
+                                  scoring_func="softmax",
+                                  e_score_correction_bias=None,
+                                  routed_scaling_factor=1.0,
+                                  is_hash_routed=False):
         """Multi-card EP offload: planner decides global placement; this rank
         H2D-loads only its assigned experts and writes the placement into
         ``log2phy`` (which the MC2 dispatcher then consumes).
@@ -1603,6 +1609,37 @@ class ExpertOffloadManager:
         log2phy_h = self.log2phy_h
         topk_ids_h.copy_(topk_ids, non_blocking=_EXTRA_CTX.capturing)
         log2phy_h.copy_(log2phy, non_blocking=_EXTRA_CTX.capturing)
+        do_substitution = (
+            self.offload_config.expert_substitution_enabled
+            and not is_hash_routed
+            and router_logits is not None
+            and topk_weights is not None
+            and router_logits.shape[-1] == self.num_total_experts
+        )
+        if (self.offload_config.expert_substitution_enabled
+                and not is_hash_routed and router_logits is not None
+                and router_logits.shape[-1] != self.num_total_experts):
+            logger.warning_once(
+                "[SUBST-MC] router_logits width %d != num_total_experts %d; "
+                "expert substitution is disabled for this layer",
+                router_logits.shape[-1], self.num_total_experts)
+        topk_weights_h = None
+        router_logits_h = None
+        correction_bias_h = None
+        if do_substitution:
+            topk_weights_h = self.topk_weights_h[:num_tokens]
+            topk_weights_h.copy_(
+                topk_weights.to(dtype=torch.float32),
+                non_blocking=_EXTRA_CTX.capturing)
+            router_logits_h = self.router_logits_h[:num_tokens]
+            router_logits_h.copy_(
+                router_logits.to(dtype=torch.float32),
+                non_blocking=_EXTRA_CTX.capturing)
+            if e_score_correction_bias is not None:
+                correction_bias_h = self.e_score_correction_bias_h
+                correction_bias_h.copy_(
+                    e_score_correction_bias.to(dtype=torch.float32),
+                    non_blocking=_EXTRA_CTX.capturing)
         # Mirror the per-rank active-token mask to pinned CPU on the same
         # stream as topk_ids_h, so the host callback (graph replay) reads it
         # after the copy lands — same ordering contract as topk_ids_h. None
@@ -1624,13 +1661,23 @@ class ExpertOffloadManager:
         if current_compute_stream not in subscribed:
             torch_npu.npu._subscribe_report(current_compute_stream)
             subscribed.add(current_compute_stream)
-        args = (topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots, False,
-                mc2_mask_h)
+        args = (
+            topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots, False,
+            mc2_mask_h, do_substitution, topk_weights_h, router_logits_h,
+            renormalize, scoring_func, correction_bias_h,
+            routed_scaling_factor,
+        )
         if _EXTRA_CTX.capturing:
             torch_npu.npu._launch_host_func(
                 current_compute_stream, self._update_weights_multi_card, args)
         else:
             self._update_weights_multi_card(args)
+        if do_substitution:
+            topk_ids[:, :self.topk].copy_(
+                topk_ids_h[:, :self.topk], non_blocking=True)
+            topk_weights[:, :self.topk].copy_(
+                topk_weights_h[:, :self.topk].to(topk_weights.dtype),
+                non_blocking=True)
         # Copy the (host-func-mutated) log2phy_h back to the NPU tensor so the
         # MC2 dispatcher reads the fresh placement.
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
@@ -1683,6 +1730,55 @@ class ExpertOffloadManager:
                 dev_tensor.data[slot].copy_(
                     src.reshape(dev_tensor.data[slot].shape), non_blocking=True)
 
+    def _apply_multi_card_substitution(
+        self,
+        layer_idx,
+        topk_ids_h,
+        topk_weights_h,
+        router_logits_h,
+        log2phy_h,
+        mc2_mask_h,
+        renormalize,
+        scoring_func,
+        correction_bias_h,
+        routed_scaling_factor,
+    ):
+        """Substitute active local rows using the previous global placement."""
+        if mc2_mask_h is None:
+            active_rows = torch.arange(topk_ids_h.shape[0])
+        else:
+            active_rows = mc2_mask_h.bool().nonzero(
+                as_tuple=True)[0]
+        if active_rows.numel() == 0:
+            return
+
+        original_ids = topk_ids_h.index_select(
+            0, active_rows)[:, :self.topk]
+        active_weights = topk_weights_h.index_select(
+            0, active_rows)[:, :self.topk]
+        active_logits = router_logits_h.index_select(0, active_rows)
+        substituted_weights, substituted_ids = substitute_experts(
+            active_logits,
+            active_weights,
+            original_ids,
+            log2phy_h,
+            renormalize=renormalize,
+            expert_substitution_threshold=(
+                self.offload_config.expert_substitution_threshold),
+            scoring_func=scoring_func,
+            e_score_correction_bias=correction_bias_h,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+        if self._debug:
+            self._log_expert_substitution(
+                layer_idx, original_ids, substituted_ids)
+        updated_ids = topk_ids_h.index_select(0, active_rows)
+        updated_weights = topk_weights_h.index_select(0, active_rows)
+        updated_ids[:, :self.topk].copy_(substituted_ids)
+        updated_weights[:, :self.topk].copy_(substituted_weights)
+        topk_ids_h.index_copy_(0, active_rows, updated_ids)
+        topk_weights_h.index_copy_(0, active_rows, updated_weights)
+
     def _update_weights_multi_card(self, args):
         """Host callback (graph replay) / inline (eager) for multi-card DECODE
         placement + H2D. Reads the pinned CPU topk_ids_h, does CPU bincount +
@@ -1691,11 +1787,27 @@ class ExpertOffloadManager:
         the compute stream), and writes placement.log2phy into the pinned
         log2phy_h (the wrapper H2D-copies it back to the NPU tensor).
         """
-        (topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots, is_prefetch,
-         mc2_mask_h) = args
+        if len(args) == 7:
+            (topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots,
+             is_prefetch, mc2_mask_h) = args
+            do_substitution = False
+        else:
+            (topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots,
+             is_prefetch, mc2_mask_h, do_substitution, topk_weights_h,
+             router_logits_h, renormalize, scoring_func, correction_bias_h,
+             routed_scaling_factor) = args
         from vllm_ascend.expert_offload.multi_card_planner import plan_placement
         from vllm.distributed.parallel_state import get_ep_group
         cpu_group = get_ep_group().cpu_group if self.ep_size > 1 else None
+
+        # Substitute against the previous FULL global placement before global
+        # counting. Each rank changes only its active local rows; the following
+        # all-reduce makes the substituted route counts globally consistent.
+        if do_substitution:
+            self._apply_multi_card_substitution(
+                layer_idx, topk_ids_h, topk_weights_h, router_logits_h,
+                log2phy_h, mc2_mask_h, renormalize, scoring_func,
+                correction_bias_h, routed_scaling_factor)
 
         # Drop pad-token rows (mc2_mask==0) BEFORE any counting / placing / LRU.
         # Under single-batch TP the ranks past the real-token count hold PAD
