@@ -136,7 +136,6 @@ def select_experts(
 class ExpertSubstitutionPlan:
     """A per-source-expert, all-or-nothing substitution plan."""
 
-    routing_scores: torch.Tensor
     replacements: dict[int, list[tuple[int, int, int]]]
     referenced: torch.Tensor
     blocked: torch.Tensor
@@ -175,8 +174,7 @@ def plan_expert_substitutions(
     routing_scores = _expert_routing_scores(router_logits, scoring_func)
     referenced = torch.zeros(num_experts, dtype=torch.bool)
     blocked = torch.zeros(num_experts, dtype=torch.bool)
-    empty_plan = ExpertSubstitutionPlan(
-        routing_scores, {}, referenced, blocked)
+    empty_plan = ExpertSubstitutionPlan({}, referenced, blocked)
     if num_tokens == 0 or top_k == 0 or top_k >= num_experts:
         return empty_plan
 
@@ -228,7 +226,7 @@ def plan_expert_substitutions(
         for token_idx, position in source_references:
             token_scores = selection_scores[token_idx]
             in_range = ((token_scores >= lower[token_idx])
-                        & (token_scores < boundary[token_idx]))
+                        & (token_scores <= boundary[token_idx]))
             candidates = (set(torch.where(in_range)[0].tolist())
                           & cached_experts)
             candidates.difference_update(
@@ -248,55 +246,33 @@ def plan_expert_substitutions(
             planned_ids = tentative_ids
             replacements[source_id] = tentative
 
-    return ExpertSubstitutionPlan(
-        routing_scores, replacements, referenced, blocked)
+    return ExpertSubstitutionPlan(replacements, referenced, blocked)
 
 
 def commit_expert_substitutions(
     plan: ExpertSubstitutionPlan,
     allowed_experts: torch.Tensor,
-    topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    renormalize: bool = False,
-    routed_scaling_factor: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Atomically apply the source-expert groups allowed by the caller."""
+) -> torch.Tensor:
+    """Atomically apply allowed groups without changing routing weights."""
     out_ids = topk_ids.clone()
-    out_weights = topk_weights.clone()
-    changed_rows: set[int] = set()
     for source_id in sorted(plan.replacements):
         if not bool(allowed_experts[source_id]):
             continue
         for token_idx, position, substitute_id in plan.replacements[source_id]:
             out_ids[token_idx, position] = substitute_id
-            out_weights[token_idx, position] = (
-                plan.routing_scores[token_idx, substitute_id]
-                * routed_scaling_factor)
-            changed_rows.add(token_idx)
-
-    if renormalize and changed_rows:
-        rows = torch.tensor(sorted(changed_rows), dtype=torch.long)
-        changed_weights = out_weights.index_select(0, rows)
-        denominator = changed_weights.sum(dim=-1, keepdim=True).clamp_min(
-            torch.finfo(out_weights.dtype).eps)
-        changed_weights = (
-            changed_weights / denominator) * routed_scaling_factor
-        out_weights.index_copy_(0, rows, changed_weights)
-    return out_weights, out_ids
+    return out_ids
 
 
 def substitute_experts(
     router_logits: torch.Tensor,
-    topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     log2phy: torch.Tensor,
-    renormalize: bool = False,
     expert_substitution_threshold: float = 0.25,
     scoring_func: str = "softmax",
     e_score_correction_bias: torch.Tensor | None = None,
-    routed_scaling_factor: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Replace a missing expert only when all of its references can move."""
+) -> torch.Tensor:
+    """Replace IDs atomically while preserving the router's original weights."""
     plan = plan_expert_substitutions(
         router_logits,
         topk_ids,
@@ -309,10 +285,7 @@ def substitute_experts(
     return commit_expert_substitutions(
         plan,
         allowed,
-        topk_weights,
         topk_ids,
-        renormalize=renormalize,
-        routed_scaling_factor=routed_scaling_factor,
     )
 
 

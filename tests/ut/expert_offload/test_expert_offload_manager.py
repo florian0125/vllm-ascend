@@ -140,7 +140,6 @@ def test_multi_card_substitution_updates_only_active_rows():
         [0.40, 0.25, 0.20, 0.15],
     ]))
     topk_ids_h = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
-    topk_weights_h = torch.tensor([[0.40, 0.25], [0.40, 0.25]])
     # The full global placement says experts 0 and 3 are resident across EP.
     log2phy_h = torch.tensor([0, -1, -1, 3], dtype=torch.int32)
     mc2_mask_h = torch.tensor([1, 0], dtype=torch.int32)
@@ -148,21 +147,14 @@ def test_multi_card_substitution_updates_only_active_rows():
     manager._apply_multi_card_substitution(
         5,
         topk_ids_h,
-        topk_weights_h,
         router_logits_h,
         log2phy_h,
         mc2_mask_h,
-        False,
         "softmax",
         None,
-        1.0,
     )
 
     assert topk_ids_h.tolist() == [[0, 3], [0, 1]]
-    torch.testing.assert_close(
-        topk_weights_h,
-        torch.tensor([[0.40, 0.15], [0.40, 0.25]]),
-    )
 
 
 def test_multi_card_substitution_honors_remote_blocker():
@@ -176,7 +168,6 @@ def test_multi_card_substitution_honors_remote_blocker():
     router_logits_h = torch.log(
         torch.tensor([[0.40, 0.25, 0.20, 0.15]]))
     topk_ids_h = torch.tensor([[0, 1]], dtype=torch.int32)
-    topk_weights_h = torch.tensor([[0.40, 0.25]])
     log2phy_h = torch.tensor([0, -1, -1, 3], dtype=torch.int32)
 
     def block_expert_one(referenced, blocked, cpu_group):
@@ -193,20 +184,15 @@ def test_multi_card_substitution_honors_remote_blocker():
         manager._apply_multi_card_substitution(
             5,
             topk_ids_h,
-            topk_weights_h,
             router_logits_h,
             log2phy_h,
             None,
-            False,
             "softmax",
             None,
-            1.0,
             object(),
         )
 
     assert topk_ids_h.tolist() == [[0, 1]]
-    torch.testing.assert_close(
-        topk_weights_h, torch.tensor([[0.40, 0.25]]))
 
 
 def test_multi_card_substitution_all_pad_still_joins_global_state():
@@ -218,7 +204,6 @@ def test_multi_card_substitution_all_pad_still_joins_global_state():
     manager.topk = 2
     manager._debug = False
     topk_ids_h = torch.tensor([[0, 1]], dtype=torch.int32)
-    topk_weights_h = torch.tensor([[0.40, 0.25]])
     gather = MagicMock(side_effect=lambda referenced, blocked, cpu_group:
                        (referenced, blocked))
 
@@ -230,19 +215,56 @@ def test_multi_card_substitution_all_pad_still_joins_global_state():
         manager._apply_multi_card_substitution(
             5,
             topk_ids_h,
-            topk_weights_h,
             torch.log(torch.tensor([[0.40, 0.25, 0.20, 0.15]])),
             torch.tensor([0, -1, -1, 3], dtype=torch.int32),
             torch.tensor([0], dtype=torch.int32),
-            False,
             "softmax",
             None,
-            1.0,
             object(),
         )
 
     gather.assert_called_once()
     assert topk_ids_h.tolist() == [[0, 1]]
+
+
+def test_single_card_substitution_changes_ids_but_preserves_weights():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "expert_substitution_enabled": True,
+        "expert_substitution_threshold": 0.30,
+    })
+    manager.topk = 2
+    manager._debug = False
+    manager.cache_policy = None
+    manager.load_stream = MagicMock()
+    topk_ids_h = torch.tensor([[0, 1]], dtype=torch.int32)
+    topk_weights_h = torch.tensor([[0.40, 0.25]])
+    original_weights = topk_weights_h.clone()
+    log2phy_h = torch.tensor([0, -1, -1, 1], dtype=torch.int32)
+    log2phy_np = log2phy_h.numpy()
+    layer = SimpleNamespace(w13_weight=torch.zeros(2, 1))
+
+    args = (
+        topk_ids_h,
+        log2phy_np,
+        layer,
+        0,
+        topk_weights_h,
+        False,
+        True,
+        torch.log(torch.tensor([[0.40, 0.25, 0.20, 0.15]])),
+        "softmax",
+        None,
+    )
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
+        return_value=nullcontext(),
+        create=True,
+    ):
+        manager._update_weights(args)
+
+    assert topk_ids_h.tolist() == [[0, 3]]
+    assert torch.equal(topk_weights_h, original_weights)
 
 
 def test_prefetch_dispatch_uses_single_or_per_layer_multi_card_capacity():

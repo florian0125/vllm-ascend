@@ -474,18 +474,6 @@ class ExpertOffloadManager:
         self.topk_weights_h = torch.zeros(
             [self.offload_threshold, self.topk],
             dtype=torch.float32, device="cpu", pin_memory=True)
-        # NPU staging buffer for graph-safe writeback of substituted
-        # topk_weights. The old writeback did
-        # topk_weights_h[...].to(topk_weights.dtype) (a CPU cast) which built a
-        # pageable tensor that EE1016 rejects under graph capture. Instead copy
-        # pinned f32 -> this NPU f32 buffer (same-dtype async copy that records
-        # into the graph), then copy_ casts to topk_weights.dtype on device.
-        # dtype stays f32 (matching topk_weights_h), so no model-specific dtype
-        # inference is needed.
-        _tw_dev = _expert_weight(self.moe_layers[0], "w13_weight").device
-        self.topk_weights_dev = torch.zeros(
-            [self.offload_threshold, self.topk],
-            dtype=torch.float32, device=_tw_dev)
         self.router_logits_h = None
         self.e_score_correction_bias_h = None
         if self.offload_config.expert_substitution_enabled:
@@ -1468,7 +1456,6 @@ class ExpertOffloadManager:
             self.offload_config.expert_substitution_enabled
             and not is_hash_routed
             and router_logits is not None
-            and topk_weights is not None
             and router_logits.shape[-1] == self.num_total_experts
         )
         if (self.offload_config.expert_substitution_enabled
@@ -1480,10 +1467,8 @@ class ExpertOffloadManager:
                 router_logits.shape[-1], self.num_total_experts)
 
         topk_weights_h = None
-        if topk_weights is not None and (
-            do_substitution or (
-                self.cache_policy is not None
-                and self.offload_config.cache_router_weight != 0)):
+        if (topk_weights is not None and self.cache_policy is not None
+                and self.offload_config.cache_router_weight != 0):
             topk_weights_h = self.topk_weights_h[:num_tokens]
             topk_weights_h.copy_(topk_weights.to(dtype=torch.float32), non_blocking=_EXTRA_CTX.capturing)
         router_logits_h = None
@@ -1517,10 +1502,8 @@ class ExpertOffloadManager:
             self._is_prefetch,
             do_substitution,
             router_logits_h,
-            renormalize,
             scoring_func,
             correction_bias_h,
-            routed_scaling_factor,
         )
         if _EXTRA_CTX.capturing:
             torch_npu.npu._launch_host_func(
@@ -1534,14 +1517,6 @@ class ExpertOffloadManager:
         if do_substitution:
             topk_ids[:, :self.topk].copy_(topk_ids_h[:, :self.topk],
                                           non_blocking=True)
-            # pinned f32 -> NPU f32 (graph-safe) -> device cast. Avoids
-            # topk_weights_h.to(dtype) which built a pageable CPU tensor and
-            # tripped EE1016 (pageable copy under graph capture).
-            topk_w_dev = self.topk_weights_dev[:num_tokens]
-            topk_w_dev[:, :self.topk].copy_(
-                topk_weights_h[:, :self.topk], non_blocking=True)
-            topk_weights[:, :self.topk].copy_(
-                topk_w_dev[:, :self.topk], non_blocking=True)
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
 
     def _mc_handle_prefill_regime(self, layer_idx) -> bool:
@@ -1634,7 +1609,6 @@ class ExpertOffloadManager:
             self.offload_config.expert_substitution_enabled
             and not is_hash_routed
             and router_logits is not None
-            and topk_weights is not None
             and router_logits.shape[-1] == self.num_total_experts
         )
         if (self.offload_config.expert_substitution_enabled
@@ -1644,14 +1618,9 @@ class ExpertOffloadManager:
                 "[SUBST-MC] router_logits width %d != num_total_experts %d; "
                 "expert substitution is disabled for this layer",
                 router_logits.shape[-1], self.num_total_experts)
-        topk_weights_h = None
         router_logits_h = None
         correction_bias_h = None
         if do_substitution:
-            topk_weights_h = self.topk_weights_h[:num_tokens]
-            topk_weights_h.copy_(
-                topk_weights.to(dtype=torch.float32),
-                non_blocking=_EXTRA_CTX.capturing)
             router_logits_h = self.router_logits_h[:num_tokens]
             router_logits_h.copy_(
                 router_logits.to(dtype=torch.float32),
@@ -1684,9 +1653,8 @@ class ExpertOffloadManager:
             subscribed.add(current_compute_stream)
         args = (
             topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots, False,
-            mc2_mask_h, do_substitution, topk_weights_h, router_logits_h,
-            renormalize, scoring_func, correction_bias_h,
-            routed_scaling_factor,
+            mc2_mask_h, do_substitution, router_logits_h, scoring_func,
+            correction_bias_h,
         )
         if _EXTRA_CTX.capturing:
             torch_npu.npu._launch_host_func(
@@ -1696,14 +1664,6 @@ class ExpertOffloadManager:
         if do_substitution:
             topk_ids[:, :self.topk].copy_(
                 topk_ids_h[:, :self.topk], non_blocking=True)
-            # pinned f32 -> NPU f32 (graph-safe) -> device cast. Avoids
-            # topk_weights_h.to(dtype) which built a pageable CPU tensor and
-            # tripped EE1016 (pageable copy under graph capture).
-            topk_w_dev = self.topk_weights_dev[:num_tokens]
-            topk_w_dev[:, :self.topk].copy_(
-                topk_weights_h[:, :self.topk], non_blocking=True)
-            topk_weights[:, :self.topk].copy_(
-                topk_w_dev[:, :self.topk], non_blocking=True)
         # Copy the (host-func-mutated) log2phy_h back to the NPU tensor so the
         # MC2 dispatcher reads the fresh placement.
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
@@ -1760,14 +1720,11 @@ class ExpertOffloadManager:
         self,
         layer_idx,
         topk_ids_h,
-        topk_weights_h,
         router_logits_h,
         log2phy_h,
         mc2_mask_h,
-        renormalize,
         scoring_func,
         correction_bias_h,
-        routed_scaling_factor,
         cpu_group=None,
     ):
         """Atomically substitute source experts across all active EP rows."""
@@ -1778,8 +1735,6 @@ class ExpertOffloadManager:
                 as_tuple=True)[0]
 
         original_ids = topk_ids_h.index_select(
-            0, active_rows)[:, :self.topk]
-        active_weights = topk_weights_h.index_select(
             0, active_rows)[:, :self.topk]
         active_logits = router_logits_h.index_select(0, active_rows)
         plan = plan_expert_substitutions(
@@ -1799,23 +1754,17 @@ class ExpertOffloadManager:
             gather_global_substitution_state_cpu(
                 plan.referenced, plan.blocked, cpu_group)
         allowed = global_referenced & ~global_blocked
-        substituted_weights, substituted_ids = commit_expert_substitutions(
+        substituted_ids = commit_expert_substitutions(
             plan,
             allowed,
-            active_weights,
             original_ids,
-            renormalize=renormalize,
-            routed_scaling_factor=routed_scaling_factor,
         )
         if self._debug:
             self._log_expert_substitution(
                 layer_idx, original_ids, substituted_ids)
         updated_ids = topk_ids_h.index_select(0, active_rows)
-        updated_weights = topk_weights_h.index_select(0, active_rows)
         updated_ids[:, :self.topk].copy_(substituted_ids)
-        updated_weights[:, :self.topk].copy_(substituted_weights)
         topk_ids_h.index_copy_(0, active_rows, updated_ids)
-        topk_weights_h.index_copy_(0, active_rows, updated_weights)
 
     def _update_weights_multi_card(self, args):
         """Host callback (graph replay) / inline (eager) for multi-card DECODE
@@ -1831,9 +1780,8 @@ class ExpertOffloadManager:
             do_substitution = False
         else:
             (topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots,
-             is_prefetch, mc2_mask_h, do_substitution, topk_weights_h,
-             router_logits_h, renormalize, scoring_func, correction_bias_h,
-             routed_scaling_factor) = args
+             is_prefetch, mc2_mask_h, do_substitution, router_logits_h,
+             scoring_func, correction_bias_h) = args
         from vllm.distributed.parallel_state import get_ep_group
 
         from vllm_ascend.expert_offload.multi_card_planner import plan_placement
@@ -1845,9 +1793,8 @@ class ExpertOffloadManager:
         # all-reduce makes the substituted route counts globally consistent.
         if do_substitution:
             self._apply_multi_card_substitution(
-                layer_idx, topk_ids_h, topk_weights_h, router_logits_h,
-                log2phy_h, mc2_mask_h, renormalize, scoring_func,
-                correction_bias_h, routed_scaling_factor, cpu_group)
+                layer_idx, topk_ids_h, router_logits_h, log2phy_h,
+                mc2_mask_h, scoring_func, correction_bias_h, cpu_group)
 
         # Drop pad-token rows (mc2_mask==0) BEFORE any counting / placing / LRU.
         # Under single-batch TP the ranks past the real-token count hold PAD
@@ -2084,35 +2031,29 @@ class ExpertOffloadManager:
              is_prefetch) = args
             do_substitution = False
             router_logits_h = None
-            renormalize = False
             scoring_func = "softmax"
             correction_bias_h = None
-            routed_scaling_factor = 1.0
         else:
             (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
-             is_prefetch, do_substitution, router_logits_h, renormalize,
-             scoring_func, correction_bias_h, routed_scaling_factor) = args
+             is_prefetch, do_substitution, router_logits_h, scoring_func,
+             correction_bias_h) = args
         if do_substitution:
             original_ids = (
                 topk_ids_h[:, :self.topk].clone()
                 if self._debug else None
             )
-            substituted_weights, substituted_ids = substitute_experts(
+            substituted_ids = substitute_experts(
                 router_logits_h,
-                topk_weights_h[:, :self.topk],
                 topk_ids_h[:, :self.topk],
                 torch.from_numpy(log2phy_np),
-                renormalize=renormalize,
                 expert_substitution_threshold=(
                     self.offload_config.expert_substitution_threshold),
                 scoring_func=scoring_func,
                 e_score_correction_bias=correction_bias_h,
-                routed_scaling_factor=routed_scaling_factor,
             )
             if original_ids is not None:
                 self._log_expert_substitution(
                     layer_idx, original_ids, substituted_ids)
-            topk_weights_h[:, :self.topk].copy_(substituted_weights)
             topk_ids_h[:, :self.topk].copy_(substituted_ids)
         with torch_npu.npu.stream(self.load_stream):
             # Hotness observation only on the reactive (non-prefetch) H2D path
