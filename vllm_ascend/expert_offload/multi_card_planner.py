@@ -405,6 +405,25 @@ def gather_global_counts_cpu(
     return global_counts
 
 
+def gather_global_substitution_state_cpu(
+    local_referenced: torch.Tensor,
+    local_blocked: torch.Tensor,
+    cpu_group=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge per-expert substitution eligibility across the EP group.
+
+    Both tensors are CPU boolean vectors. MAX is a logical OR here: an expert
+    may be substituted only when it is referenced somewhere and blocked
+    nowhere. ``cpu_group=None`` keeps the single-process unit-test path cheap.
+    """
+    state = torch.stack((local_referenced, local_blocked)).to(torch.int32)
+    if cpu_group is not None:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.all_reduce(state, op=dist.ReduceOp.MAX, group=cpu_group)
+    return state[0].bool(), state[1].bool()
+
+
 def plan_for_layer(
     topk_ids: torch.Tensor,
     global_num_experts: int,

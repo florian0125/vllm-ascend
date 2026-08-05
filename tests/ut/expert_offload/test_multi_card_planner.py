@@ -4,6 +4,7 @@ Run: cd vllm-ascend && python3 tests/ut/expert_offload/test_multi_card_planner.p
 """
 import os
 import sys
+from unittest.mock import patch
 
 # Import the planner as a standalone module (it only depends on torch + dataclass)
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -273,6 +274,36 @@ def test_gather_global_counts_cpu_nogroup():
     out = mcp.gather_global_counts_cpu(counts, cpu_group=None)
     _check(torch.equal(out, counts), "no group -> unchanged")
     _check(out is not counts or torch.equal(out, counts), "value-equal")
+
+
+def test_gather_global_substitution_state_cpu_nogroup():
+    """Single-process state aggregation preserves local eligibility."""
+    referenced = torch.tensor([False, True, True])
+    blocked = torch.tensor([False, False, True])
+    out_referenced, out_blocked = \
+        mcp.gather_global_substitution_state_cpu(referenced, blocked)
+    _check(torch.equal(out_referenced, referenced), "referenced unchanged")
+    _check(torch.equal(out_blocked, blocked), "blocked unchanged")
+
+
+def test_gather_global_substitution_state_cpu_merges_remote_blocker():
+    """A high-confidence reference on any rank blocks the expert globally."""
+    referenced = torch.tensor([False, True, False])
+    blocked = torch.tensor([False, False, False])
+
+    def fake_all_reduce(state, op, group):
+        del op, group
+        state[0, 1] = 1
+        state[1, 1] = 1
+
+    with patch("torch.distributed.is_initialized", return_value=True), \
+            patch("torch.distributed.all_reduce", side_effect=fake_all_reduce):
+        out_referenced, out_blocked = \
+            mcp.gather_global_substitution_state_cpu(
+                referenced, blocked, cpu_group=object())
+
+    _check(bool(out_referenced[1]), "expert referenced globally")
+    _check(bool(out_blocked[1]), "remote blocker propagated")
 
 
 def test_cpu_path_matches_npu_path_placement():

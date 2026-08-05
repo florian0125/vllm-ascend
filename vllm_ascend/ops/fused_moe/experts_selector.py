@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -131,37 +132,53 @@ def select_experts(
     return topk_weights, topk_ids
 
 
-def substitute_experts(
+@dataclass
+class ExpertSubstitutionPlan:
+    """A per-source-expert, all-or-nothing substitution plan."""
+
+    routing_scores: torch.Tensor
+    replacements: dict[int, list[tuple[int, int, int]]]
+    referenced: torch.Tensor
+    blocked: torch.Tensor
+
+
+def _expert_routing_scores(
     router_logits: torch.Tensor,
-    topk_weights: torch.Tensor,
+    scoring_func: str,
+) -> torch.Tensor:
+    if scoring_func == "softmax":
+        return router_logits.softmax(dim=-1)
+    if scoring_func == "sigmoid":
+        return router_logits.sigmoid()
+    if scoring_func == "sqrtsoftplus":
+        return F.softplus(router_logits).sqrt()
+    raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+
+def plan_expert_substitutions(
+    router_logits: torch.Tensor,
     topk_ids: torch.Tensor,
     log2phy: torch.Tensor,
-    renormalize: bool = False,
     expert_substitution_threshold: float = 0.25,
     scoring_func: str = "softmax",
     e_score_correction_bias: torch.Tensor | None = None,
-    routed_scaling_factor: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Replace low-confidence cache misses with nearby resident experts.
+) -> ExpertSubstitutionPlan:
+    """Plan atomic substitutions grouped by each non-resident source expert.
 
     All inputs are expected to be CPU tensors. Selection confidence follows
-    the router's scoring function and optional correction bias, while the
-    returned routing weight uses the unbiased score (matching grouped-topk
-    routers that use correction bias only for expert selection).
+    the router's scoring function and optional correction bias. A source
+    expert is blocked when any of its token references is high-confidence or
+    cannot be assigned a distinct resident candidate. No route is mutated here.
     """
     num_tokens, top_k = topk_ids.shape
     num_experts = router_logits.shape[-1]
+    routing_scores = _expert_routing_scores(router_logits, scoring_func)
+    referenced = torch.zeros(num_experts, dtype=torch.bool)
+    blocked = torch.zeros(num_experts, dtype=torch.bool)
+    empty_plan = ExpertSubstitutionPlan(
+        routing_scores, {}, referenced, blocked)
     if num_tokens == 0 or top_k == 0 or top_k >= num_experts:
-        return topk_weights, topk_ids
-
-    if scoring_func == "softmax":
-        routing_scores = router_logits.softmax(dim=-1)
-    elif scoring_func == "sigmoid":
-        routing_scores = router_logits.sigmoid()
-    elif scoring_func == "sqrtsoftplus":
-        routing_scores = F.softplus(router_logits).sqrt()
-    else:
-        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+        return empty_plan
 
     selection_scores = routing_scores
     if e_score_correction_bias is not None:
@@ -175,50 +192,128 @@ def substitute_experts(
     selected_scores = selection_scores.gather(1, topk_ids.long())
     low_confidence = selected_scores < upper.unsqueeze(1)
     in_cache = log2phy[topk_ids.long()] >= 0
-    needs_substitution = low_confidence & ~in_cache
-    if not needs_substitution.any():
-        return topk_weights, topk_ids
-
     cached_experts = set(torch.where(log2phy >= 0)[0].tolist())
+    references: dict[int, list[tuple[int, int]]] = {}
+    for token_idx, position in (~in_cache).nonzero(as_tuple=False).tolist():
+        source_id = int(topk_ids[token_idx, position])
+        referenced[source_id] = True
+        references.setdefault(source_id, []).append((token_idx, position))
+
+    # Build plans deterministically. Earlier committed plans reserve their
+    # candidate IDs within a token; a failed source group changes nothing.
+    planned_ids = topk_ids.clone()
+    replacements: dict[int, list[tuple[int, int, int]]] = {}
+    source_order = sorted(
+        references,
+        key=lambda source_id: (
+            max(selected_scores[token_idx, position].item()
+                for token_idx, position in references[source_id]),
+            -len(references[source_id]),
+            source_id,
+        ),
+    )
+    for source_id in source_order:
+        source_references = sorted(
+            references[source_id],
+            key=lambda item: (
+                selected_scores[item[0], item[1]].item(), item[0], item[1]),
+        )
+        if any(not bool(low_confidence[token_idx, position])
+               for token_idx, position in source_references):
+            blocked[source_id] = True
+            continue
+
+        tentative: list[tuple[int, int, int]] = []
+        tentative_ids = planned_ids.clone()
+        for token_idx, position in source_references:
+            token_scores = selection_scores[token_idx]
+            in_range = ((token_scores >= lower[token_idx])
+                        & (token_scores < boundary[token_idx]))
+            candidates = (set(torch.where(in_range)[0].tolist())
+                          & cached_experts)
+            candidates.difference_update(
+                tentative_ids[token_idx].tolist())
+            if not candidates:
+                blocked[source_id] = True
+                break
+            substitute_id = max(
+                candidates,
+                key=lambda expert_id: (
+                    token_scores[expert_id].item(), -expert_id),
+            )
+            tentative_ids[token_idx, position] = substitute_id
+            tentative.append((token_idx, position, substitute_id))
+
+        if not bool(blocked[source_id]):
+            planned_ids = tentative_ids
+            replacements[source_id] = tentative
+
+    return ExpertSubstitutionPlan(
+        routing_scores, replacements, referenced, blocked)
+
+
+def commit_expert_substitutions(
+    plan: ExpertSubstitutionPlan,
+    allowed_experts: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    renormalize: bool = False,
+    routed_scaling_factor: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Atomically apply the source-expert groups allowed by the caller."""
     out_ids = topk_ids.clone()
     out_weights = topk_weights.clone()
-
-    for token_idx in range(num_tokens):
-        positions = needs_substitution[token_idx].nonzero(
-            as_tuple=True)[0]
-        if positions.numel() == 0:
+    changed_rows: set[int] = set()
+    for source_id in sorted(plan.replacements):
+        if not bool(allowed_experts[source_id]):
             continue
-        # Replace the weakest selected expert first.
-        positions = sorted(
-            positions.tolist(),
-            key=lambda pos: selected_scores[token_idx, pos].item(),
-        )
-        token_selection_scores = selection_scores[token_idx]
-        in_range = ((token_selection_scores >= lower[token_idx])
-                    & (token_selection_scores < boundary[token_idx]))
-        candidates = (set(torch.where(in_range)[0].tolist())
-                      & cached_experts)
-        candidates.difference_update(out_ids[token_idx].tolist())
-        candidates = sorted(
-            candidates,
-            key=lambda expert_id: token_selection_scores[expert_id].item(),
-            reverse=True,
-        )
-
-        for position in positions:
-            if not candidates:
-                break
-            substitute_id = candidates.pop(0)
+        for token_idx, position, substitute_id in plan.replacements[source_id]:
             out_ids[token_idx, position] = substitute_id
             out_weights[token_idx, position] = (
-                routing_scores[token_idx, substitute_id]
+                plan.routing_scores[token_idx, substitute_id]
                 * routed_scaling_factor)
+            changed_rows.add(token_idx)
 
-    if renormalize:
-        denominator = out_weights.sum(dim=-1, keepdim=True).clamp_min(
+    if renormalize and changed_rows:
+        rows = torch.tensor(sorted(changed_rows), dtype=torch.long)
+        changed_weights = out_weights.index_select(0, rows)
+        denominator = changed_weights.sum(dim=-1, keepdim=True).clamp_min(
             torch.finfo(out_weights.dtype).eps)
-        out_weights = (out_weights / denominator) * routed_scaling_factor
+        changed_weights = (
+            changed_weights / denominator) * routed_scaling_factor
+        out_weights.index_copy_(0, rows, changed_weights)
     return out_weights, out_ids
+
+
+def substitute_experts(
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    log2phy: torch.Tensor,
+    renormalize: bool = False,
+    expert_substitution_threshold: float = 0.25,
+    scoring_func: str = "softmax",
+    e_score_correction_bias: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Replace a missing expert only when all of its references can move."""
+    plan = plan_expert_substitutions(
+        router_logits,
+        topk_ids,
+        log2phy,
+        expert_substitution_threshold=expert_substitution_threshold,
+        scoring_func=scoring_func,
+        e_score_correction_bias=e_score_correction_bias,
+    )
+    allowed = plan.referenced & ~plan.blocked
+    return commit_expert_substitutions(
+        plan,
+        allowed,
+        topk_weights,
+        topk_ids,
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
+    )
 
 
 def check_npu_moe_gating_top_k(

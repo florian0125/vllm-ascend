@@ -14,7 +14,11 @@ from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
-from vllm_ascend.ops.fused_moe.experts_selector import substitute_experts
+from vllm_ascend.ops.fused_moe.experts_selector import (
+    commit_expert_substitutions,
+    plan_expert_substitutions,
+    substitute_experts,
+)
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 
@@ -1764,31 +1768,43 @@ class ExpertOffloadManager:
         scoring_func,
         correction_bias_h,
         routed_scaling_factor,
+        cpu_group=None,
     ):
-        """Substitute active local rows using the previous global placement."""
+        """Atomically substitute source experts across all active EP rows."""
         if mc2_mask_h is None:
             active_rows = torch.arange(topk_ids_h.shape[0])
         else:
             active_rows = mc2_mask_h.bool().nonzero(
                 as_tuple=True)[0]
-        if active_rows.numel() == 0:
-            return
 
         original_ids = topk_ids_h.index_select(
             0, active_rows)[:, :self.topk]
         active_weights = topk_weights_h.index_select(
             0, active_rows)[:, :self.topk]
         active_logits = router_logits_h.index_select(0, active_rows)
-        substituted_weights, substituted_ids = substitute_experts(
+        plan = plan_expert_substitutions(
             active_logits,
-            active_weights,
             original_ids,
             log2phy_h,
-            renormalize=renormalize,
             expert_substitution_threshold=(
                 self.offload_config.expert_substitution_threshold),
             scoring_func=scoring_func,
             e_score_correction_bias=correction_bias_h,
+        )
+        from vllm_ascend.expert_offload.multi_card_planner import (
+            gather_global_substitution_state_cpu,
+        )
+
+        global_referenced, global_blocked = \
+            gather_global_substitution_state_cpu(
+                plan.referenced, plan.blocked, cpu_group)
+        allowed = global_referenced & ~global_blocked
+        substituted_weights, substituted_ids = commit_expert_substitutions(
+            plan,
+            allowed,
+            active_weights,
+            original_ids,
+            renormalize=renormalize,
             routed_scaling_factor=routed_scaling_factor,
         )
         if self._debug:
@@ -1818,8 +1834,10 @@ class ExpertOffloadManager:
              is_prefetch, mc2_mask_h, do_substitution, topk_weights_h,
              router_logits_h, renormalize, scoring_func, correction_bias_h,
              routed_scaling_factor) = args
-        from vllm_ascend.expert_offload.multi_card_planner import plan_placement
         from vllm.distributed.parallel_state import get_ep_group
+
+        from vllm_ascend.expert_offload.multi_card_planner import plan_placement
+
         cpu_group = get_ep_group().cpu_group if self.ep_size > 1 else None
 
         # Substitute against the previous FULL global placement before global
@@ -1829,7 +1847,7 @@ class ExpertOffloadManager:
             self._apply_multi_card_substitution(
                 layer_idx, topk_ids_h, topk_weights_h, router_logits_h,
                 log2phy_h, mc2_mask_h, renormalize, scoring_func,
-                correction_bias_h, routed_scaling_factor)
+                correction_bias_h, routed_scaling_factor, cpu_group)
 
         # Drop pad-token rows (mc2_mask==0) BEFORE any counting / placing / LRU.
         # Under single-batch TP the ranks past the real-token count hold PAD

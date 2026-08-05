@@ -78,3 +78,88 @@ def test_substitution_supports_missing_correction_bias_and_renormalize():
 
     assert ids.tolist() == [[0, 3]]
     torch.testing.assert_close(weights.sum(dim=-1), torch.full((1,), 2.0))
+
+
+def test_substitution_keeps_all_references_when_one_is_high_confidence():
+    router_logits = torch.log(torch.tensor([
+        [0.40, 0.25, 0.20, 0.15],
+        [0.15, 0.70, 0.10, 0.05],
+    ]))
+    topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.40, 0.25], [0.70, 0.15]])
+    log2phy = torch.tensor([0, -1, -1, 1], dtype=torch.int32)
+
+    weights, ids = substitute_experts(
+        router_logits,
+        topk_weights,
+        topk_ids,
+        log2phy,
+        expert_substitution_threshold=0.30,
+    )
+
+    assert torch.equal(ids, topk_ids)
+    assert torch.equal(weights, topk_weights)
+
+
+def test_substitution_replaces_all_references_to_a_missing_expert():
+    router_logits = torch.log(torch.tensor([
+        [0.40, 0.25, 0.20, 0.15],
+        [0.35, 0.25, 0.22, 0.18],
+    ]))
+    topk_ids = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.40, 0.25], [0.35, 0.25]])
+    log2phy = torch.tensor([0, -1, -1, 1], dtype=torch.int32)
+
+    weights, ids = substitute_experts(
+        router_logits,
+        topk_weights,
+        topk_ids,
+        log2phy,
+        expert_substitution_threshold=0.30,
+    )
+
+    assert ids.tolist() == [[0, 3], [0, 3]]
+    torch.testing.assert_close(
+        weights, torch.tensor([[0.40, 0.15], [0.35, 0.18]]))
+
+
+def test_substitution_rolls_back_group_when_one_reference_has_no_candidate():
+    router_logits = torch.log(torch.tensor([
+        [0.40, 0.25, 0.20, 0.15],
+        [0.40, 0.25, 0.24, 0.11],
+    ]))
+    topk_ids = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.40, 0.25], [0.40, 0.25]])
+    log2phy = torch.tensor([0, -1, -1, 1], dtype=torch.int32)
+
+    weights, ids = substitute_experts(
+        router_logits,
+        topk_weights,
+        topk_ids,
+        log2phy,
+        expert_substitution_threshold=0.30,
+    )
+
+    assert torch.equal(ids, topk_ids)
+    assert torch.equal(weights, topk_weights)
+
+
+def test_substitution_does_not_duplicate_candidate_within_token():
+    router_logits = torch.log(
+        torch.tensor([[0.25, 0.24, 0.20, 0.18, 0.13]]))
+    topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.25, 0.24]])
+    # Only expert 3 is both resident and inside the substitution score band.
+    log2phy = torch.tensor([-1, -1, -1, 0, -1], dtype=torch.int32)
+
+    weights, ids = substitute_experts(
+        router_logits,
+        topk_weights,
+        topk_ids,
+        log2phy,
+        expert_substitution_threshold=0.30,
+    )
+
+    assert ids.tolist() == [[0, 3]]
+    assert len(set(ids[0].tolist())) == ids.shape[1]
+    torch.testing.assert_close(weights, torch.tensor([[0.25, 0.18]]))

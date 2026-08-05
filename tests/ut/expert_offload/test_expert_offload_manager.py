@@ -165,6 +165,86 @@ def test_multi_card_substitution_updates_only_active_rows():
     )
 
 
+def test_multi_card_substitution_honors_remote_blocker():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "expert_substitution_enabled": True,
+        "expert_substitution_threshold": 0.30,
+    })
+    manager.topk = 2
+    manager._debug = False
+    router_logits_h = torch.log(
+        torch.tensor([[0.40, 0.25, 0.20, 0.15]]))
+    topk_ids_h = torch.tensor([[0, 1]], dtype=torch.int32)
+    topk_weights_h = torch.tensor([[0.40, 0.25]])
+    log2phy_h = torch.tensor([0, -1, -1, 3], dtype=torch.int32)
+
+    def block_expert_one(referenced, blocked, cpu_group):
+        del cpu_group
+        global_blocked = blocked.clone()
+        global_blocked[1] = True
+        return referenced, global_blocked
+
+    with patch(
+        "vllm_ascend.expert_offload.multi_card_planner."
+        "gather_global_substitution_state_cpu",
+        side_effect=block_expert_one,
+    ):
+        manager._apply_multi_card_substitution(
+            5,
+            topk_ids_h,
+            topk_weights_h,
+            router_logits_h,
+            log2phy_h,
+            None,
+            False,
+            "softmax",
+            None,
+            1.0,
+            object(),
+        )
+
+    assert topk_ids_h.tolist() == [[0, 1]]
+    torch.testing.assert_close(
+        topk_weights_h, torch.tensor([[0.40, 0.25]]))
+
+
+def test_multi_card_substitution_all_pad_still_joins_global_state():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "expert_substitution_enabled": True,
+        "expert_substitution_threshold": 0.30,
+    })
+    manager.topk = 2
+    manager._debug = False
+    topk_ids_h = torch.tensor([[0, 1]], dtype=torch.int32)
+    topk_weights_h = torch.tensor([[0.40, 0.25]])
+    gather = MagicMock(side_effect=lambda referenced, blocked, cpu_group:
+                       (referenced, blocked))
+
+    with patch(
+        "vllm_ascend.expert_offload.multi_card_planner."
+        "gather_global_substitution_state_cpu",
+        gather,
+    ):
+        manager._apply_multi_card_substitution(
+            5,
+            topk_ids_h,
+            topk_weights_h,
+            torch.log(torch.tensor([[0.40, 0.25, 0.20, 0.15]])),
+            torch.tensor([0, -1, -1, 3], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+            False,
+            "softmax",
+            None,
+            1.0,
+            object(),
+        )
+
+    gather.assert_called_once()
+    assert topk_ids_h.tolist() == [[0, 1]]
+
+
 def test_prefetch_dispatch_uses_single_or_per_layer_multi_card_capacity():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager.offload_config = ExpertOffloadConfig(
