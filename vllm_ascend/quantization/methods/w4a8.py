@@ -724,6 +724,13 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                 w2_scale_bias=w2_scale_bias,
                 is_per_channel_weight=self.is_per_channel_weight,
                 swiglu_limit=layer.swiglu_limit,
+                # Device-resident expert count for this layer. The auto-derivation
+                # in build_fused_experts_input misreads the single-tensor-in-list
+                # wrapping of the else branch above (len([w]) == 1), which sizes
+                # the dispatcher's group_list to 1 while the weight dim0 is the
+                # real slot count (e.g. 32 for expert offload). moe_config carries
+                # the correct value, including the prefill-pool overrides above.
+                num_local_experts=layer.moe_config.num_local_experts,
             )
         )
         # Trigger next-layer expert prefetch AFTER GMM kernel submission
