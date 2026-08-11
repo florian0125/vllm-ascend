@@ -406,27 +406,74 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig) -> MoECommT
         #  - DECODE (small batch): MC2 with dynamic per-layer placement
         #    (log2phy) + the device buffer (num_device_experts slots). Used
         #    only when (a) tokens fit the MC2 kernel hard limit (512) and
-        #    (b) the buffer can hold the active expert union (~num_tokens*topk
-        #    distinct). MC2 routes by physical id, so MC2<->buffer are paired.
+        #    (b) the buffer can hold the local route upper bound
+        #    (num_tokens * topk). Replicated mode uses global slots; sharded
+        #    mode uses one owner's per-rank slots as the worst-case bound. MC2
+        #    routes by physical id, so MC2<->buffer are paired.
         #  - PREFILL / buffer-overflow (large batch, or union > buffer):
         #    ALLTOALL with a per-rank EP shard in the prefill pool (full
         #    experts). AllGather EP needs sequence parallel (enable_sp) to
         #    cross-card gather; without SP it deadlocks, so ALLTOALL (own token
         #    all-to-all) is correct.
-        # The buffer-fit check (b) makes the device buffer never overflow
-        # (no spread -> no MC2 deadlock), so the old ep_size*topk slot floor
-        # is unnecessary — and pad-token garbage that used to inflate the
-        # union is filtered by mc2_mask (51a6d644). num_device_experts is now
-        # a free knob: smaller => more batches take the full-expert pool.
-        _ndev = get_ascend_config().expert_offload_config.num_device_experts
-        _topk = getattr(vllm_config.model_config.hf_config,
-                        "num_experts_per_tok", 1)
-        _buffer_fits = num_tokens * _topk <= _ndev
+        # Pad-token garbage is filtered by mc2_mask (51a6d644).
+        # num_device_experts remains a free knob: smaller => more batches use
+        # the full-expert pool.
+        _offload_config = get_ascend_config().expert_offload_config
+        # Communication selection is process-wide rather than layer-specific,
+        # so use the smallest configured layer capacity as the safe bound.
+        # Replicated CPU weights allow arbitrary cross-rank placement, hence
+        # the whole device pool is available.  Sharded CPU weights pin every
+        # expert to its owner rank; in the worst case all routes target one
+        # shard, so admission must fit that rank's slots by itself.
+        _global_slots = min(_offload_config.num_device_experts_list)
+        _ep_size = get_ep_group().world_size
+        _admission_slots = (
+            min(_offload_config.num_device_experts_for_rank(i, _ep_size)
+                for i in range(len(_offload_config.num_device_experts_list)))
+            if _offload_config.shard_per_rank else _global_slots
+        )
+        _hf = getattr(vllm_config.model_config, "hf_config", None)
+        if _hf is None:
+            _hf = vllm_config.model_config.hf_text_config
+        _text_config = getattr(_hf, "text_config", None)
+        _topk = (
+            getattr(_hf, "num_experts_per_tok", None)
+            or getattr(_hf, "num_experts_per_token", None)
+            or getattr(_text_config, "num_experts_per_tok", None)
+            or getattr(_text_config, "num_experts_per_token", None)
+            or 1
+        )
+        # ``num_tokens`` is the per-rank execution shape. TP ranks can hold
+        # replicated token rows and idle DP ranks can execute dummy rows to
+        # stay in collective lockstep, so multiplying this bound by EP size
+        # can double-count routes. Use the local route bound for admission.
+        _route_upper_bound = num_tokens * _topk
+        _buffer_fits = _route_upper_bound <= _admission_slots
         if (num_tokens <= mc2_tokens_capacity and num_tokens <= 512
                 and _buffer_fits):
             moe_comm_type = MoECommType.MC2
         else:
             moe_comm_type = MoECommType.ALLTOALL
+        if _offload_config.moe_offload_debug:
+            if num_tokens > mc2_tokens_capacity:
+                _reason = "mc2_capacity"
+            elif num_tokens > 512:
+                _reason = "mc2_hard_limit"
+            elif not _buffer_fits:
+                _reason = "expert_slots"
+            else:
+                _reason = "fits"
+            logger.info(
+                "[MC_ADMISSION] cpu_mode=%s num_tokens=%s topk=%s "
+                "ep_size=%s global_slots=%s admission_slots=%s "
+                "route_upper_bound=%s "
+                "mc2_tokens_capacity=%s mc2_hard_limit=512 "
+                "buffer_fits=%s selected=%s reason=%s",
+                ("sharded" if _offload_config.shard_per_rank
+                 else "replicated"),
+                num_tokens, _topk, _ep_size, _global_slots, _admission_slots,
+                _route_upper_bound, mc2_tokens_capacity, _buffer_fits,
+                moe_comm_type.name, _reason)
     elif soc_version == AscendDeviceType.A2:
         moe_comm_type = _select_a2_moe_comm_method(num_tokens, vllm_config, mc2_tokens_capacity)
     elif soc_version == AscendDeviceType.A3:

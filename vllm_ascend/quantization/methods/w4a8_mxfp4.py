@@ -256,10 +256,28 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                     topk_weights,
                     hidden_states=x,
                     mc2_mask=mc2_mask,
+                    router_logits=router_logits,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias,
+                    routed_scaling_factor=routed_scaling_factor,
+                    is_hash_routed=tid2eid is not None,
                 )
                 prefill_regime = forward_context.moe_comm_type != MoECommType.MC2
             else:
-                mgr.update_weights(layer, topk_ids, log2phy, topk_weights, hidden_states=x)
+                mgr.update_weights(
+                    layer,
+                    topk_ids,
+                    log2phy,
+                    topk_weights,
+                    hidden_states=x,
+                    router_logits=router_logits,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias,
+                    routed_scaling_factor=routed_scaling_factor,
+                    is_hash_routed=tid2eid is not None,
+                )
                 prefill_regime = num_tokens > mgr.offload_threshold
 
             if (
@@ -323,6 +341,11 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             w1_scale = layer.w13_weight_scale
             w2_scale = layer.w2_weight_scale
 
+        # Trigger next-layer expert prefetch only after the GMM kernel has been
+        # submitted, so the recorded compute event covers the current layer.
+        if enable_expert_offload and not use_prefill_pool and num_tokens <= mgr.offload_threshold:
+            mgr.trigger_next_layer_prefetch(layer, x)
+
         try:
             final_hidden_states = moe_comm_method.fused_experts(
                 fused_experts_input=build_fused_experts_input(
@@ -364,10 +387,6 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                     token_dispatcher.local_expert_indices = _saved_dispatcher_state["local_expert_indices"]
                     token_dispatcher.expert_ids_per_ep_rank = _saved_dispatcher_state["expert_ids_per_ep_rank"]
 
-        # Trigger next-layer expert prefetch only after the GMM kernel has been
-        # submitted, so the recorded compute event covers the current layer.
-        if enable_expert_offload and not use_prefill_pool and num_tokens <= mgr.offload_threshold:
-            mgr.trigger_next_layer_prefetch(layer, x)
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):

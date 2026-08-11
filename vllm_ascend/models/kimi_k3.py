@@ -740,6 +740,7 @@ class KimiK3MoE(nn.Module):
 
         self.experts = FusedMoE(
             shared_experts=self.shared_experts,
+            gate=self.gate,
             num_experts=config.num_experts,
             top_k=config.num_experts_per_token,
             hidden_size=self.moe_hidden_size,

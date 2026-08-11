@@ -410,9 +410,19 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
             last_expert_idx = first_expert_idx + self.num_experts_local
         else:
+            # num_local_experts is per-layer (the device-resident expert count
+            # of the w1 being multiplied, threaded via routing). The dispatcher
+            # is a process-wide singleton whose self.num_experts_local is fixed
+            # to one layer's value, so it CANNOT be used when num_device_experts
+            # varies per MoE layer — group_list would be sized to the singleton
+            # value (e.g. 90) and mismatch an 80-expert weight. Fall back to it
+            # only when routing didn't carry a value (older call sites).
+            num_local_experts = token_dispatch_input.routing.num_local_experts
+            if num_local_experts <= 0:
+                num_local_experts = self.num_experts_local
             first_expert_idx = 0
-            last_expert_idx = self.num_experts_local
-            global_num_experts = self.num_experts_local
+            last_expert_idx = num_local_experts
+            global_num_experts = num_local_experts
         sorted_hidden_states, expanded_row_idx, expert_tokens, dynamic_scale = DeviceOperator.npu_moe_init_routing(
             hidden_states,
             topk_ids,

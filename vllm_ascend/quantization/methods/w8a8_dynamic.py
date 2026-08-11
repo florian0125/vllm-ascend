@@ -302,8 +302,35 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             from vllm_ascend.expert_offload import ExpertOffloadManager
             mgr = ExpertOffloadManager.get_instance()
             num_tokens = topk_ids.size(0)
-            mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
-                               hidden_states=x)
+            is_multi_card_decode = (
+                getattr(layer, "enable_multi_card", False)
+                and _EXTRA_CTX.moe_comm_type == MoECommType.MC2
+            )
+            if is_multi_card_decode:
+                mgr.update_weights_multi_card(
+                    layer, topk_ids, log2phy, topk_weights,
+                    hidden_states=x, mc2_mask=mc2_mask,
+                    router_logits=router_logits,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias,
+                    routed_scaling_factor=routed_scaling_factor,
+                    is_hash_routed=tid2eid is not None,
+                )
+            else:
+                mgr.update_weights(
+                    layer,
+                    topk_ids,
+                    log2phy,
+                    topk_weights,
+                    hidden_states=x,
+                    router_logits=router_logits,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias,
+                    routed_scaling_factor=routed_scaling_factor,
+                    is_hash_routed=tid2eid is not None,
+                )
             if num_tokens > mgr.offload_threshold and mgr._prefill_initialized and not mgr._skip_prefill:
                 use_prefill_pool = True
                 try:

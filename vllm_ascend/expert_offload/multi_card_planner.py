@@ -107,6 +107,44 @@ def _plan_single_rank(global_counts, num_device_experts):
                      per_rank_load=rank_load, unassigned=unassigned)
 
 
+def plan_hot_preload(
+    hot_pairs,
+    global_num_experts: int,
+    ep_size: int,
+    num_device_experts: int,
+    force_shard: int | None = None,
+) -> Placement:
+    """Build a deterministic initial placement from an offline hot ranking.
+
+    ``hot_pairs`` is ordered hottest first and contains ``(expert_id, score)``
+    entries. The raw scores are workload-specific and may be very close, so
+    placement uses rank order as a stable synthetic count. Passing every ranked
+    expert lets shard-per-rank mode fill each owner's slots with that shard's
+    hottest experts even when the globally hottest prefix is skewed.
+    """
+    if global_num_experts < 1:
+        raise ValueError("global_num_experts must be >= 1")
+    counts = torch.zeros(global_num_experts, dtype=torch.int64)
+    ranking_size = len(hot_pairs)
+    seen = set()
+    for rank, pair in enumerate(hot_pairs):
+        expert_id = int(pair[0])
+        if expert_id < 0 or expert_id >= global_num_experts:
+            raise ValueError(
+                f"hot expert id {expert_id} is outside "
+                f"[0, {global_num_experts})")
+        if expert_id in seen:
+            raise ValueError(f"duplicate hot expert id {expert_id}")
+        seen.add(expert_id)
+        counts[expert_id] = ranking_size - rank
+    return plan_placement(
+        counts,
+        ep_size=ep_size,
+        num_device_experts=num_device_experts,
+        force_shard=force_shard,
+    )
+
+
 def _assign_experts_to_ranks(active, ep_size, num_device_experts,
                              prev_rank_of=None, force_shard=None):
     """Assign each expert to a rank. Residence-aware: an expert that was on a
@@ -367,6 +405,25 @@ def gather_global_counts_cpu(
     return global_counts
 
 
+def gather_global_substitution_state_cpu(
+    local_referenced: torch.Tensor,
+    local_blocked: torch.Tensor,
+    cpu_group=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge per-expert substitution eligibility across the EP group.
+
+    Both tensors are CPU boolean vectors. MAX is a logical OR here: an expert
+    may be substituted only when it is referenced somewhere and blocked
+    nowhere. ``cpu_group=None`` keeps the single-process unit-test path cheap.
+    """
+    state = torch.stack((local_referenced, local_blocked)).to(torch.int32)
+    if cpu_group is not None:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.all_reduce(state, op=dist.ReduceOp.MAX, group=cpu_group)
+    return state[0].bool(), state[1].bool()
+
+
 def plan_for_layer(
     topk_ids: torch.Tensor,
     global_num_experts: int,
@@ -470,4 +527,3 @@ def prefill_is_all2all(comm_type) -> bool:
     MoECommType enum value from _EXTRA_CTX.moe_comm_type.
     """
     return getattr(comm_type, "name", str(comm_type)) != "MC2"
-

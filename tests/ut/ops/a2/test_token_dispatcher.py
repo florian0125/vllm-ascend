@@ -59,6 +59,7 @@ def build_token_dispatch_input_fixture(
     act_quant_type: torch.dtype | None = None,
     is_per_channel_weight: bool = False,
     mc2_mask: torch.Tensor | None = None,
+    num_local_experts: int = 0,
 ) -> MoETokenDispatchInput:
     mxfp_spec = None
     if quant_type in (QuantType.W8A8MXFP, QuantType.W4A4MXFP):
@@ -73,6 +74,7 @@ def build_token_dispatch_input_fixture(
             mc2_mask=mc2_mask,
             apply_router_weight_on_input=apply_router_weight_on_input,
             pertoken_scale=pertoken_scale,
+            num_local_experts=num_local_experts,
         ),
         quant=MoEQuantParams(
             quant_type=quant_type,
@@ -484,6 +486,33 @@ def test_allgather_token_dispatch_mxfp4_keeps_prequantized_scale():
     assert init_kwargs["quant_mode"] == -1
     assert init_kwargs["act_quant_type"] == MXFP4_TEST_DTYPE
     assert output.dynamic_scale is returned_scale
+
+
+def test_allgather_token_dispatch_uses_per_layer_expert_capacity():
+    dispatcher = TokenDispatcherWithAllGather(
+        top_k=2, num_experts=128, num_local_experts=99)
+    token_dispatch_input = build_token_dispatch_input_fixture(
+        hidden_states=torch.randn(2, 8),
+        topk_weights=torch.tensor([[0.7, 0.3], [0.6, 0.4]]),
+        topk_ids=torch.tensor([[0, 1], [1, 2]], dtype=torch.int32),
+        num_local_experts=6,
+    )
+    init_routing_output = (
+        torch.randn(4, 8),
+        torch.arange(4, dtype=torch.int32),
+        torch.ones(6, dtype=torch.int32),
+        None,
+    )
+
+    with patch(
+        "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_init_routing",
+        return_value=init_routing_output,
+    ) as mock_init_routing:
+        dispatcher.token_dispatch(token_dispatch_input)
+
+    init_kwargs = mock_init_routing.call_args.kwargs
+    assert init_kwargs["expert_num"] == 6
+    assert init_kwargs["active_expert_range"] == [0, 6]
 
 
 class TestTokenDispatcherWithAllGather(TestBase):
