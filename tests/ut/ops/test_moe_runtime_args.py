@@ -105,8 +105,40 @@ class TestMoERuntimeArgs(unittest.TestCase):
                 self.assertTrue(fused_experts_input.dynamic_eplb)
                 self.assertTrue(fused_experts_input.routing.apply_router_weight_on_input)
                 self.assertEqual(fused_experts_input.routing.global_redundant_expert_num, 2)
+                self.assertEqual(
+                    fused_experts_input.routing.num_local_experts, 2)
                 self.assertEqual(fused_experts_input.activation, "gelu")
                 self.assertEqual(fused_experts_input.quant.quant_type, quant_type)
+
+    def test_build_fused_experts_input_tracks_dynamic_layer_capacity(self):
+        common = {
+            "hidden_states": torch.randn(2, 4),
+            "topk_weights": torch.randn(2, 1),
+            "topk_ids": torch.tensor([[0], [1]], dtype=torch.int32),
+            "quant_type": QuantType.NONE,
+            "dynamic_eplb": False,
+        }
+
+        tensor_weights = build_fused_experts_input(
+            **common,
+            w1=torch.randn(6, 4, 8),
+            w2=torch.randn(6, 8, 4),
+        )
+        list_weights = build_fused_experts_input(
+            **common,
+            w1=[torch.randn(4, 8) for _ in range(3)],
+            w2=[torch.randn(8, 4) for _ in range(3)],
+        )
+        explicit = build_fused_experts_input(
+            **common,
+            w1=torch.randn(6, 4, 8),
+            w2=torch.randn(6, 8, 4),
+            num_local_experts=5,
+        )
+
+        self.assertEqual(tensor_weights.routing.num_local_experts, 6)
+        self.assertEqual(list_weights.routing.num_local_experts, 3)
+        self.assertEqual(explicit.routing.num_local_experts, 5)
 
     def test_build_fused_experts_input_merges_dense_and_quant_weights(self):
         w1 = torch.randn(2, 8, 16)

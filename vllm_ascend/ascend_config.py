@@ -964,6 +964,10 @@ class ExpertOffloadConfig:
         "expert_prefetch_num": 2,
         "shard_per_rank": True,
         "enable_multi_card": False,
+        "hot_expert_preload": False,
+        "hot_experts_file": "",
+        "expert_substitution_enabled": False,
+        "expert_substitution_threshold": 0.25,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -984,6 +988,61 @@ class ExpertOffloadConfig:
             return self.config[key]
         raise AttributeError(f"Config has no attribute '{key}'")
 
+    def num_device_experts_for_layer(self, layer_idx: int) -> int:
+        """Resolve the per-layer device-expert buffer size.
+
+        A scalar config broadcasts to every MoE layer; a single-element list
+        also broadcasts; a multi-element list indexes by MoE-layer registration
+        order and must cover every registered MoE layer (length validated in
+        ExpertOffloadManager._finalize_offload).
+        """
+        val = self.config["num_device_experts"]
+        if isinstance(val, list):
+            if len(val) == 1:
+                return val[0]
+            if layer_idx >= len(val):
+                raise IndexError(
+                    f"num_device_experts list (len {len(val)}) does not cover "
+                    f"MoE layer {layer_idx}; set its length to the number of "
+                    f"MoE layers")
+            return val[layer_idx]
+        return val
+
+    def num_device_experts_for_rank(self, layer_idx: int,
+                                    ep_size: int = 1) -> int:
+        """Return the physical expert slots held by one EP rank.
+
+        ``num_device_experts`` is the global capacity for a layer. Single-card
+        execution passes ``ep_size=1``; multi-card execution splits that
+        capacity evenly across EP ranks.
+        """
+        if ep_size < 1:
+            raise ValueError(f"ep_size must be >= 1; got {ep_size}")
+        capacity = self.num_device_experts_for_layer(layer_idx)
+        if capacity % ep_size != 0:
+            raise ValueError(
+                "num_device_experts for each multi-card MoE layer must be "
+                "divisible by EP size; "
+                f"layer={layer_idx}, capacity={capacity}, ep_size={ep_size}")
+        return capacity // ep_size
+
+    def validate_num_moe_layers(self, num_moe_layers: int) -> None:
+        """Validate current target layers while allowing later MTP layers."""
+        nde_list = self.num_device_experts_list
+        if len(nde_list) > 1 and len(nde_list) < num_moe_layers:
+            raise ValueError(
+                f"num_device_experts list length ({len(nde_list)}) must be at "
+                f"least the number of MoE layers registered so far "
+                f"({num_moe_layers}); use a scalar or a single-element list to "
+                f"broadcast, or a list of length >= {num_moe_layers} (append "
+                f"one entry per draft MoE layer, e.g. MTP)")
+
+    @property
+    def num_device_experts_list(self) -> list[int]:
+        """num_device_experts as a list (scalar wrapped into a 1-element list)."""
+        val = self.config["num_device_experts"]
+        return val if isinstance(val, list) else [val]
+
     def _validate_config(self):
         if self.expert_map_path is not None:
             logger.info("The expert_map is %s", self.expert_map_path)
@@ -991,10 +1050,45 @@ class ExpertOffloadConfig:
                 raise TypeError("The expert_map is not json.")
             if not (os.path.exists(self.expert_map_path) and os.access(self.expert_map_path, os.R_OK)):
                 raise ValueError("The expert_map is not exist.")
-        if not isinstance(self.config["num_device_experts"], int):
-            raise TypeError("num_device_experts must be an integer")
-        if self.config["num_device_experts"] < 0:
-            raise ValueError(f"num_device_experts must >= 0; got {self.config['num_device_experts']} instead")
+        if not isinstance(self.config["hot_expert_preload"], bool):
+            raise TypeError("hot_expert_preload must be a boolean")
+        if self.hot_expert_preload:
+            if not self.hot_experts_file:
+                raise ValueError(
+                    "hot_expert_preload is True but hot_experts_file is empty")
+            if not self.hot_experts_file.endswith(".json"):
+                raise TypeError("hot_experts_file must be a .json file")
+            # 相对路径相对 expert_offload 模块目录 resolve（热点 JSON 始终放该目录）
+            hot_path = self.hot_experts_file
+            if not os.path.isabs(hot_path):
+                hot_path = os.path.join(os.path.dirname(__file__),
+                                        "expert_offload", hot_path)
+            if not (os.path.exists(hot_path) and os.access(hot_path, os.R_OK)):
+                raise ValueError(
+                    f"hot_experts_file not found or unreadable: "
+                    f"{self.hot_experts_file} (resolved: {hot_path})")
+        # num_device_experts may be a scalar (broadcast to every MoE layer) or
+        # a list of per-layer device-expert buffer sizes. A list must be
+        # non-empty with non-negative integer elements. Its length must cover
+        # at least the target MoE layers and may be longer to also cover draft
+        # MoE layers that register later (e.g. MTP); the lower bound is checked
+        # in ExpertOffloadManager._finalize_offload, since num_moe_layers is
+        # only known after the model builds. A single-element list broadcasts.
+        nde = self.config["num_device_experts"]
+        if isinstance(nde, list):
+            if len(nde) == 0:
+                raise ValueError("num_device_experts list must not be empty")
+            if not all(isinstance(x, int) for x in nde):
+                raise TypeError(
+                    "num_device_experts list elements must be integers")
+            if any(x < 0 for x in nde):
+                raise ValueError(
+                    f"num_device_experts list elements must >= 0; got {nde}")
+        elif not isinstance(nde, int):
+            raise TypeError(
+                "num_device_experts must be an integer or a list of integers")
+        elif nde < 0:
+            raise ValueError(f"num_device_experts must >= 0; got {nde} instead")
         if not isinstance(self.config["num_device_layers"], int):
             raise TypeError("num_device_layers must be an integer")
         if self.config["num_device_layers"] < 1:
@@ -1034,6 +1128,13 @@ class ExpertOffloadConfig:
                 f"got {self.config['expert_prefetch_num']} instead")
         if not isinstance(self.config["enable_multi_card"], bool):
             raise TypeError("enable_multi_card must be a boolean")
+        if not isinstance(self.config["expert_substitution_enabled"], bool):
+            raise TypeError("expert_substitution_enabled must be a boolean")
+        if not isinstance(self.config["expert_substitution_threshold"],
+                          (int, float)):
+            raise TypeError("expert_substitution_threshold must be a number")
+        if self.config["expert_substitution_threshold"] < 0:
+            raise ValueError("expert_substitution_threshold must be >= 0")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None
