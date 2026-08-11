@@ -20,8 +20,10 @@ export VLLM_USE_FASTOKENS=1
 # 同步的修改
 # export ASCEND_LAUNCH_BLOCKING=1
 
-nic_name="ens6f1np1"
-local_ip="90.90.93.34"
+# nic_name="ens6f1np1"
+# local_ip="90.90.93.34"
+local_ip="141.61.141.58"
+nic_name="enp35s0f2"
 
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages/mooncake:$LD_LIBRARY_PATH
 export PYTHONPATH=/home/g00619970/moeoffload_multi/vllm:/home/g00619970/moeoffload_multi/vllm-ascend:$PYTHONPATH
@@ -58,7 +60,9 @@ sysctl kernel.sched_migration_cost_ns=50000
 # 在使用84G显存时，
 # 如果当前是128，那 --gpu-memory-utilization 0.62 \
 # 如果当前是112，那 --gpu-memory-utilization 0.71 \
-vllm serve /home/g00955623/weights/DeepSeek-V4-Flash \
+# /mnt/weight/A5-weights/DeepSeek-V4-Flash
+# /home/g00955623/weights/DeepSeek-V4-Flash
+vllm serve /mnt/weight/A5-weights/DeepSeek-V4-Flash \
     --host 0.0.0.0 \
     --port 8150 \
     --data-parallel-size 1 \
@@ -83,7 +87,7 @@ vllm serve /home/g00955623/weights/DeepSeek-V4-Flash \
     --safetensors-load-strategy 'prefetch' \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,3]}' \
     --speculative-config '{"num_speculative_tokens": 2,"method": "mtp","enforce_eager": true}' \
-    --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true, "enable_multi_card": false, "shard_per_rank": false,"num_device_experts": 84,"num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1,"hot_expert_preload": false, "hot_experts_file": "expert_rank_gsm8k.json","expert_substitution_enabled": false,"expert_substitution_threshold": 0.25,"moe_offload_debug": true}}' \
+    --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true, "enable_multi_card": false, "shard_per_rank": false,"num_device_experts": 48,"num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1,"hot_expert_preload": false, "hot_experts_file": "expert_rank_gsm8k.json","expert_substitution_enabled": false,"expert_substitution_threshold": 0.25,"moe_offload_debug": true}}' \
     --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/home/g00619970/moeoffload_multi/prefile", "torch_profiler_with_stack": false}' \
     # --quantization ascend \
 
