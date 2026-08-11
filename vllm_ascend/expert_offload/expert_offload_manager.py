@@ -18,6 +18,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.h2d_transfer import (
     H2DCopyTask,
     TorchCopyH2DTransport,
+    create_h2d_transport,
 )
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
 from vllm_ascend.ops.fused_moe.experts_selector import (
@@ -210,10 +211,18 @@ class ExpertOffloadManager:
         ExpertOffloadManager._instance = self
 
         self.load_stream = torch_npu.npu.Stream()
-        # Phase 1 keeps the existing Tensor/Storage.copy_ implementation behind
-        # a transport boundary. MemFabric backends can replace this object
-        # without taking ownership of routing, placement, or cache policy.
-        self.h2d_transport = TorchCopyH2DTransport()
+        self.h2d_transport = create_h2d_transport(
+            self.offload_config.h2d_backend,
+            device_id=torch_npu.npu.current_device(),
+            memfabric_pool_size_gib=(
+                self.offload_config.memfabric_pool_size_gib),
+            memfabric_log_level=self.offload_config.memfabric_log_level,
+        )
+        logger.info(
+            "[EXPERT-OFFLOAD-H2D] backend=%s memfabric_pool_size_gib=%d",
+            self.offload_config.h2d_backend,
+            self.offload_config.memfabric_pool_size_gib,
+        )
 
         self._init_prefill_pool_state()
         self._is_prefetch: bool = False
@@ -329,22 +338,22 @@ class ExpertOffloadManager:
             self._shard_size = shard
             self._shard_base = self.ep_rank * shard
             w13_list = [
-                torch.empty(w13_shape, dtype=params_dtype, device="cpu",
-                            pin_memory=True) for _ in range(shard)
+                self._allocate_expert_host_tensor(w13_shape, params_dtype)
+                for _ in range(shard)
             ]
             w2_list = [
-                torch.empty(w2_shape, dtype=params_dtype, device="cpu",
-                            pin_memory=True) for _ in range(shard)
+                self._allocate_expert_host_tensor(w2_shape, params_dtype)
+                for _ in range(shard)
             ]
             self.w13_weights_cpu.append(w13_list)
             self.w2_weights_cpu.append(w2_list)
         else:
             w13_list = [
-                torch.empty(w13_shape, dtype=params_dtype, device="cpu", pin_memory=True)
+                self._allocate_expert_host_tensor(w13_shape, params_dtype)
                 for _ in range(ntotal)
             ]
             w2_list = [
-                torch.empty(w2_shape, dtype=params_dtype, device="cpu", pin_memory=True)
+                self._allocate_expert_host_tensor(w2_shape, params_dtype)
                 for _ in range(ntotal)
             ]
             self.w13_weights_cpu.append(w13_list)
@@ -518,8 +527,8 @@ class ExpertOffloadManager:
                 buffers.append([])
             for _ in range(nalloc):
                 buffers[layer_moe_idx].append(
-                    torch.empty(per_expert_shape, dtype=dtype,
-                                device="cpu", pin_memory=True))
+                    self._allocate_expert_host_tensor(
+                        per_expert_shape, dtype))
 
     def _finalize_offload(self, model):
         """Post-weight-loading finalization.
@@ -821,7 +830,10 @@ class ExpertOffloadManager:
                 new_buffers = []
                 for buf in expert_buffers:
                     transformed = buf.transpose(0, 1).contiguous().sum(dim=0)
-                    new_buffers.append(transformed)
+                    backend_buffer = self._allocate_expert_host_tensor(
+                        transformed.shape, transformed.dtype)
+                    backend_buffer.copy_(transformed)
+                    new_buffers.append(backend_buffer)
                 layer_buffers[layer_idx] = new_buffers
 
     def _encode_w4a8_dynamic_weight_scales(self):
@@ -860,8 +872,11 @@ class ExpertOffloadManager:
                     # per-channel branch.
                     scale_np.dtype = np.uint32
                     encoded = scale_np.astype(np.int64)
-                    encoded_buf = torch.from_numpy(np.ascontiguousarray(
+                    encoded_tensor = torch.from_numpy(np.ascontiguousarray(
                         encoded.copy()))
+                    encoded_buf = self._allocate_expert_host_tensor(
+                        encoded_tensor.shape, encoded_tensor.dtype)
+                    encoded_buf.copy_(encoded_tensor)
                     encoded_buffers.append(encoded_buf)
                 self.scale_cpu_buffers[attr_name][layer_idx] = encoded_buffers
 
@@ -1282,71 +1297,106 @@ class ExpertOffloadManager:
                     )
                     getattr(self, attr)[i] = t.transpose(1, 2)
 
+    def _build_prefill_h2d_tasks(
+        self,
+        layer_idx: int,
+        pool_slot: int,
+        source_eid: int,
+        destination_eid: int,
+    ) -> list[H2DCopyTask]:
+        """Build weight and quant tasks for one prefill-pool expert."""
+        w13_start = destination_eid * self.w13_expert_size_bytes
+        w2_start = destination_eid * self.w2_expert_size_bytes
+        w13_dst = self._prefill_w13[pool_slot].untyped_storage()[
+            w13_start:w13_start + self.w13_expert_size_bytes]
+        w2_dst = self._prefill_w2[pool_slot].untyped_storage()[
+            w2_start:w2_start + self.w2_expert_size_bytes]
+        tasks = [
+            H2DCopyTask(
+                source=self._expert_src_storage(
+                    layer_idx, source_eid, 'w13'),
+                destination=w13_dst,
+                nbytes=self.w13_expert_size_bytes,
+                name=(f"prefill-w13[L{layer_idx},E{source_eid}"
+                      f"->P{pool_slot}:E{destination_eid}]"),
+            ),
+            H2DCopyTask(
+                source=self._expert_src_storage(
+                    layer_idx, source_eid, 'w2'),
+                destination=w2_dst,
+                nbytes=self.w2_expert_size_bytes,
+                name=(f"prefill-w2[L{layer_idx},E{source_eid}"
+                      f"->P{pool_slot}:E{destination_eid}]"),
+            ),
+        ]
+
+        local_eid = self._shard_local(source_eid)
+        if local_eid is None:
+            return tasks
+        quant_specs = (
+            (self.scale_cpu_buffers, "w13_weight_scale",
+             self._prefill_w13_scale),
+            (self.scale_cpu_buffers, "w2_weight_scale",
+             self._prefill_w2_scale),
+            (self.offset_cpu_buffers, "w13_weight_offset",
+             self._prefill_w13_offset),
+            (self.offset_cpu_buffers, "w2_weight_offset",
+             self._prefill_w2_offset),
+            (self.scale_bias_cpu_buffers, "w13_scale_bias",
+             self._prefill_w13_scale_bias),
+            (self.scale_bias_cpu_buffers, "w2_scale_bias",
+             self._prefill_w2_scale_bias),
+        )
+        for cpu_buffers, attr_name, prefill_buffers in quant_specs:
+            if (pool_slot >= len(prefill_buffers)
+                    or attr_name not in cpu_buffers
+                    or layer_idx >= len(cpu_buffers[attr_name])
+                    or local_eid >= len(cpu_buffers[attr_name][layer_idx])):
+                continue
+            src = cpu_buffers[attr_name][layer_idx][local_eid]
+            dst = prefill_buffers[pool_slot][destination_eid]
+            tasks.append(H2DCopyTask(
+                source=src.reshape(dst.shape),
+                destination=dst,
+                nbytes=src.numel() * src.element_size(),
+                name=(f"prefill-{attr_name}[L{layer_idx},E{source_eid}"
+                      f"->P{pool_slot}:E{destination_eid}]"),
+            ))
+        return tasks
+
+    def _refresh_prefill_fp32_scale(self, pool_slot: int,
+                                    num_experts: int) -> None:
+        if (pool_slot >= len(self._prefill_w13_scale_fp32)
+                or pool_slot >= len(self._prefill_w13_scale)):
+            return
+        count = min(num_experts,
+                    self._prefill_w13_scale[pool_slot].shape[0])
+        for eid in range(count):
+            self._prefill_w13_scale_fp32[pool_slot][eid].copy_(
+                self._prefill_w13_scale[pool_slot][eid].to(torch.float32),
+                non_blocking=True)
+
     def _init_prefill_pool_data(self, dev, ntotal: int, ndl: int):
         """Load layer 0 weights into all prefill pool slots.
 
         Prefill pool tensors are already NZ-cast at this point (done in
-        create_prefill_pool). Use simple per-expert copy_() — same pattern
-        as the decode path's _update_weights.
+        create_prefill_pool). Route the initial full overwrite through the
+        configured H2D transport, just like runtime prefill/decode loading.
         """
-        has_scales = bool(self._prefill_w13_scale)
-        has_offsets = bool(self._prefill_w13_offset)
-        has_scale_bias = bool(self._prefill_w13_scale_bias)
-
-        for slot in range(ndl):
-            for eid in range(min(ntotal, len(self.w13_weights_cpu[0]))):
-                # _expert_src_storage takes a GLOBAL eid (shard-per-rank remaps
-                # it to the local shard slot); the prefill-pool slot stays local.
-                geid = (self._shard_base + eid) if self.offload_config.shard_per_rank else eid
-                self._prefill_w13[slot].untyped_storage()[eid * self.w13_expert_size_bytes : (eid + 1) * self.w13_expert_size_bytes].copy_(
-                    self._expert_src_storage(0, geid, 'w13')
-                )
-                self._prefill_w2[slot].untyped_storage()[eid * self.w2_expert_size_bytes : (eid + 1) * self.w2_expert_size_bytes].copy_(
-                    self._expert_src_storage(0, geid, 'w2')
-                )
-
-            # Initialize scale/offset buffers with layer 0 data (W8A8)
-            if has_scales:
-                for scale_name, prefill_list, cpu_buffers in [
-                    ("w13_weight_scale", self._prefill_w13_scale, self.scale_cpu_buffers),
-                    ("w2_weight_scale", self._prefill_w2_scale, self.scale_cpu_buffers),
-                ]:
-                    if (scale_name in cpu_buffers and
-                            0 < len(cpu_buffers[scale_name])):
-                        for eid in range(min(ntotal, len(cpu_buffers[scale_name][0]))):
-                            src = cpu_buffers[scale_name][0][eid]
-                            prefill_list[slot][eid].copy_(
-                                src.reshape(prefill_list[slot][eid].shape))
-            if has_offsets:
-                for offset_name, prefill_list, cpu_buffers in [
-                    ("w13_weight_offset", self._prefill_w13_offset, self.offset_cpu_buffers),
-                    ("w2_weight_offset", self._prefill_w2_offset, self.offset_cpu_buffers),
-                ]:
-                    if (offset_name in cpu_buffers and
-                            0 < len(cpu_buffers[offset_name])):
-                        for eid in range(min(ntotal, len(cpu_buffers[offset_name][0]))):
-                            src = cpu_buffers[offset_name][0][eid]
-                            prefill_list[slot][eid].copy_(
-                                src.reshape(prefill_list[slot][eid].shape))
-            # Initialize scale_bias buffers with layer 0 data (W4A8_DYNAMIC)
-            if has_scale_bias:
-                for sb_name, prefill_list in [
-                    ("w13_scale_bias", self._prefill_w13_scale_bias),
-                    ("w2_scale_bias", self._prefill_w2_scale_bias),
-                ]:
-                    cpu_buffers = self.scale_bias_cpu_buffers
-                    if (sb_name in cpu_buffers and
-                            len(cpu_buffers[sb_name]) > 0 and
-                            slot < len(prefill_list)):
-                        for eid in range(min(ntotal, len(cpu_buffers[sb_name][0]))):
-                            src = cpu_buffers[sb_name][0][eid]
-                            prefill_list[slot][eid].copy_(
-                                src.reshape(prefill_list[slot][eid].shape))
-            # Initialize fp32 scale (convert from scale)
-            if has_scales and slot < len(self._prefill_w13_scale_fp32):
-                for eid in range(min(ntotal, self._prefill_w13_scale[slot].shape[0])):
-                    self._prefill_w13_scale_fp32[slot][eid].copy_(
-                        self._prefill_w13_scale[slot][eid].to(torch.float32))
+        del dev
+        num_source_experts = min(ntotal, len(self.w13_weights_cpu[0]))
+        with torch_npu.npu.stream(self.load_stream):
+            for slot in range(ndl):
+                tasks = []
+                for local_eid in range(num_source_experts):
+                    source_eid = (
+                        self._shard_base + local_eid
+                        if self.offload_config.shard_per_rank else local_eid)
+                    tasks.extend(self._build_prefill_h2d_tasks(
+                        0, slot, source_eid, local_eid))
+                self._get_h2d_transport().copy_batch(tasks)
+                self._refresh_prefill_fp32_scale(slot, num_source_experts)
+            self._synchronize_h2d()
 
     def _prefill_load_layer(self, layer_idx: int, log2phy: torch.Tensor):
         """Load ALL experts for model layer layer_idx into the prefill pool.
@@ -1358,7 +1408,6 @@ class ExpertOffloadManager:
         """
         ndl = self.num_device_layers
         pool_slot = layer_idx % ndl
-        dev = self._prefill_w13[pool_slot].device
         ntotal = self.num_total_experts
         is_w8a8 = self._prefill_w13[pool_slot].dtype == torch.int8
 
@@ -1366,66 +1415,14 @@ class ExpertOffloadManager:
             logger.info("[PREFILL_LOAD] layer=%d pool_slot=%d ntotal=%d is_w8a8=%s",
                         layer_idx, pool_slot, ntotal, is_w8a8)
 
-        from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
-
         with torch_npu.npu.stream(self.load_stream):
+            tasks = []
             for eid in range(ntotal):
-                self._prefill_w13[pool_slot].untyped_storage()[eid * self.w13_expert_size_bytes : (eid + 1) * self.w13_expert_size_bytes].copy_(
-                    self._expert_src_storage(layer_idx, eid, 'w13'),
-                    non_blocking=True
-                )
-                self._prefill_w2[pool_slot].untyped_storage()[eid * self.w2_expert_size_bytes : (eid + 1) * self.w2_expert_size_bytes].copy_(
-                    self._expert_src_storage(layer_idx, eid, 'w2'),
-                    non_blocking=True
-                )
-
-            # W8A8 scale/offset — load into prefill buffers
-            for scale_name, prefill_list, cpu_buffers in [
-                ("w13_weight_scale", self._prefill_w13_scale, self.scale_cpu_buffers),
-                ("w2_weight_scale", self._prefill_w2_scale, self.scale_cpu_buffers),
-            ]:
-                if pool_slot < len(prefill_list):
-                    if (scale_name in cpu_buffers and
-                            layer_idx < len(cpu_buffers[scale_name])):
-                        for eid in range(min(ntotal, len(cpu_buffers[scale_name][layer_idx]))):
-                            src = cpu_buffers[scale_name][layer_idx][eid]
-                            prefill_list[pool_slot][eid].copy_(
-                                src.reshape(prefill_list[pool_slot][eid].shape), non_blocking=True)
-            for offset_name, prefill_list, cpu_buffers in [
-                ("w13_weight_offset", self._prefill_w13_offset, self.offset_cpu_buffers),
-                ("w2_weight_offset", self._prefill_w2_offset, self.offset_cpu_buffers),
-            ]:
-                if pool_slot < len(prefill_list):
-                    if (offset_name in cpu_buffers and
-                            layer_idx < len(cpu_buffers[offset_name])):
-                        for eid in range(min(ntotal, len(cpu_buffers[offset_name][layer_idx]))):
-                            src = cpu_buffers[offset_name][layer_idx][eid]
-                            prefill_list[pool_slot][eid].copy_(
-                                src.reshape(prefill_list[pool_slot][eid].shape), non_blocking=True)
-
-            # W4A8_DYNAMIC scale_bias — load into prefill buffers
-            for sb_name, prefill_list in [
-                ("w13_scale_bias", self._prefill_w13_scale_bias),
-                ("w2_scale_bias", self._prefill_w2_scale_bias),
-            ]:
-                cpu_buffers = self.scale_bias_cpu_buffers
-                if pool_slot < len(prefill_list):
-                    if (sb_name in cpu_buffers and
-                            layer_idx < len(cpu_buffers[sb_name])):
-                        for eid in range(min(ntotal, len(cpu_buffers[sb_name][layer_idx]))):
-                            src = cpu_buffers[sb_name][layer_idx][eid]
-                            prefill_list[pool_slot][eid].copy_(
-                                src.reshape(prefill_list[pool_slot][eid].shape), non_blocking=True)
-
-            # Refresh fp32 scale for prefill pool
-            if (pool_slot < len(self._prefill_w13_scale_fp32) and
-                    pool_slot < len(self._prefill_w13_scale)):
-                # Copy scale data from freshly loaded scale to fp32
-                for eid in range(min(ntotal, self._prefill_w13_scale[pool_slot].shape[0])):
-                    self._prefill_w13_scale_fp32[pool_slot][eid].copy_(
-                        self._prefill_w13_scale[pool_slot][eid].to(torch.float32), non_blocking=True)
-
-            self.load_stream.synchronize()
+                tasks.extend(self._build_prefill_h2d_tasks(
+                    layer_idx, pool_slot, eid, eid))
+            self._get_h2d_transport().copy_batch(tasks)
+            self._refresh_prefill_fp32_scale(pool_slot, ntotal)
+            self._synchronize_h2d()
 
         # NOTE: Do NOT modify the layer's own log2phy here — decode path
         # relies on it staying with 32-expert mapping.  Prefill path in
@@ -1505,7 +1502,7 @@ class ExpertOffloadManager:
             # it (the apply path continues on the default stream after we return;
             # the host-side block here guarantees the copies are done before the
             # next op is queued).
-            self.load_stream.synchronize()
+            self._synchronize_h2d()
 
     # ------------------------------------------------------------------ #
     #  Forward path: page in experts based on topk_ids                    #
@@ -2198,12 +2195,24 @@ class ExpertOffloadManager:
         return resident_map, hits, misses
 
     def _get_h2d_transport(self):
-        """Return the configured transport, lazily supplying the phase-1 default."""
+        """Return the configured transport, lazily supplying the default."""
         transport = getattr(self, 'h2d_transport', None)
         if transport is None:
             transport = TorchCopyH2DTransport()
             self.h2d_transport = transport
         return transport
+
+    def _allocate_expert_host_tensor(self, shape, dtype) -> torch.Tensor:
+        """Allocate weight/quant storage owned by the selected H2D backend."""
+        return self._get_h2d_transport().allocate_host_tensor(shape, dtype)
+
+    def _synchronize_h2d(self) -> None:
+        """Wait for the load stream and retire backend copy descriptors."""
+        self._get_h2d_transport().synchronize(self.load_stream)
+
+    def close(self) -> None:
+        """Release H2D backend resources; safe to call more than once."""
+        self._get_h2d_transport().close()
 
     def _build_expert_h2d_tasks(self, layer, layer_idx, eid,
                                 slot) -> list[H2DCopyTask]:
@@ -2260,7 +2269,7 @@ class ExpertOffloadManager:
             self._load_expert_weights_into_slots(layer, layer_idx, misses)
             for slot, eid in misses:
                 resident_map[slot] = eid
-            self.load_stream.synchronize()
+            self._synchronize_h2d()
 
     def _log_mc_decode_cache(self, layer_idx, my_experts, hits, misses,
                              resident_map, log2phy, per_rank_slots,
@@ -2456,7 +2465,7 @@ class ExpertOffloadManager:
 
             self._load_expert_weights_into_slots(
                 layer, layer_idx, planned_loads)
-            self.load_stream.synchronize()
+            self._synchronize_h2d()
 
     def _preload_hot_experts(self):
         """Preload each layer's top-N hot experts into device resident slots
@@ -2548,7 +2557,7 @@ class ExpertOffloadManager:
                                 "ids=%s",
                                 layer_idx, len(weights),
                                 list(weights)[:20])
-            self.load_stream.synchronize()
+            self._synchronize_h2d()
 
     def predict_next_layer_experts_npu(
         self,

@@ -514,6 +514,38 @@ class TestAscendConfig(TestBase):
 
 
 class TestExpertOffloadConfig(TestBase):
+    def test_h2d_backend_defaults_to_torch(self):
+        config = ExpertOffloadConfig({})
+
+        self.assertEqual(config.h2d_backend, "torch")
+        self.assertEqual(config.memfabric_pool_size_gib, 0)
+        self.assertEqual(config.memfabric_log_level, 3)
+
+    def test_memfabric_h2d_accepts_single_card_config(self):
+        config = ExpertOffloadConfig({
+            "h2d_backend": "memfabric",
+            "memfabric_pool_size_gib": 16,
+            "memfabric_log_level": 1,
+        })
+
+        self.assertEqual(config.h2d_backend, "memfabric")
+        self.assertEqual(config.memfabric_pool_size_gib, 16)
+        self.assertEqual(config.memfabric_log_level, 1)
+
+    def test_h2d_backend_validation(self):
+        with self.assertRaisesRegex(ValueError, "h2d_backend must be"):
+            ExpertOffloadConfig({"h2d_backend": "unknown"})
+        with self.assertRaisesRegex(TypeError, "pool_size_gib.*integer"):
+            ExpertOffloadConfig({"memfabric_pool_size_gib": 1.5})
+        with self.assertRaisesRegex(ValueError, "pool_size_gib must be > 0"):
+            ExpertOffloadConfig({"h2d_backend": "memfabric"})
+        with self.assertRaisesRegex(ValueError, "single-card"):
+            ExpertOffloadConfig({
+                "h2d_backend": "memfabric",
+                "memfabric_pool_size_gib": 16,
+                "enable_multi_card": True,
+            })
+
     def test_expert_substitution_defaults_and_override(self):
         default = ExpertOffloadConfig({})
         enabled = ExpertOffloadConfig({

@@ -584,6 +584,54 @@ def test_expert_load_combines_multiple_experts_into_one_transport_batch():
     ]
 
 
+def test_expert_host_allocation_and_synchronization_use_transport():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.h2d_transport = MagicMock()
+    manager.load_stream = object()
+    expected = object()
+    manager.h2d_transport.allocate_host_tensor.return_value = expected
+
+    result = manager._allocate_expert_host_tensor((2, 4), torch.float32)
+    manager._synchronize_h2d()
+
+    assert result is expected
+    manager.h2d_transport.allocate_host_tensor.assert_called_once_with(
+        (2, 4), torch.float32)
+    manager.h2d_transport.synchronize.assert_called_once_with(
+        manager.load_stream)
+
+
+def test_prefill_weight_and_quant_attributes_are_one_h2d_task_batch():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({"shard_per_rank": False})
+    manager.w13_expert_size_bytes = 4
+    manager.w2_expert_size_bytes = 2
+    w13_source = torch.ones(4, dtype=torch.uint8).untyped_storage()
+    w2_source = torch.ones(2, dtype=torch.uint8).untyped_storage()
+    manager._expert_src_storage = MagicMock(
+        side_effect=[w13_source, w2_source])
+    manager._prefill_w13 = [torch.zeros((2, 4), dtype=torch.uint8)]
+    manager._prefill_w2 = [torch.zeros((2, 2), dtype=torch.uint8)]
+    manager._prefill_w13_scale = [torch.zeros((2, 2))]
+    manager._prefill_w2_scale = []
+    manager._prefill_w13_offset = []
+    manager._prefill_w2_offset = []
+    manager._prefill_w13_scale_bias = []
+    manager._prefill_w2_scale_bias = []
+    scale = torch.tensor([1.0, 2.0])
+    manager.scale_cpu_buffers = {"w13_weight_scale": [[scale]]}
+    manager.offset_cpu_buffers = {}
+    manager.scale_bias_cpu_buffers = {}
+
+    tasks = manager._build_prefill_h2d_tasks(0, 0, 0, 1)
+
+    assert len(tasks) == 3
+    assert [task.nbytes for task in tasks] == [4, 2, 8]
+    assert tasks[2].source.data_ptr() == scale.data_ptr()
+    assert tasks[2].destination.data_ptr() == \
+        manager._prefill_w13_scale[0][1].data_ptr()
+
+
 def test_quant_attributes_are_represented_as_h2d_tasks():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager.offload_config = ExpertOffloadConfig({"shard_per_rank": False})
