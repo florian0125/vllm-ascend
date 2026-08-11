@@ -15,6 +15,10 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.expert_offload.h2d_transfer import (
+    H2DCopyTask,
+    TorchCopyH2DTransport,
+)
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
 from vllm_ascend.ops.fused_moe.experts_selector import (
     commit_expert_substitutions,
@@ -206,6 +210,10 @@ class ExpertOffloadManager:
         ExpertOffloadManager._instance = self
 
         self.load_stream = torch_npu.npu.Stream()
+        # Phase 1 keeps the existing Tensor/Storage.copy_ implementation behind
+        # a transport boundary. MemFabric backends can replace this object
+        # without taking ownership of routing, placement, or cache policy.
+        self.h2d_transport = TorchCopyH2DTransport()
 
         self._init_prefill_pool_state()
         self._is_prefetch: bool = False
@@ -1808,15 +1816,10 @@ class ExpertOffloadManager:
             return cpu_buf[eid - self._shard_base].untyped_storage()
         return cpu_buf[eid].untyped_storage()
 
-    def _copy_quant_attrs_into_slot(self, layer, layer_idx, eid, slot):
-        """Copy one expert's scale/offset/scale_bias CPU buffers into a device slot.
-
-        Shared by the single-card and multi-card decode H2D load loops (both
-        needed the same 3-attr copy). Iterates the quant buffer dicts that
-        exist for this model — W8A8 has scale+offset, W4A8_DYNAMIC adds
-        scale_bias, W4A8_MXFP has none — and silently skips any that are
-        absent for this layer/expert, so callers don't branch on quant type.
-        """
+    def _build_quant_attr_h2d_tasks(self, layer, layer_idx, eid,
+                                    slot) -> list[H2DCopyTask]:
+        """Build scale/offset/scale_bias H2D tasks for one expert slot."""
+        tasks = []
         for buffer_dict in (self.scale_cpu_buffers,
                             self.offset_cpu_buffers,
                             self.scale_bias_cpu_buffers):
@@ -1831,8 +1834,19 @@ class ExpertOffloadManager:
                 if dev_tensor is None:
                     continue
                 src = buffers[layer_idx][local_eid]
-                dev_tensor.data[slot].copy_(
-                    src.reshape(dev_tensor.data[slot].shape), non_blocking=True)
+                dst = dev_tensor.data[slot]
+                tasks.append(H2DCopyTask(
+                    source=src.reshape(dst.shape),
+                    destination=dst,
+                    nbytes=src.numel() * src.element_size(),
+                    name=f"{attr_name}[L{layer_idx},E{eid}->S{slot}]",
+                ))
+        return tasks
+
+    def _copy_quant_attrs_into_slot(self, layer, layer_idx, eid, slot):
+        """Copy one expert's quant attributes through the H2D transport."""
+        self._get_h2d_transport().copy_batch(
+            self._build_quant_attr_h2d_tasks(layer, layer_idx, eid, slot))
 
     def _apply_multi_card_substitution(
         self,
@@ -2183,29 +2197,68 @@ class ExpertOffloadManager:
             (hits if resident_map.get(slot) == eid else misses).append((slot, eid))
         return resident_map, hits, misses
 
-    def _load_expert_weights_into_slot(self, layer, layer_idx, eid, slot):
-        """H2D-copy one expert and all derived quant data into a device slot.
+    def _get_h2d_transport(self):
+        """Return the configured transport, lazily supplying the phase-1 default."""
+        transport = getattr(self, 'h2d_transport', None)
+        if transport is None:
+            transport = TorchCopyH2DTransport()
+            self.h2d_transport = transport
+        return transport
 
-        This is the shared format-aware path for single-card decode,
-        multi-card decode, and offline hot-expert preload.
-        """
-        _expert_weight(layer, "w13_weight").data.untyped_storage()[
-            slot * self.w13_expert_size_bytes:(slot + 1) * self.w13_expert_size_bytes
-        ].copy_(self._expert_src_storage(layer_idx, eid, 'w13'), non_blocking=True)
-        _expert_weight(layer, "w2_weight").data.untyped_storage()[
-            slot * self.w2_expert_size_bytes:(slot + 1) * self.w2_expert_size_bytes
-        ].copy_(self._expert_src_storage(layer_idx, eid, 'w2'), non_blocking=True)
-        self._copy_quant_attrs_into_slot(layer, layer_idx, eid, slot)
+    def _build_expert_h2d_tasks(self, layer, layer_idx, eid,
+                                slot) -> list[H2DCopyTask]:
+        """Build format-preserving weight and quant H2D tasks for one expert."""
+        w13_start = slot * self.w13_expert_size_bytes
+        w2_start = slot * self.w2_expert_size_bytes
+        w13_dst = _expert_weight(layer, "w13_weight").data.untyped_storage()[
+            w13_start:w13_start + self.w13_expert_size_bytes]
+        w2_dst = _expert_weight(layer, "w2_weight").data.untyped_storage()[
+            w2_start:w2_start + self.w2_expert_size_bytes]
+        tasks = [
+            H2DCopyTask(
+                source=self._expert_src_storage(layer_idx, eid, 'w13'),
+                destination=w13_dst,
+                nbytes=self.w13_expert_size_bytes,
+                name=f"w13[L{layer_idx},E{eid}->S{slot}]",
+            ),
+            H2DCopyTask(
+                source=self._expert_src_storage(layer_idx, eid, 'w2'),
+                destination=w2_dst,
+                nbytes=self.w2_expert_size_bytes,
+                name=f"w2[L{layer_idx},E{eid}->S{slot}]",
+            ),
+        ]
+        tasks.extend(
+            self._build_quant_attr_h2d_tasks(layer, layer_idx, eid, slot))
+        return tasks
+
+    @staticmethod
+    def _refresh_expert_fp32_scale(layer, slot):
         if hasattr(layer, 'w13_weight_scale_fp32'):
             layer.w13_weight_scale_fp32[slot].copy_(
                 layer.w13_weight_scale.data[slot].to(torch.float32))
+
+    def _load_expert_weights_into_slots(self, layer, layer_idx, loads):
+        """Batch H2D-copy ``(slot, eid)`` loads, then refresh derived data."""
+        loads = list(loads)
+        tasks = []
+        for slot, eid in loads:
+            tasks.extend(
+                self._build_expert_h2d_tasks(layer, layer_idx, eid, slot))
+        self._get_h2d_transport().copy_batch(tasks)
+        for slot, _ in loads:
+            self._refresh_expert_fp32_scale(layer, slot)
+
+    def _load_expert_weights_into_slot(self, layer, layer_idx, eid, slot):
+        """Compatibility wrapper for loading one expert into one device slot."""
+        self._load_expert_weights_into_slots(layer, layer_idx, [(slot, eid)])
 
     def _h2d_load_mc_misses(self, layer, layer_idx, misses, resident_map):
         """H2D-load missed experts (w13/w2 + quant attrs) into their slots on
         load_stream, then synchronize to gate the compute stream."""
         with torch_npu.npu.stream(self.load_stream):
+            self._load_expert_weights_into_slots(layer, layer_idx, misses)
             for slot, eid in misses:
-                self._load_expert_weights_into_slot(layer, layer_idx, eid, slot)
                 resident_map[slot] = eid
             self.load_stream.synchronize()
 
@@ -2362,8 +2415,8 @@ class ExpertOffloadManager:
                                 flag,layer_idx, len(need_to_load), len(reusable_slots),
                                 sorted(need_to_load)[:20])
 
-            dev = _expert_weight(layer, "w13_weight").device
             n_copies = 0
+            planned_loads = []
             for eid in need_to_load:
                 if self.cache_policy is not None:
                     victim = self.cache_policy.choose_victim(
@@ -2388,7 +2441,7 @@ class ExpertOffloadManager:
                             sorted(list(need_to_load))[n_copies:][:20])
                     break  # no free slots — should not happen in normal usage
                 
-                self._load_expert_weights_into_slot(layer, layer_idx, eid, slot)
+                planned_loads.append((slot, eid))
                 # Update mapping
                 if victim is None:
                     victim = slot_owner[slot]
@@ -2401,6 +2454,8 @@ class ExpertOffloadManager:
                     reusable_slots.remove(slot)
                 n_copies += 1
 
+            self._load_expert_weights_into_slots(
+                layer, layer_idx, planned_loads)
             self.load_stream.synchronize()
 
     def _preload_hot_experts(self):

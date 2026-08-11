@@ -12,6 +12,7 @@ from vllm_ascend.expert_offload.expert_offload_manager import (
     _expert_weight,
     _stable_int_checksum,
 )
+from vllm_ascend.expert_offload.h2d_transfer import H2DCopyTask
 
 
 def _manager_for_prediction(next_layer, gate_weight, *, topk=2,
@@ -539,7 +540,9 @@ def test_shared_expert_copy_is_non_blocking_and_refreshes_quant_scale():
     manager.w2_expert_size_bytes = 2
     manager._expert_src_storage = MagicMock(
         side_effect=["w13-source", "w2-source"])
-    manager._copy_quant_attrs_into_slot = MagicMock()
+    manager.scale_cpu_buffers = {}
+    manager.offset_cpu_buffers = {}
+    manager.scale_bias_cpu_buffers = {}
     layer = SimpleNamespace(
         w13_weight=Weight(),
         w2_weight=Weight(),
@@ -553,9 +556,102 @@ def test_shared_expert_copy_is_non_blocking_and_refreshes_quant_scale():
         (slice(4, 8), "w13-source", True)]
     assert layer.w2_weight.storage.copies == [
         (slice(2, 4), "w2-source", True)]
-    manager._copy_quant_attrs_into_slot.assert_called_once_with(
-        layer, 0, 7, 1)
     assert layer.w13_weight_scale_fp32[1] == 2.5
+
+
+def test_expert_load_combines_multiple_experts_into_one_transport_batch():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.h2d_transport = MagicMock()
+    first_task = H2DCopyTask(object(), object(), 4, name="first")
+    second_task = H2DCopyTask(object(), object(), 8, name="second")
+    manager._build_expert_h2d_tasks = MagicMock(
+        side_effect=[[first_task], [second_task]])
+    manager._refresh_expert_fp32_scale = MagicMock()
+    layer = object()
+
+    manager._load_expert_weights_into_slots(
+        layer, 3, [(1, 7), (2, 9)])
+
+    manager.h2d_transport.copy_batch.assert_called_once_with(
+        [first_task, second_task])
+    assert manager._build_expert_h2d_tasks.call_args_list == [
+        call(layer, 3, 7, 1),
+        call(layer, 3, 9, 2),
+    ]
+    assert manager._refresh_expert_fp32_scale.call_args_list == [
+        call(layer, 1),
+        call(layer, 2),
+    ]
+
+
+def test_quant_attributes_are_represented_as_h2d_tasks():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({"shard_per_rank": False})
+    source = torch.tensor([1.25, 2.5], dtype=torch.float32)
+    manager.scale_cpu_buffers = {"w13_weight_scale": [[source]]}
+    manager.offset_cpu_buffers = {}
+    manager.scale_bias_cpu_buffers = {}
+    destination = torch.zeros((1, 2), dtype=torch.float32)
+    layer = SimpleNamespace(w13_weight_scale=destination)
+
+    tasks = manager._build_quant_attr_h2d_tasks(layer, 0, 0, 0)
+
+    assert len(tasks) == 1
+    assert tasks[0].source.data_ptr() == source.data_ptr()
+    assert tasks[0].destination.data_ptr() == destination[0].data_ptr()
+    assert tasks[0].nbytes == source.numel() * source.element_size()
+    assert tasks[0].non_blocking is True
+
+
+def test_single_card_update_submits_misses_as_one_batch():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig()
+    manager.topk = 1
+    manager._debug = False
+    manager.cache_policy = None
+    manager.load_stream = MagicMock()
+    manager._load_expert_weights_into_slots = MagicMock()
+    topk_ids_h = torch.tensor([[1]], dtype=torch.int32)
+    log2phy_h = torch.tensor([0, -1], dtype=torch.int32)
+    layer = SimpleNamespace()
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
+        return_value=nullcontext(),
+    ):
+        manager._update_weights((
+            topk_ids_h,
+            log2phy_h.numpy(),
+            layer,
+            0,
+            None,
+            False,
+        ))
+
+    manager._load_expert_weights_into_slots.assert_called_once_with(
+        layer, 0, [(0, 1)])
+    assert log2phy_h.tolist() == [-1, 0]
+    manager.load_stream.synchronize.assert_called_once_with()
+
+
+def test_multi_card_misses_submit_one_batch_before_resident_commit():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.load_stream = MagicMock()
+    manager._load_expert_weights_into_slots = MagicMock()
+    layer = object()
+    misses = [(0, 4), (1, 7)]
+    resident_map = {}
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
+        return_value=nullcontext(),
+    ):
+        manager._h2d_load_mc_misses(layer, 3, misses, resident_map)
+
+    manager._load_expert_weights_into_slots.assert_called_once_with(
+        layer, 3, misses)
+    assert resident_map == {0: 4, 1: 7}
+    manager.load_stream.synchronize.assert_called_once_with()
 
 
 def test_single_card_hot_preload_uses_format_aware_shared_copy(tmp_path):
