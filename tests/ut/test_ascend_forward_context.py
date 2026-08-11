@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -241,6 +242,114 @@ def test_select_moe_comm_method_uses_allgather_without_effective_expert_parallel
     vllm_config = _make_vllm_config(enable_expert_parallel=enable_expert_parallel)
 
     assert afc.select_moe_comm_method(16, vllm_config) == MoECommType.ALLGATHER
+
+
+@pytest.mark.parametrize(
+    ("hf_config", "num_tokens", "expected"),
+    [
+        (SimpleNamespace(num_experts_per_tok=2), 2, MoECommType.MC2),
+        (SimpleNamespace(num_experts_per_tok=2), 3, MoECommType.ALLTOALL),
+        (
+            SimpleNamespace(
+                text_config=SimpleNamespace(num_experts_per_token=4)),
+            1,
+            MoECommType.MC2,
+        ),
+        (
+            SimpleNamespace(
+                text_config=SimpleNamespace(num_experts_per_token=4)),
+            2,
+            MoECommType.ALLTOALL,
+        ),
+    ],
+)
+def test_multi_card_offload_capacity_supports_deepseek_and_kimi_k3(
+    monkeypatch,
+    hf_config,
+    num_tokens,
+    expected,
+):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A3,
+        capacity=128,
+        ep_world_size=2,
+    )
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(
+            expert_offload_config=SimpleNamespace(
+                expert_offload=True,
+                enable_multi_card=True,
+                moe_offload_debug=True,
+                shard_per_rank=False,
+                num_device_experts_list=[8, 16],
+                num_device_experts_for_rank=lambda _layer, ep_size: 8 // ep_size,
+            ),
+        ),
+    )
+    vllm_config = _make_vllm_config()
+    vllm_config.model_config.hf_config = hf_config
+
+    assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
+
+
+@pytest.mark.parametrize(
+    ("shard_per_rank", "num_tokens", "expected"),
+    [
+        (True, 1, MoECommType.MC2),
+        (True, 2, MoECommType.MC2),
+        (True, 3, MoECommType.ALLTOALL),
+        (False, 2, MoECommType.MC2),
+        (False, 3, MoECommType.MC2),
+        (False, 5, MoECommType.ALLTOALL),
+    ],
+)
+def test_multi_card_offload_admission_uses_owner_capacity_when_sharded(
+    monkeypatch,
+    shard_per_rank,
+    num_tokens,
+    expected,
+):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A3,
+        capacity=128,
+        ep_world_size=2,
+    )
+    offload_config = SimpleNamespace(
+        expert_offload=True,
+        enable_multi_card=True,
+        moe_offload_debug=True,
+        shard_per_rank=shard_per_rank,
+        num_device_experts_list=[8],
+        num_device_experts_for_rank=lambda _layer, ep_size: 8 // ep_size,
+    )
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(expert_offload_config=offload_config),
+    )
+    vllm_config = _make_vllm_config()
+    vllm_config.model_config.hf_config = SimpleNamespace(
+        num_experts_per_tok=2)
+
+    with patch.object(afc.logger, "info") as log_info:
+        selected = afc.select_moe_comm_method(num_tokens, vllm_config)
+
+    assert selected == expected
+    admission = next(
+        call for call in log_info.call_args_list
+        if call.args[0].startswith("[MC_ADMISSION]"))
+    assert admission.args[1] == (
+        "sharded" if shard_per_rank else "replicated")
+    assert admission.args[2:9] == (
+        num_tokens, 2, 2, 8, 4 if shard_per_rank else 8,
+        num_tokens * 2, 128)
+    assert admission.args[10] == expected.name
+    assert admission.args[11] == (
+        "fits" if expected == MoECommType.MC2 else "expert_slots")
 
 
 @pytest.mark.parametrize(

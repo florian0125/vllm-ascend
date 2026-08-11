@@ -23,6 +23,7 @@ from vllm.config import KVTransferConfig, VllmConfig
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import (
     AscendConfig,
+    ExpertOffloadConfig,
     SchedulerConfig,
     ShortRequestFirstConfig,
     clear_ascend_config,
@@ -510,6 +511,61 @@ class TestAscendConfig(TestBase):
         second_ascend_config = init_ascend_config(second_vllm_config)
         self.assertIsNot(first_ascend_config, second_ascend_config)
         self.assertTrue(second_ascend_config.ascend_compilation_config.enable_npugraph_ex)
+
+
+class TestExpertOffloadConfig(TestBase):
+    def test_expert_substitution_defaults_and_override(self):
+        default = ExpertOffloadConfig({})
+        enabled = ExpertOffloadConfig({
+            "expert_substitution_enabled": True,
+            "expert_substitution_threshold": 0.1,
+        })
+
+        self.assertFalse(default.expert_substitution_enabled)
+        self.assertEqual(default.expert_substitution_threshold, 0.25)
+        self.assertTrue(enabled.expert_substitution_enabled)
+        self.assertEqual(enabled.expert_substitution_threshold, 0.1)
+
+    def test_expert_substitution_config_validation(self):
+        with self.assertRaisesRegex(TypeError, "must be a boolean"):
+            ExpertOffloadConfig({"expert_substitution_enabled": 1})
+        with self.assertRaisesRegex(ValueError, "must be >= 0"):
+            ExpertOffloadConfig({"expert_substitution_threshold": -0.1})
+
+    def test_scalar_and_single_element_capacity_broadcast(self):
+        scalar = ExpertOffloadConfig({"num_device_experts": 32})
+        single = ExpertOffloadConfig({"num_device_experts": [48]})
+
+        self.assertEqual(scalar.num_device_experts_for_layer(9), 32)
+        self.assertEqual(single.num_device_experts_for_layer(9), 48)
+        self.assertEqual(single.num_device_experts_for_rank(9, ep_size=4), 12)
+
+    def test_per_layer_capacity_supports_single_and_multi_card(self):
+        config = ExpertOffloadConfig(
+            {"num_device_experts": [32, 48, 64]})
+
+        self.assertEqual(config.num_device_experts_for_rank(0), 32)
+        self.assertEqual(config.num_device_experts_for_rank(1, ep_size=2), 24)
+        self.assertEqual(config.num_device_experts_for_rank(2, ep_size=8), 8)
+
+    def test_multi_card_capacity_must_divide_ep_size(self):
+        config = ExpertOffloadConfig({"num_device_experts": [32, 34]})
+
+        with self.assertRaisesRegex(ValueError, "divisible by EP size"):
+            config.num_device_experts_for_rank(1, ep_size=4)
+
+    def test_mtp_capacity_may_extend_beyond_registered_target_layers(self):
+        config = ExpertOffloadConfig(
+            {"num_device_experts": [32, 32, 32, 16]})
+
+        config.validate_num_moe_layers(3)
+        self.assertEqual(config.num_device_experts_for_layer(3), 16)
+
+    def test_capacity_list_must_cover_registered_target_layers(self):
+        config = ExpertOffloadConfig({"num_device_experts": [32, 32]})
+
+        with self.assertRaisesRegex(ValueError, "at least.*3"):
+            config.validate_num_moe_layers(3)
 
 
 class TestShortRequestFirstConfig(TestBase):

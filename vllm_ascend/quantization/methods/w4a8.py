@@ -575,12 +575,30 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             mgr = ExpertOffloadManager.get_instance()
             is_mc = getattr(layer, 'enable_multi_card', False)
             if is_mc:
-                mgr.update_weights_multi_card(layer, topk_ids, log2phy,
-                                              topk_weights, hidden_states=x,
-                                              mc2_mask=mc2_mask)
+                mgr.update_weights_multi_card(
+                    layer, topk_ids, log2phy, topk_weights,
+                    hidden_states=x, mc2_mask=mc2_mask,
+                    router_logits=router_logits,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias,
+                    routed_scaling_factor=routed_scaling_factor,
+                    is_hash_routed=tid2eid is not None,
+                )
             else:
-                mgr.update_weights(layer, topk_ids, log2phy, topk_weights,
-                                   hidden_states=x)
+                mgr.update_weights(
+                    layer,
+                    topk_ids,
+                    log2phy,
+                    topk_weights,
+                    hidden_states=x,
+                    router_logits=router_logits,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    e_score_correction_bias=e_score_correction_bias,
+                    routed_scaling_factor=routed_scaling_factor,
+                    is_hash_routed=tid2eid is not None,
+                )
             # Prefill regime: num_tokens > offload_threshold.
             #  - single-card: pool holds all experts, identity log2phy.
             #  - multi-card:  pool holds this rank's EP shard (loaded by
@@ -716,6 +734,13 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                 w2_scale_bias=w2_scale_bias,
                 is_per_channel_weight=self.is_per_channel_weight,
                 swiglu_limit=layer.swiglu_limit,
+                # Device-resident expert count for this layer. The auto-derivation
+                # in build_fused_experts_input misreads the single-tensor-in-list
+                # wrapping of the else branch above (len([w]) == 1), which sizes
+                # the dispatcher's group_list to 1 while the weight dim0 is the
+                # real slot count (e.g. 32 for expert offload). moe_config carries
+                # the correct value, including the prefill-pool overrides above.
+                num_local_experts=layer.moe_config.num_local_experts,
             )
         )
         # Trigger next-layer expert prefetch AFTER GMM kernel submission
