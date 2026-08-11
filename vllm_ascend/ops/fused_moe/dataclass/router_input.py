@@ -37,3 +37,4 @@ class MoeRouterInput:
     apply_router_weight_on_input: bool
     log2phy: torch.Tensor | None = None
     pertoken_scale: torch.Tensor | None = None
+    num_local_experts: int = 0

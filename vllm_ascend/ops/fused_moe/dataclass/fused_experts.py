@@ -100,8 +100,12 @@ def build_fused_experts_input(
     w2_scale_bias: list[torch.Tensor] | torch.Tensor | None = None,
     w1_offset: torch.Tensor | None = None,
     w2_offset: torch.Tensor | None = None,
+    num_local_experts: int | None = None,
     lora_context=None,
 ) -> MoEFusedExpertsInput:
+    if num_local_experts is None:
+        num_local_experts = (layer.moe_config.num_local_experts if layer is not None
+                             else len(w1) if isinstance(w1, (list, tuple)) else w1.shape[0])
     return MoEFusedExpertsInput(
         hidden_states=hidden_states,
         topk_weights=topk_weights,
@@ -125,6 +129,7 @@ def build_fused_experts_input(
             mc2_mask=mc2_mask,
             apply_router_weight_on_input=apply_router_weight_on_input,
             pertoken_scale=pertoken_scale,
+            num_local_experts=num_local_experts,
         ),
         activation=activation,
         need_trans=need_trans,

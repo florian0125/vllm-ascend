@@ -9,7 +9,10 @@ import numpy as np
 
 @dataclass
 class LRCLayerState:
-    recent_queue: deque[tuple[int, ...]] = field(default_factory=deque)
+    # Sparse ``(expert_id, route_count)`` snapshots.  ``observe`` stores one
+    # snapshot per token while ``observe_global_counts`` stores one per global
+    # decode step, without expanding counts into repeated expert ids.
+    recent_queue: deque[tuple[tuple[int, int], ...]] = field(default_factory=deque)
     freq: list[int] = field(default_factory=list)
     # Only `ema` is vectorized (full-array C-level decay), so it is a numpy
     # array. freq / router_score / last_used stay Python lists: their hot-path
@@ -112,10 +115,12 @@ class LRCExpertCachePolicy:
             state.ema *= self.ema_beta
             state.ema[np.array(experts, dtype=np.intp)] += self._one_minus_beta
 
-            state.recent_queue.append(experts)
+            counts: dict[int, int] = {}
             for eid in experts:
+                counts[eid] = counts.get(eid, 0) + 1
                 state.freq[eid] += 1
                 state.last_used[eid] = state.step
+            state.recent_queue.append(tuple(counts.items()))
 
             if router_scores is not None:
                 score_row = score_rows[row_index]
@@ -123,11 +128,58 @@ class LRCExpertCachePolicy:
                     state.router_score[eid] = float(score)
 
             while len(state.recent_queue) > self.recent_window:
-                old_experts = state.recent_queue.popleft()
-                for old_eid in old_experts:
-                    state.freq[old_eid] -= 1
+                old_counts = state.recent_queue.popleft()
+                for old_eid, old_count in old_counts:
+                    state.freq[old_eid] -= old_count
 
         return unique
+
+    def observe_global_counts(
+        self,
+        layer_idx: int,
+        global_counts,
+        global_router_score=None,
+    ) -> set[int]:
+        """Update one layer from globally aggregated decode statistics.
+
+        ``global_counts[e]`` is the number of routes to expert ``e`` in this
+        decode step.  The sparse recent-window entry preserves those real
+        frequencies without materializing repeated ids.  Router scores, when
+        supplied, are expected to be the global mean score per active expert.
+        """
+        counts = np.asarray(global_counts, dtype=np.int64)
+        if counts.ndim != 1 or counts.size != self.num_experts:
+            raise ValueError(
+                f"global_counts must have shape ({self.num_experts},)")
+        if np.any(counts < 0):
+            raise ValueError("global_counts must be non-negative")
+
+        scores = None
+        if global_router_score is not None:
+            scores = np.asarray(global_router_score, dtype=np.float32)
+            if scores.shape != counts.shape:
+                raise ValueError(
+                    f"global_router_score must have shape ({self.num_experts},)")
+
+        state = self.layer_states[layer_idx]
+        state.step += 1
+        state.ema *= self.ema_beta
+        state.ema += counts.astype(np.float32) * self._one_minus_beta
+
+        active = np.flatnonzero(counts)
+        snapshot = tuple((int(eid), int(counts[eid])) for eid in active)
+        state.recent_queue.append(snapshot)
+        for eid, count in snapshot:
+            state.freq[eid] += count
+            state.last_used[eid] = state.step
+            if scores is not None:
+                state.router_score[eid] = float(scores[eid])
+
+        while len(state.recent_queue) > self.recent_window:
+            old_counts = state.recent_queue.popleft()
+            for old_eid, old_count in old_counts:
+                state.freq[old_eid] -= old_count
+        return {eid for eid, _count in snapshot}
 
     def choose_victim(
         self,
@@ -172,6 +224,33 @@ class LRCExpertCachePolicy:
             + self.router_weight * np.asarray(state.router_score, dtype=np.float32)
             - self.age_weight * age
         )
+
+    def seed_layer_hotness(self, layer_idx: int,
+                           weights: dict[int, float]) -> None:
+        """Seed per-layer hotness from offline stats (decode resident preload).
+
+        Freshly preloaded hot experts must survive early choose_victim() calls
+        before runtime observe() builds up real statistics; without seeding
+        they read hotness≈0 and get evicted first, undoing the preload.
+
+        Offline weights are softmax router scores (~1e-2), far smaller than the
+        freq term (recent_weight*freq, ~1 per hit) that dominates hotness, so
+        writing them into ema/router_score yields hotness ~1e-2 — still evicted
+        first against any runtime-hit expert (freq>=1). We therefore min-max
+        normalize each layer's weights into [1, recent_window] and write that
+        into freq (the dominant term), keeping the raw weight in router_score.
+        This makes a preloaded hot expert's initial hotness comparable to (or
+        above) a runtime-hit expert, preventing early eviction.
+        """
+        state = self.layer_states[layer_idx]
+        if not weights:
+            return
+        w_max = max(weights.values()) or 1.0
+        for eid, w in weights.items():
+            norm = (w / w_max) if w_max > 0 else 0.0
+            state.freq[eid] = max(1, round(norm * self.recent_window))
+            state.router_score[eid] = float(w)
+            state.last_used[eid] = state.step    # zero age penalty
 
     def layer_step(self, layer_idx: int) -> int:
         return self.layer_states[layer_idx].step

@@ -58,6 +58,7 @@ def _run_apply(
     *,
     num_tokens: int,
     mc2_mask: torch.Tensor | None = None,
+    tid2eid: torch.Tensor | None = None,
     build_side_effect=None,
 ):
     x = torch.randn(num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16)
@@ -102,6 +103,7 @@ def _run_apply(
             enable_force_load_balance=False,
             log2phy=log2phy,
             mc2_mask=mc2_mask,
+            tid2eid=tid2eid,
         )
 
     assert output is expected_output
@@ -133,6 +135,12 @@ def test_single_card_decode_updates_weights_and_prefetches_after_gmm():
     assert update_call.args[2] is result.log2phy
     assert update_call.args[3] is result.topk_weights
     assert update_call.kwargs["hidden_states"] is result.x
+    assert update_call.kwargs["router_logits"].shape == (2, NUM_EXPERTS)
+    assert update_call.kwargs["renormalize"] is True
+    assert update_call.kwargs["scoring_func"] == "softmax"
+    assert update_call.kwargs["e_score_correction_bias"] is None
+    assert update_call.kwargs["routed_scaling_factor"] == 1.0
+    assert update_call.kwargs["is_hash_routed"] is False
     manager.update_weights_multi_card.assert_not_called()
     manager.trigger_next_layer_prefetch.assert_called_once_with(layer, result.x)
     assert [call[0] for call in call_order.method_calls] == ["fused_experts", "prefetch"]
@@ -169,8 +177,57 @@ def test_multi_card_decode_uses_multi_card_weight_update():
     assert update_call.args[3] is result.topk_weights
     assert update_call.kwargs["hidden_states"] is result.x
     assert update_call.kwargs["mc2_mask"] is mc2_mask
+    assert update_call.kwargs["router_logits"].shape == (2, NUM_EXPERTS)
+    assert update_call.kwargs["renormalize"] is True
+    assert update_call.kwargs["scoring_func"] == "softmax"
+    assert update_call.kwargs["e_score_correction_bias"] is None
+    assert update_call.kwargs["routed_scaling_factor"] == 1.0
+    assert update_call.kwargs["is_hash_routed"] is False
     manager.trigger_next_layer_prefetch.assert_called_once_with(layer, result.x)
     assert result.build_input.call_args.kwargs["log2phy"] is result.log2phy
+
+
+def test_multi_card_hash_routed_layer_disables_substitution():
+    method = _make_method()
+    layer = _make_layer(multi_card=True)
+    manager = _make_manager(layer)
+    comm_method = Mock(token_dispatcher=SimpleNamespace(
+        num_experts_local=4))
+    tid2eid = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+
+    _run_apply(
+        method,
+        layer,
+        manager,
+        comm_method,
+        MoECommType.MC2,
+        num_tokens=2,
+        tid2eid=tid2eid,
+    )
+
+    assert manager.update_weights_multi_card.call_args.kwargs[
+        "is_hash_routed"] is True
+
+
+def test_hash_routed_layer_disables_substitution_without_layer_index_hardcode():
+    method = _make_method()
+    layer = _make_layer(multi_card=False)
+    manager = _make_manager(layer)
+    comm_method = Mock(token_dispatcher=SimpleNamespace(
+        num_experts_local=4))
+    tid2eid = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+
+    _run_apply(
+        method,
+        layer,
+        manager,
+        comm_method,
+        MoECommType.MC2,
+        num_tokens=2,
+        tid2eid=tid2eid,
+    )
+
+    assert manager.update_weights.call_args.kwargs["is_hash_routed"] is True
 
 
 def test_single_card_prefill_uses_full_expert_pool_and_restores_counts():

@@ -39,16 +39,23 @@ def _prefill_view(layer, mgr, slot):
     return view
 
 
-def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids):
+def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router_logits):
     mgr = ExpertOffloadManager.get_instance()
     comm = _EXTRA_CTX.moe_comm_method
     num_tokens = topk_ids.size(0)
+    router = layer.router
+    routing = dict(router_logits=router_logits,
+                   renormalize=getattr(router, "renormalize", True),
+                   scoring_func=getattr(router, "scoring_func", "softmax"),
+                   e_score_correction_bias=getattr(router, "e_score_correction_bias", None),
+                   routed_scaling_factor=getattr(router, "routed_scaling_factor", 1.0),
+                   is_hash_routed=layer.tid2eid is not None)
     if layer.enable_multi_card:
         mgr.update_weights_multi_card(layer, topk_ids, layer.log2phy, topk_weights,
-                                      hidden_states=hidden_states, mc2_mask=layer.ascend_mc2_mask)
+                                      hidden_states=hidden_states, mc2_mask=layer.ascend_mc2_mask, **routing)
         prefill_regime = _EXTRA_CTX.moe_comm_type != MoECommType.MC2
     else:
-        mgr.update_weights(layer, topk_ids, layer.log2phy, topk_weights, hidden_states=hidden_states)
+        mgr.update_weights(layer, topk_ids, layer.log2phy, topk_weights, hidden_states=hidden_states, **routing)
         prefill_regime = num_tokens > mgr.offload_threshold
     use_prefill = prefill_regime and mgr._prefill_initialized and (layer.enable_multi_card or not mgr._skip_prefill)
     dispatcher = comm.token_dispatcher

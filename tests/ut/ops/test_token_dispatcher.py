@@ -1112,3 +1112,30 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
             )
 
         assert mock_routing.call_args.kwargs["quant_mode"] == -1
+
+
+def test_allgather_token_dispatch_uses_per_layer_expert_capacity():
+    dispatcher = TokenDispatcherWithAllGather(
+        top_k=2, num_experts=128, num_local_experts=99)
+    token_dispatch_input = build_token_dispatch_input_fixture(
+        hidden_states=torch.randn(2, 8),
+        topk_weights=torch.tensor([[0.7, 0.3], [0.6, 0.4]]),
+        topk_ids=torch.tensor([[0, 1], [1, 2]], dtype=torch.int32),
+        num_local_experts=6,
+    )
+    init_routing_output = (
+        torch.randn(4, 8),
+        torch.arange(4, dtype=torch.int32),
+        torch.ones(6, dtype=torch.int32),
+        None,
+    )
+
+    with patch(
+        "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_init_routing",
+        return_value=init_routing_output,
+    ) as mock_init_routing:
+        dispatcher.token_dispatch(token_dispatch_input)
+
+    init_kwargs = mock_init_routing.call_args.kwargs
+    assert init_kwargs["expert_num"] == 6
+    assert init_kwargs["active_expert_range"] == [0, 6]

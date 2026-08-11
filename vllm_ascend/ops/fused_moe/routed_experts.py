@@ -432,7 +432,14 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         )
 
         cfg = get_ascend_config().expert_offload_config
-        self.enable_expert_offload, expert_map = init_expert_offload_config(cfg, self.moe_config.num_logical_experts)
+        self.enable_expert_offload = False
+        self.enable_multi_card = False
+        if "mtp" in self.layer_name.split(".") or self.quant_type == QuantType.NONE:
+            return
+        mgr = ExpertOffloadManager.get_instance() if cfg.expert_offload else None
+        layer_idx = len(mgr.moe_layers) if mgr is not None else 0
+        self.enable_expert_offload, expert_map, capacity = init_expert_offload_config(
+            cfg, self.moe_config.num_logical_experts, layer_idx)
         self.enable_expert_offload = self.enable_expert_offload and self.quant_type != QuantType.NONE
         self.enable_multi_card = False
         if not self.enable_expert_offload:
@@ -443,14 +450,14 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         self.offload_layer_idx = len(mgr.moe_layers)
         self.global_num_experts = self.moe_config.num_logical_experts
         self.enable_multi_card = cfg.enable_multi_card and self.moe_config.ep_size > 1
-        slots = cfg.num_device_experts
+        slots = capacity
         if self.enable_multi_card:
             if slots % self.moe_config.ep_size:
                 raise ValueError("num_device_experts must be divisible by the expert parallel size")
             slots //= self.moe_config.ep_size
             self.log2phy = init_log2phy_for_offload_multi_card(
                 self.global_num_experts, slots, self.moe_config.ep_size, self.ep_rank)
-            self.ascend_expert_map = torch.arange(cfg.num_device_experts, dtype=torch.int32)
+            self.ascend_expert_map = torch.arange(capacity, dtype=torch.int32)
         else:
             self.log2phy = init_log2phy_for_offload(self.global_num_experts, slots)
             self.ascend_expert_map = expert_map
@@ -485,7 +492,8 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         # fills the device weight with experts [0, ndev); num_device_experts is
         # the TOTAL slot count, so divide by ep_size. ep_size=1 (single-card) is
         # a no-op. CPU buffer still gets ALL experts (loaded above this guard).
-        ndev = mgr.num_device_experts // mgr.ep_size
+        ndev = mgr.offload_config.num_device_experts_for_rank(
+            layer_moe_idx, mgr.ep_size if self.enable_multi_card else 1)
 
         def _offload_weight_loader(param, loaded_weight, weight_name, shard_id,
                                    expert_id, **kwargs):
@@ -807,7 +815,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             if self.enable_expert_offload:
                 from vllm_ascend.expert_offload.routed_experts import apply_offloaded_experts
 
-                fused_experts_results = apply_offloaded_experts(self, hidden_states, topk_weights, topk_ids)
+                fused_experts_results = apply_offloaded_experts(self, hidden_states, topk_weights, topk_ids, router_logits)
             else:
                 fused_experts_results: FusedExpertsResult = self.quant_method.apply(
                     layer=self,
