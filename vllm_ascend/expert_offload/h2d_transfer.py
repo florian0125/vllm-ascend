@@ -34,6 +34,16 @@ class H2DCopyTask:
             raise ValueError(f"H2D copy size must be positive; got {self.nbytes}")
 
 
+@dataclass(frozen=True)
+class HostPointerSource:
+    """Pointer-only view of a peer rank's MemFabric SHARED allocation."""
+
+    pointer: int
+
+    def data_ptr(self) -> int:
+        return self.pointer
+
+
 class ExpertH2DTransport(Protocol):
     """Backend contract for a batch of expert H2D copies."""
 
@@ -56,6 +66,8 @@ class ExpertH2DTransport(Protocol):
 
 class TorchCopyH2DTransport:
     """Existing expert-offload H2D behavior implemented with ``copy_``."""
+
+    supports_remote_sources = False
 
     def allocate_host_tensor(self, shape, dtype) -> torch.Tensor:
         return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
@@ -82,6 +94,8 @@ class MemFabricLocalH2DTransport:
     calls ``synchronize`` on that same stream, preserving graph host-callback
     ordering without a device-wide synchronization.
     """
+
+    supports_remote_sources = False
 
     def __init__(
         self,
@@ -198,16 +212,91 @@ class MemFabricLocalH2DTransport:
         atexit.unregister(self.close)
 
 
+class MemFabricSharedH2DTransport(MemFabricLocalH2DTransport):
+    """Multi-card SHARED DRAM backend with one contribution per EP rank."""
+
+    supports_remote_sources = True
+
+    def __init__(
+        self,
+        device_id: int,
+        pool_size_gib: int,
+        world_size: int,
+        rank_id: int,
+        log_level: int = 3,
+        *,
+        mf_module=None,
+        offload_module=None,
+    ) -> None:
+        if world_size <= 1:
+            raise ValueError(
+                "MemFabric SHARED world_size must be greater than one")
+        if not 0 <= rank_id < world_size:
+            raise ValueError(
+                f"Invalid MemFabric SHARED rank: {rank_id}/{world_size}")
+        if pool_size_gib <= 0:
+            raise ValueError(
+                "MemFabric pool size must be positive; "
+                f"got {pool_size_gib} GiB")
+        if mf_module is None or offload_module is None:
+            try:
+                import memfabric_hybrid as mf
+                from memfabric_hybrid import offload
+            except ImportError as exc:
+                raise RuntimeError(
+                    "h2d_backend='memfabric' requires memfabric_hybrid; "
+                    "install it and source the MemFabric environment first"
+                ) from exc
+            mf_module = mf
+            offload_module = offload
+
+        self.device_id = device_id
+        self.device = torch.device(f"npu:{device_id}")
+        self._offload = offload_module
+        self._closed = False
+        self._inflight_descriptors = []
+        self._descriptor_lock = threading.Lock()
+        self.world_size = world_size
+        self.rank_id = rank_id
+
+        mf_module.set_log_level(log_level)
+        config = offload_module.OffloadConfig()
+        config.device_id = device_id
+        config.reserve_size = pool_size_gib * ONE_GIB
+        config.alloc_size = config.reserve_size
+        config.world_size = world_size
+        config.rank_id = rank_id
+        config.scene = offload_module.Scene.SHARED
+        ret = offload_module.initialize(config)
+        if ret != 0:
+            raise RuntimeError(
+                "MemFabric SHARED initialization failed: "
+                f"device={device_id}, rank={rank_id}/{world_size}, "
+                f"pool_size_gib={pool_size_gib}, ret={ret}")
+        atexit.register(self.close)
+
+
 def create_h2d_transport(
     backend: str,
     *,
     device_id: int,
     memfabric_pool_size_gib: int,
     memfabric_log_level: int,
+    enable_multi_card: bool = False,
+    world_size: int = 1,
+    rank_id: int = 0,
 ) -> ExpertH2DTransport:
     if backend == "torch":
         return TorchCopyH2DTransport()
     if backend == "memfabric":
+        if enable_multi_card:
+            return MemFabricSharedH2DTransport(
+                device_id=device_id,
+                pool_size_gib=memfabric_pool_size_gib,
+                world_size=world_size,
+                rank_id=rank_id,
+                log_level=memfabric_log_level,
+            )
         return MemFabricLocalH2DTransport(
             device_id=device_id,
             pool_size_gib=memfabric_pool_size_gib,

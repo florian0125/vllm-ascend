@@ -6,6 +6,7 @@ import pytest
 from vllm_ascend.expert_offload.h2d_transfer import (
     H2DCopyTask,
     MemFabricLocalH2DTransport,
+    MemFabricSharedH2DTransport,
     ONE_GIB,
     TorchCopyH2DTransport,
     create_h2d_transport,
@@ -107,6 +108,48 @@ def test_memfabric_transport_initializes_local_pool_and_allocates_from_it():
     assert config.alloc_size == 2 * ONE_GIB
     assert result is expected
     offload_module.empty.assert_called_once_with((4, 8), dtype="dtype")
+
+
+def test_memfabric_shared_transport_initializes_one_contribution_per_rank():
+    mf_module = MagicMock()
+    offload_module = MagicMock()
+    offload_module.OffloadConfig.side_effect = SimpleNamespace
+    offload_module.Scene.SHARED = "shared"
+    offload_module.initialize.return_value = 0
+    with (
+        patch(
+            "vllm_ascend.expert_offload.h2d_transfer.torch.device",
+            return_value="npu:fake",
+        ),
+        patch(
+            "vllm_ascend.expert_offload.h2d_transfer.atexit.register",
+        ),
+    ):
+        transport = MemFabricSharedH2DTransport(
+            device_id=2,
+            pool_size_gib=4,
+            world_size=8,
+            rank_id=2,
+            log_level=1,
+            mf_module=mf_module,
+            offload_module=offload_module,
+        )
+
+    config = offload_module.initialize.call_args.args[0]
+    assert config.device_id == 2
+    assert config.reserve_size == 4 * ONE_GIB
+    assert config.alloc_size == 4 * ONE_GIB
+    assert config.world_size == 8
+    assert config.rank_id == 2
+    assert config.scene == "shared"
+    assert transport.supports_remote_sources is True
+
+
+def test_memfabric_shared_transport_validates_rank_topology():
+    with pytest.raises(ValueError, match="world_size"):
+        MemFabricSharedH2DTransport(0, 1, 1, 0)
+    with pytest.raises(ValueError, match="Invalid.*rank"):
+        MemFabricSharedH2DTransport(0, 1, 4, 4)
 
 
 def test_memfabric_transport_pads_odd_sparse_copy_batch_and_retires_descriptors():

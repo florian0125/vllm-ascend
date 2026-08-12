@@ -968,10 +968,9 @@ class ExpertOffloadConfig:
         "hot_experts_file": "",
         "expert_substitution_enabled": False,
         "expert_substitution_threshold": 0.25,
-        # Expert weight H2D backend. ``torch`` preserves the existing pinned
-        # CPU + Tensor.copy_ path; ``memfabric`` uses MemFabric LOCAL DRAM and
-        # sparse_copy. Stage 2 supports MemFabric on one card only.
-        "h2d_backend": "torch", # Options: "torch", "memfabric"
+        # Expert weight H2D backend. MemFabric selects LOCAL for single-card
+        # and SHARED DRAM for multi-card expert offload.
+        "h2d_backend": "torch",  # Options: "torch", "memfabric"
         "memfabric_pool_size_gib": 0,
         "memfabric_log_level": 3,
     }
@@ -1151,10 +1150,10 @@ class ExpertOffloadConfig:
                 raise ValueError(
                     "memfabric_pool_size_gib must be > 0 when "
                     "h2d_backend='memfabric'")
-            if self.config["enable_multi_card"]:
+            if (self.config["enable_multi_card"]
+                    and not self.config["shard_per_rank"]):
                 raise ValueError(
-                    "h2d_backend='memfabric' currently supports single-card "
-                    "expert offload only; enable_multi_card must be False")
+                    "multi-card MemFabric requires shard_per_rank=True")
         if not isinstance(self.config["expert_substitution_enabled"], bool):
             raise TypeError("expert_substitution_enabled must be a boolean")
         if not isinstance(self.config["expert_substitution_threshold"],

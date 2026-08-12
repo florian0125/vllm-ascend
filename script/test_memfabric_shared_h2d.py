@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Smoke-test multi-card MoE expert-weight H2D from MemFabric shared DRAM.
 
-Rank 0 owns the MemFabric-backed w13/w2 host weights.  Their global addresses
-are broadcast to every rank, then each NPU pulls the same discontiguous expert
-buffers into rank-local device slots with ``offload.sparse_copy``.
+Every rank contributes a MemFabric-backed expert shard. The ranks exchange
+their SHARED GVA pointers once, then every NPU pulls another rank's
+discontiguous w13/w2 buffers with ``offload.sparse_copy``.
 
 Run on one Ascend node after sourcing the CANN and MemFabric environments:
 
@@ -69,6 +69,8 @@ def main() -> int:
     rank, local_rank, world_size = _rank_env()
     if world_size < 2:
         raise ValueError("shared DRAM test requires at least two ranks")
+    if args.num_experts % world_size != 0:
+        raise ValueError("num-experts must be divisible by world size")
 
     mf, offload = _import_npu_dependencies()
     mf.set_log_level(args.log_level)
@@ -77,7 +79,7 @@ def main() -> int:
     config = offload.OffloadConfig()
     config.device_id = local_rank
     config.reserve_size = args.reserve_gib * ONE_GIB
-    config.alloc_size = config.reserve_size if rank == 0 else 0
+    config.alloc_size = config.reserve_size
     config.world_size = world_size
     config.rank_id = rank
     config.scene = offload.Scene.SHARED
@@ -86,48 +88,50 @@ def main() -> int:
         raise RuntimeError(f"rank {rank}: offload.initialize failed: ret={ret}")
 
     process_group_initialized = False
+    cpu_group = None
     host_weights: list[torch.Tensor] = []
     device_slots: list[torch.Tensor] = []
     try:
         dist.init_process_group(backend="hccl")
         process_group_initialized = True
+        cpu_group = dist.new_group(backend="gloo")
         shapes = (
             (args.hidden_size, 2 * args.intermediate_size),  # w13
             (args.intermediate_size, args.hidden_size),  # w2
         )
-        lengths_cpu: list[int] = []
-        expected: list[float] = []
-        for expert_id in range(args.num_experts):
+        experts_per_rank = args.num_experts // world_size
+        shard_start = rank * experts_per_rank
+        local_ptrs = []
+        for expert_id in range(shard_start,
+                               shard_start + experts_per_rank):
             for weight_id, shape in enumerate(shapes):
                 value = _pattern(expert_id, weight_id)
-                if rank == 0:
-                    host = offload.empty(shape,
-                                         dtype=torch.bfloat16).fill_(value)
-                else:
-                    # Non-owner ranks keep no replica; only the rank-0 global
-                    # MemFabric addresses are used after the broadcast below.
-                    host = None
+                host = offload.empty(
+                    shape, dtype=torch.bfloat16).fill_(value)
+                host_weights.append(host)
+                local_ptrs.append(host.data_ptr())
+
+        gathered_ptrs = [None] * world_size
+        dist.all_gather_object(
+            gathered_ptrs, local_ptrs, group=cpu_group)
+        source_rank = (rank + 1) % world_size
+        source_start = source_rank * experts_per_rank
+        expected: list[float] = []
+        lengths_cpu: list[int] = []
+        for expert_id in range(source_start,
+                               source_start + experts_per_rank):
+            for weight_id, shape in enumerate(shapes):
                 slot = torch.empty(shape,
                                    dtype=torch.bfloat16,
                                    device=f"npu:{local_rank}")
-                if host is not None:
-                    host_weights.append(host)
                 device_slots.append(slot)
+                expected.append(_pattern(expert_id, weight_id))
                 lengths_cpu.append(slot.numel() * slot.element_size())
-                expected.append(value)
 
         buffer_count = len(device_slots)
-        if rank == 0:
-            src_ptrs = torch.tensor(
-                [item.data_ptr() for item in host_weights],
-                dtype=torch.int64,
-                device=f"npu:{local_rank}",
-            )
-        else:
-            src_ptrs = torch.empty(buffer_count,
-                                   dtype=torch.int64,
-                                   device=f"npu:{local_rank}")
-        dist.broadcast(src_ptrs, src=0)
+        src_ptrs = torch.tensor(gathered_ptrs[source_rank],
+                                dtype=torch.int64,
+                                device=f"npu:{local_rank}")
 
         dst_ptrs = torch.tensor([item.data_ptr() for item in device_slots],
                                  dtype=torch.int64,
@@ -153,14 +157,17 @@ def main() -> int:
         dist.barrier()
     finally:
         if process_group_initialized:
-            dist.destroy_process_group()
+            dist.barrier()
         offload.uninitialize()
+        if process_group_initialized:
+            dist.destroy_process_group()
 
     total_bytes = sum(lengths_cpu)
     print(
         "memfabric shared H2D OK: "
         f"rank={rank}/{world_size}, device={local_rank}, "
-        f"experts={args.num_experts}, buffers={len(device_slots)}, "
+        f"source_rank={source_rank}, experts={experts_per_rank}, "
+        f"buffers={len(device_slots)}, "
         f"bytes={total_bytes}",
         flush=True,
     )

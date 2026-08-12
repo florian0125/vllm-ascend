@@ -385,6 +385,9 @@ class NPUWorker(WorkerBase):
             weight_transfer_engine.shutdown()
 
         if model_runner := getattr(self, "model_runner", None):
+            offload_manager = getattr(model_runner, "offload_manager", None)
+            if offload_manager is not None:
+                offload_manager.close()
             shutdown_fn = getattr(model_runner, "shutdown", None)
             if callable(shutdown_fn):
                 shutdown_fn()

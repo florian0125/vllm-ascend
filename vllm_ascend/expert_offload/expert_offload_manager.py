@@ -17,6 +17,7 @@ from vllm.logger import logger
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.h2d_transfer import (
     H2DCopyTask,
+    HostPointerSource,
     TorchCopyH2DTransport,
     create_h2d_transport,
 )
@@ -211,16 +212,20 @@ class ExpertOffloadManager:
         ExpertOffloadManager._instance = self
 
         self.load_stream = torch_npu.npu.Stream()
-        self.h2d_transport = create_h2d_transport(
-            self.offload_config.h2d_backend,
-            device_id=torch_npu.npu.current_device(),
-            memfabric_pool_size_gib=(
-                self.offload_config.memfabric_pool_size_gib),
-            memfabric_log_level=self.offload_config.memfabric_log_level,
-        )
+        # MemFabric SHARED initialization is collective and needs the EP group,
+        # so defer it until the first layer allocates Host expert buffers.
+        self.h2d_transport = None
+        if not (self.offload_config.h2d_backend == "memfabric"
+                and self.enable_multi_card):
+            self.h2d_transport = self._create_h2d_transport()
+        self._shared_h2d_sources = {}
+        self._shared_h2d_sources_ready = False
         logger.info(
-            "[EXPERT-OFFLOAD-H2D] backend=%s memfabric_pool_size_gib=%d",
+            "[EXPERT-OFFLOAD-H2D] backend=%s mode=%s "
+            "memfabric_pool_size_gib=%d",
             self.offload_config.h2d_backend,
+            ("shared" if self.enable_multi_card else "local")
+            if self.offload_config.h2d_backend == "memfabric" else "copy",
             self.offload_config.memfabric_pool_size_gib,
         )
 
@@ -293,6 +298,21 @@ class ExpertOffloadManager:
     def ep_rank(self) -> int:
         self._resolve_ep_info()
         return self._ep_rank
+
+    def _create_h2d_transport(self):
+        enable_shared = (
+            self.offload_config.h2d_backend == "memfabric"
+            and self.enable_multi_card)
+        return create_h2d_transport(
+            self.offload_config.h2d_backend,
+            device_id=torch_npu.npu.current_device(),
+            memfabric_pool_size_gib=(
+                self.offload_config.memfabric_pool_size_gib),
+            memfabric_log_level=self.offload_config.memfabric_log_level,
+            enable_multi_card=enable_shared,
+            world_size=self.ep_size if enable_shared else 1,
+            rank_id=self.ep_rank if enable_shared else 0,
+        )
 
     # ------------------------------------------------------------------ #
     #  Lifecycle: called during model init and after weight loading       #
@@ -549,6 +569,7 @@ class ExpertOffloadManager:
             self._weight_load_secs, self._weight_load_calls)
         t1 = time.perf_counter()
         self.process_weights_after_loading()
+        self._publish_shared_h2d_sources()
         t2 = time.perf_counter()
 
         num_moe_layers = len(self.moe_layers)
@@ -1331,8 +1352,6 @@ class ExpertOffloadManager:
         ]
 
         local_eid = self._shard_local(source_eid)
-        if local_eid is None:
-            return tasks
         quant_specs = (
             (self.scale_cpu_buffers, "w13_weight_scale",
              self._prefill_w13_scale),
@@ -1350,15 +1369,22 @@ class ExpertOffloadManager:
         for cpu_buffers, attr_name, prefill_buffers in quant_specs:
             if (pool_slot >= len(prefill_buffers)
                     or attr_name not in cpu_buffers
-                    or layer_idx >= len(cpu_buffers[attr_name])
-                    or local_eid >= len(cpu_buffers[attr_name][layer_idx])):
+                    or layer_idx >= len(cpu_buffers[attr_name])):
                 continue
-            src = cpu_buffers[attr_name][layer_idx][local_eid]
             dst = prefill_buffers[pool_slot][destination_eid]
+            if (local_eid is not None
+                    and local_eid < len(cpu_buffers[attr_name][layer_idx])):
+                src_tensor = cpu_buffers[attr_name][layer_idx][local_eid]
+                source = src_tensor.reshape(dst.shape)
+                nbytes = src_tensor.numel() * src_tensor.element_size()
+            else:
+                source = self._shared_h2d_source(
+                    layer_idx, source_eid, attr_name)
+                nbytes = dst.numel() * dst.element_size()
             tasks.append(H2DCopyTask(
-                source=src.reshape(dst.shape),
+                source=source,
                 destination=dst,
-                nbytes=src.numel() * src.element_size(),
+                nbytes=nbytes,
                 name=(f"prefill-{attr_name}[L{layer_idx},E{source_eid}"
                       f"->P{pool_slot}:E{destination_eid}]"),
             ))
@@ -1468,6 +1494,17 @@ class ExpertOffloadManager:
         pool_slot = layer_idx % ndl
         shard = self.mc_shard_size
         base = self.ep_rank * shard
+
+        if self.offload_config.h2d_backend == "memfabric":
+            with torch_npu.npu.stream(self.load_stream):
+                tasks = []
+                for local_i, eid in enumerate(range(base, base + shard)):
+                    tasks.extend(self._build_prefill_h2d_tasks(
+                        layer_idx, pool_slot, eid, local_i))
+                self._get_h2d_transport().copy_batch(tasks)
+                self._refresh_prefill_fp32_scale(pool_slot, shard)
+                self._synchronize_h2d()
+            return
 
         with torch_npu.npu.stream(self.load_stream):
             for local_i in range(shard):
@@ -1799,7 +1836,10 @@ class ExpertOffloadManager:
         """
         cpu_buf = getattr(self, f'{which}_weights_cpu')[layer_idx]
         if self.offload_config.shard_per_rank:
-            return cpu_buf[eid - self._shard_base].untyped_storage()
+            local_eid = self._shard_local(eid)
+            if local_eid is not None:
+                return cpu_buf[local_eid].untyped_storage()
+            return self._shared_h2d_source(layer_idx, eid, which)
         return cpu_buf[eid].untyped_storage()
 
     def _expert_dst_storage(self, layer_idx, eid, which='w13'):
@@ -1813,6 +1853,69 @@ class ExpertOffloadManager:
             return cpu_buf[eid - self._shard_base].untyped_storage()
         return cpu_buf[eid].untyped_storage()
 
+    def _shared_h2d_source(self, layer_idx, eid, name):
+        pointer = self._shared_h2d_sources.get((layer_idx, eid, name))
+        if pointer is None:
+            raise RuntimeError(
+                "Missing MemFabric SHARED source pointer: "
+                f"layer={layer_idx}, expert={eid}, name={name}")
+        return HostPointerSource(pointer)
+
+    def _shared_h2d_layer_ready(self, layer_idx: int) -> bool:
+        if not getattr(self, '_shared_h2d_sources_ready', False):
+            return False
+        shared_sources = getattr(self, '_shared_h2d_sources', {})
+        return all(
+            (layer_idx, eid, name) in shared_sources
+            for eid in range(self.num_total_experts)
+            for name in ("w13", "w2"))
+
+    def _publish_shared_h2d_sources(self) -> None:
+        """All-gather peer shard pointers once after format conversion."""
+        transport = self._get_h2d_transport()
+        if not getattr(transport, "supports_remote_sources", False):
+            return
+
+        local_sources = {}
+        for layer_idx in range(len(self.w13_weights_cpu)):
+            for local_eid, tensor in enumerate(
+                    self.w13_weights_cpu[layer_idx]):
+                eid = self._shard_base + local_eid
+                local_sources[(layer_idx, eid, "w13")] = tensor.data_ptr()
+                local_sources[(layer_idx, eid, "w2")] = (
+                    self.w2_weights_cpu[layer_idx][local_eid].data_ptr())
+        for buffer_dict in (self.scale_cpu_buffers,
+                            self.offset_cpu_buffers,
+                            self.scale_bias_cpu_buffers):
+            for name, layer_buffers in buffer_dict.items():
+                for layer_idx, expert_buffers in enumerate(layer_buffers):
+                    for local_eid, tensor in enumerate(expert_buffers):
+                        eid = self._shard_base + local_eid
+                        local_sources[(layer_idx, eid, name)] = tensor.data_ptr()
+
+        from torch import distributed as dist
+        from vllm.distributed.parallel_state import get_ep_group
+        gathered_sources = [None] * self.ep_size
+        dist.all_gather_object(
+            gathered_sources, local_sources,
+            group=get_ep_group().cpu_group)
+        shared_sources = {}
+        for rank_sources in gathered_sources:
+            overlap = shared_sources.keys() & rank_sources.keys()
+            if overlap:
+                raise RuntimeError(
+                    "Duplicate MemFabric SHARED expert sources: "
+                    f"{list(overlap)[:4]}")
+            shared_sources.update(rank_sources)
+        self._shared_h2d_sources = shared_sources
+        self._shared_h2d_sources_ready = True
+        if not all(self._shared_h2d_layer_ready(layer_idx)
+                   for layer_idx in range(len(self.w13_weights_cpu))):
+            raise RuntimeError("Incomplete MemFabric SHARED source table")
+        logger.info(
+            "[EXPERT-OFFLOAD-H2D] published %d SHARED source pointers "
+            "across %d EP ranks", len(shared_sources), self.ep_size)
+
     def _build_quant_attr_h2d_tasks(self, layer, layer_idx, eid,
                                     slot) -> list[H2DCopyTask]:
         """Build scale/offset/scale_bias H2D tasks for one expert slot."""
@@ -1821,21 +1924,27 @@ class ExpertOffloadManager:
                             self.offset_cpu_buffers,
                             self.scale_bias_cpu_buffers):
             for attr_name, buffers in buffer_dict.items():
-                # eid is GLOBAL (same eid the weight H2D above used); remap to
-                # the shard-sized buffer's local slot (identity when single-card).
                 local_eid = self._shard_local(eid)
-                if (local_eid is None or layer_idx >= len(buffers)
-                        or local_eid >= len(buffers[layer_idx])):
-                    continue
                 dev_tensor = getattr(layer, attr_name, None)
-                if dev_tensor is None:
+                if dev_tensor is None or layer_idx >= len(buffers):
                     continue
-                src = buffers[layer_idx][local_eid]
                 dst = dev_tensor.data[slot]
+                if (local_eid is not None
+                        and local_eid < len(buffers[layer_idx])):
+                    src_tensor = buffers[layer_idx][local_eid]
+                    source = src_tensor.reshape(dst.shape)
+                    nbytes = src_tensor.numel() * src_tensor.element_size()
+                elif getattr(self._get_h2d_transport(),
+                             "supports_remote_sources", False):
+                    source = self._shared_h2d_source(
+                        layer_idx, eid, attr_name)
+                    nbytes = dst.numel() * dst.element_size()
+                else:
+                    continue
                 tasks.append(H2DCopyTask(
-                    source=src.reshape(dst.shape),
+                    source=source,
                     destination=dst,
-                    nbytes=src.numel() * src.element_size(),
+                    nbytes=nbytes,
                     name=f"{attr_name}[L{layer_idx},E{eid}->S{slot}]",
                 ))
         return tasks
@@ -1956,10 +2065,13 @@ class ExpertOffloadManager:
         counts_ms = ((time.perf_counter() - counts_start) * 1000.0
                      if counts_start is not None else 0.0)
 
-        # Plan placement: stable slot (prev_log2phy) + hotness (new order).
-        # shard-per-rank: force EP ownership (expert → e//shard) so a rank only
-        # places experts it holds in its shard CPU buffer.
-        force_shard = getattr(self, '_shard_size', None) if self.offload_config.shard_per_rank else None
+        # MemFabric SHARED exposes peer shard pointers, so published layers may
+        # use global load-balanced placement. Unpublished late layers (MTP)
+        # retain owner-shard placement until their pointers are available.
+        force_shard = (
+            getattr(self, '_shard_size', None)
+            if (self.offload_config.shard_per_rank
+                and not self._shared_h2d_layer_ready(layer_idx)) else None)
         placement_start = time.perf_counter() if self._debug else None
         placement = plan_placement(global_counts, self.ep_size, per_rank_slots,
                                    prev_log2phy, hotness, force_shard=force_shard)
@@ -2195,12 +2307,12 @@ class ExpertOffloadManager:
         return resident_map, hits, misses
 
     def _get_h2d_transport(self):
-        """Return the configured transport, lazily supplying the default."""
-        transport = getattr(self, 'h2d_transport', None)
-        if transport is None:
-            transport = TorchCopyH2DTransport()
-            self.h2d_transport = transport
-        return transport
+        """Return the transport, lazily initializing collective SHARED."""
+        if not hasattr(self, 'h2d_transport'):
+            self.h2d_transport = TorchCopyH2DTransport()
+        elif self.h2d_transport is None:
+            self.h2d_transport = self._create_h2d_transport()
+        return self.h2d_transport
 
     def _allocate_expert_host_tensor(self, shape, dtype) -> torch.Tensor:
         """Allocate weight/quant storage owned by the selected H2D backend."""
@@ -2212,7 +2324,10 @@ class ExpertOffloadManager:
 
     def close(self) -> None:
         """Release H2D backend resources; safe to call more than once."""
-        self._get_h2d_transport().close()
+        transport = getattr(self, 'h2d_transport', None)
+        if transport is not None:
+            transport.synchronize(self.load_stream)
+            transport.close()
 
     def _build_expert_h2d_tasks(self, layer, layer_idx, eid,
                                 slot) -> list[H2DCopyTask]:
@@ -2265,6 +2380,15 @@ class ExpertOffloadManager:
     def _h2d_load_mc_misses(self, layer, layer_idx, misses, resident_map):
         """H2D-load missed experts (w13/w2 + quant attrs) into their slots on
         load_stream, then synchronize to gate the compute stream."""
+        if (self._debug and self._shared_h2d_layer_ready(layer_idx)
+                and misses):
+            remote_count = sum(
+                self._shard_local(eid) is None for _, eid in misses)
+            logger.info(
+                "[MEMFABRIC-SHARED-H2D] layer=%d rank=%d loads=%d "
+                "remote=%d local=%d",
+                layer_idx, self.ep_rank, len(misses), remote_count,
+                len(misses) - remote_count)
         with torch_npu.npu.stream(self.load_stream):
             self._load_expert_weights_into_slots(layer, layer_idx, misses)
             for slot, eid in misses:
@@ -2509,9 +2633,11 @@ class ExpertOffloadManager:
                     per_rank_slots = (
                         self.offload_config.num_device_experts_for_rank(
                             layer_idx, self.ep_size))
-                    force_shard = (getattr(self, '_shard_size', None)
-                                   if self.offload_config.shard_per_rank
-                                   else None)
+                    force_shard = (
+                        getattr(self, '_shard_size', None)
+                        if (self.offload_config.shard_per_rank
+                            and not self._shared_h2d_layer_ready(layer_idx))
+                        else None)
                     placement = plan_hot_preload(
                         pairs,
                         global_num_experts=self.num_total_experts,

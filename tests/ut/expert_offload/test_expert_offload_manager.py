@@ -559,6 +559,67 @@ def test_shared_expert_copy_is_non_blocking_and_refreshes_quant_scale():
     assert layer.w13_weight_scale_fp32[1] == 2.5
 
 
+def test_memfabric_shared_resolves_remote_expert_pointer():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "h2d_backend": "memfabric",
+        "memfabric_pool_size_gib": 1,
+        "enable_multi_card": True,
+        "shard_per_rank": True,
+    })
+    manager._shard_base = 0
+    manager._shard_size = 2
+    manager.w13_weights_cpu = [[torch.zeros(1), torch.zeros(1)]]
+    manager._shared_h2d_sources_ready = True
+    manager._shared_h2d_sources = {(0, 3, "w13"): 123456}
+
+    source = manager._expert_src_storage(0, 3, "w13")
+
+    assert source.data_ptr() == 123456
+
+
+def test_memfabric_shared_publishes_complete_peer_pointer_table():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "h2d_backend": "memfabric",
+        "memfabric_pool_size_gib": 1,
+        "enable_multi_card": True,
+        "shard_per_rank": True,
+    })
+    manager.h2d_transport = SimpleNamespace(supports_remote_sources=True)
+    manager._ep_size = 2
+    manager._ep_rank = 0
+    manager._ep_info_resolved = True
+    manager._shard_base = 0
+    manager.num_total_experts = 2
+    manager.w13_weights_cpu = [[torch.zeros(1)]]
+    manager.w2_weights_cpu = [[torch.zeros(1)]]
+    manager.scale_cpu_buffers = {}
+    manager.offset_cpu_buffers = {}
+    manager.scale_bias_cpu_buffers = {}
+    manager._shared_h2d_sources = {}
+    manager._shared_h2d_sources_ready = False
+
+    def gather(output, local, group):
+        output[0] = local
+        output[1] = {
+            (0, 1, "w13"): 301,
+            (0, 1, "w2"): 302,
+        }
+
+    ep_group = SimpleNamespace(cpu_group=object())
+    with (
+        patch("torch.distributed.all_gather_object", side_effect=gather),
+        patch("vllm.distributed.parallel_state.get_ep_group",
+              return_value=ep_group),
+    ):
+        manager._publish_shared_h2d_sources()
+
+    assert manager._shared_h2d_sources_ready is True
+    assert manager._shared_h2d_sources[(0, 1, "w13")] == 301
+    assert len(manager._shared_h2d_sources) == 4
+
+
 def test_expert_load_combines_multiple_experts_into_one_transport_batch():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager.h2d_transport = MagicMock()
