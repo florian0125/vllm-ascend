@@ -25,8 +25,15 @@ export VLLM_USE_FASTOKENS=1
 local_ip="141.61.141.58"
 nic_name="enp35s0f2"
 
+
+
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages/mooncake:$LD_LIBRARY_PATH
 export PYTHONPATH=/home/g00619970/moeoffload_multi/vllm:/home/g00619970/moeoffload_multi/vllm-ascend:$PYTHONPATH
+
+# MemFabric acc_offload 扩展库：offload.initialize() 运行时会从该路径 dlopen
+# libmf_hybm_accoffload.so，缺失会导致 "offload launch load library failed"
+# → RuntimeError: MemFabric LOCAL initialization failed (ret=-1)
+source /usr/local/memfabric_hybrid/set_env.sh
 
 rm -rf ~/ascend/log/debug/plog/*
 export HCCL_IF_IP=$local_ip
@@ -87,8 +94,10 @@ vllm serve /mnt/weight/A5-weights/DeepSeek-V4-Flash \
     --safetensors-load-strategy 'prefetch' \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,3]}' \
     --speculative-config '{"num_speculative_tokens": 2,"method": "mtp","enforce_eager": true}' \
-    --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true, "enable_multi_card": false, "shard_per_rank": false,"num_device_experts": 48,"num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1,"hot_expert_preload": false, "hot_experts_file": "expert_rank_gsm8k.json","expert_substitution_enabled": false,"expert_substitution_threshold": 0.25,"moe_offload_debug": true}}' \
+    --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true, "enable_multi_card": false,"h2d_backend": "memfabric", "memfabric_pool_size_gib": 200, "shard_per_rank": false,"num_device_experts": 48,"num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1,"hot_expert_preload": false, "hot_experts_file": "expert_rank_gsm8k.json","expert_substitution_enabled": false,"expert_substitution_threshold": 0.25,"moe_offload_debug": true}}' \
     --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/home/g00619970/moeoffload_multi/prefile", "torch_profiler_with_stack": false}' \
+
+    # "h2d_backend": "torch", # Options: "torch", "memfabric"
     # --quantization ascend \
 
     # --enforce_eager \
