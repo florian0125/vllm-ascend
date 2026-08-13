@@ -11,7 +11,7 @@ export VLLM_USE_V1=1
 export HCCL_BUFFSIZE=1024
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export VLLM_SERVER_DEV_MODE=1
-export ASCEND_RT_VISIBLE_DEVICES="6,7"
+export ASCEND_RT_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 
 export USE_MULTI_BLOCK_POOL=1
 export USE_MULTI_GROUPS_KV_CACHE=1
@@ -72,7 +72,7 @@ sysctl kernel.sched_migration_cost_ns=50000
 vllm serve /mnt/weight/A5-weights/DeepSeek-V4-Flash \
     --host 0.0.0.0 \
     --port 8150 \
-    --data-parallel-size 1 \
+    --data-parallel-size 2 \
     --tensor-parallel-size 1 \
     --pipeline-parallel-size 1 \
     --enable-expert-parallel \
@@ -94,7 +94,7 @@ vllm serve /mnt/weight/A5-weights/DeepSeek-V4-Flash \
     --safetensors-load-strategy 'prefetch' \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,3]}' \
     --speculative-config '{"num_speculative_tokens": 2,"method": "mtp","enforce_eager": true}' \
-    --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true, "enable_multi_card": false,"h2d_backend": "memfabric", "memfabric_pool_size_gib": 200, "shard_per_rank": false,"num_device_experts": 48,"num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1,"hot_expert_preload": false, "hot_experts_file": "expert_rank_gsm8k.json","expert_substitution_enabled": false,"expert_substitution_threshold": 0.25,"moe_offload_debug": true}}' \
+    --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true, "enable_multi_card": true,"h2d_backend": "memfabric", "memfabric_pool_size_gib": 200,"memfabric_log_level": 0,"num_device_experts": 48,"num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1,"hot_expert_preload": false, "hot_experts_file": "expert_rank_gsm8k.json","expert_substitution_enabled": false,"expert_substitution_threshold": 0.25,"moe_offload_debug": true}}' \
     --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/home/g00619970/moeoffload_multi/prefile", "torch_profiler_with_stack": false}' \
 
     # "h2d_backend": "torch", # Options: "torch", "memfabric"
