@@ -2540,7 +2540,8 @@ class ExpertOffloadManager:
                 already_there_layer = set(topk_ids_h[0].tolist()) & on_device
                 logger.info("%s l=%d expert_hit=%s expert_miss=%s hit_rate=%.2f layer_expert_hit=%s needed=%s topk_ids_h=%s" ,
                             flag,layer_idx, sorted(already_there),
-                            sorted(need_to_load), len(already_there_layer) / topk_ids_h.shape[1],
+                            # sorted(need_to_load), len(already_there_layer) / topk_ids_h.shape[1],
+                            sorted(need_to_load), len(already_there) / (len(already_there) + len(need_to_load)) if len(already_there) + len(need_to_load) > 0 else 0,
                             already_there_layer, needed, topk_ids_h)
                 if need_to_load and len(need_to_load) > len(reusable_slots):
                     logger.info("%s l=%d SHORTFALL: need %d load but only %d slots, "

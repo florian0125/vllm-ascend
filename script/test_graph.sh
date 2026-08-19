@@ -11,7 +11,7 @@ export VLLM_USE_V1=1
 export HCCL_BUFFSIZE=1024
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export VLLM_SERVER_DEV_MODE=1
-export ASCEND_RT_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+export ASCEND_RT_VISIBLE_DEVICES="6,7"
 
 export USE_MULTI_BLOCK_POOL=1
 export USE_MULTI_GROUPS_KV_CACHE=1
@@ -20,10 +20,10 @@ export VLLM_USE_FASTOKENS=1
 # 同步的修改
 # export ASCEND_LAUNCH_BLOCKING=1
 
-# nic_name="ens6f1np1"
-# local_ip="90.90.93.34"
-local_ip="141.61.141.58"
-nic_name="enp35s0f2"
+nic_name="ens6f1np1"
+local_ip="90.90.93.34"
+# local_ip="141.61.141.58"
+# nic_name="enp35s0f2"
 
 
 
@@ -33,7 +33,7 @@ export PYTHONPATH=/home/g00619970/moeoffload_multi/vllm:/home/g00619970/moeofflo
 # MemFabric acc_offload 扩展库：offload.initialize() 运行时会从该路径 dlopen
 # libmf_hybm_accoffload.so，缺失会导致 "offload launch load library failed"
 # → RuntimeError: MemFabric LOCAL initialization failed (ret=-1)
-source /usr/local/memfabric_hybrid/set_env.sh
+# source /usr/local/memfabric_hybrid/set_env.sh
 
 rm -rf ~/ascend/log/debug/plog/*
 export HCCL_IF_IP=$local_ip
@@ -69,18 +69,19 @@ sysctl kernel.sched_migration_cost_ns=50000
 # 如果当前是112，那 --gpu-memory-utilization 0.71 \
 # /mnt/weight/A5-weights/DeepSeek-V4-Flash
 # /home/g00955623/weights/DeepSeek-V4-Flash
-vllm serve /mnt/weight/A5-weights/DeepSeek-V4-Flash \
+# /mnt/data/models/DeepSeek-V4-Flash
+vllm serve /mnt/data/models/DeepSeek-V4-Flash \
     --host 0.0.0.0 \
     --port 8150 \
-    --data-parallel-size 8 \
+    --data-parallel-size 1 \
     --tensor-parallel-size 1 \
     --pipeline-parallel-size 1 \
     --enable-expert-parallel \
     --seed 1024 \
     --served-model-name "glm-5" \
-    --max-num-seqs 1 \
-    --max-model-len 270000 \
-    --max-num-batched-tokens 32768 \
+    --max-num-seqs 4 \
+    --max-model-len 150000 \
+    --max-num-batched-tokens 8192 \
     --trust-remote-code \
     --gpu-memory-utilization 0.95 \
     --enable-chunked-prefill \
@@ -92,9 +93,9 @@ vllm serve /mnt/weight/A5-weights/DeepSeek-V4-Flash \
     --aggregate-engine-logging \
     --api-server-count 1 \
     --safetensors-load-strategy 'prefetch' \
-    --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,3]}' \
-    --speculative-config '{"num_speculative_tokens": 2,"method": "mtp","enforce_eager": true}' \
-    --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true, "enable_multi_card": true,"h2d_backend": "memfabric", "memfabric_pool_size_gib": 25,"memfabric_log_level": 1,"num_device_experts": 48,"num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1,"hot_expert_preload": false, "hot_experts_file": "expert_rank_gsm8k.json","expert_substitution_enabled": false,"expert_substitution_threshold": 0.25,"moe_offload_debug": true}}' \
+    --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+    --speculative-config '{"num_speculative_tokens": 1,"method": "mtp","enforce_eager": true}' \
+    --additional-config '{"expert_offload_config": {"expert_offload": true, "enable_multi_card": false, "num_device_experts": [78, 78, 78, 120, 78, 78, 120, 78, 78, 78, 120, 78, 78, 78, 78, 78, 78, 78, 78, 120, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 120, 78, 78, 78, 120, 78, 78, 120, 256], "num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1, "hot_expert_preload": true, "hot_experts_file": "expert_rank_gsm8k.json","moe_offload_debug": true}}' \
     --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/home/g00619970/moeoffload_multi/prefile", "torch_profiler_with_stack": false}' \
 
     # "h2d_backend": "torch", # Options: "torch", "memfabric"
@@ -104,6 +105,9 @@ vllm serve /mnt/weight/A5-weights/DeepSeek-V4-Flash \
     # --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
     # --speculative-config '{"num_speculative_tokens": 1,"method": "mtp","enforce_eager": true}' \
 
+    # --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,3]}' \
+    # --speculative-config '{"num_speculative_tokens": 2,"method": "mtp","enforce_eager": true}' \
+
     # --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true,"num_device_experts": [84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84, 84], "num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1, "hot_expert_preload": true, "hot_experts_file": "expert_rank_gsm8k.json", "moe_offload_debug": true}}' \
 
     # --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true,"num_device_experts": [78, 78, 78, 120, 78, 78, 120, 78, 78, 78, 120, 78, 78, 78, 78, 78, 78, 78, 78, 120, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 120, 78, 78, 78, 120, 78, 78, 120, 256], "num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1, "hot_expert_preload": true, "hot_experts_file": "expert_rank_gsm8k.json", "substitute_policy_enabled": true, "substitute_alpha": 0.1, "substitute_scoring_func": "sqrtsoftplus", "substitute_skip_layers": [0, 1, 2], "substitute_max_reuse": 0, "moe_offload_debug": true}}' \
@@ -111,3 +115,5 @@ vllm serve /mnt/weight/A5-weights/DeepSeek-V4-Flash \
     # --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true, "enable_multi_card": true, "num_device_experts": 48, "num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1, "hot_expert_preload": true, "hot_experts_file": "expert_rank_gsm8k.json","moe_offload_debug": true}}' \
 
     # "expert_substitution_enabled": true,"expert_substitution_threshold": 0.25,
+
+    # --additional-config '{"multistream_overlap_shared_expert": false,"enable_cpu_binding":true, "expert_offload_config": {"expert_offload": true, "enable_multi_card": true,"h2d_backend": "memfabric", "memfabric_pool_size_gib": 25,"memfabric_log_level": 1,"num_device_experts": 48,"num_device_layers": 2, "cache_policy_enabled": true, "expert_prefetch_enabled": true, "expert_prefetch_num":1,"hot_expert_preload": false, "hot_experts_file": "expert_rank_gsm8k.json","expert_substitution_enabled": false,"expert_substitution_threshold": 0.25,"moe_offload_debug": true}}' \
