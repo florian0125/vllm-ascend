@@ -417,6 +417,47 @@ def test_retention_evicts_coldest_when_full():
         _check(int(p.log2phy[e]) >= 0, f"hotter expert {e} retained")
 
 
+def test_stable_slots_rank_all_victims_once():
+    """Multiple new active experts rank resident victims only once."""
+
+    class CountingHotness:
+        def __init__(self, values):
+            self.values = values
+            self.reads = [0] * len(values)
+
+        def __getitem__(self, expert_id):
+            self.reads[expert_id] += 1
+            return self.values[expert_id]
+
+    # Rank 0 is full with experts 0..3; experts 4 and 5 are both new.
+    prev = torch.full((6,), -1, dtype=torch.int32)
+    prev[:4] = torch.arange(4, dtype=torch.int32)
+    hotness = CountingHotness([0.1, 0.2, 0.3, 0.4, 10.0, 9.0])
+
+    slots = mcp._assign_slots_stable(
+        [4, 5], rank=0, num_device_experts=4,
+        prev_log2phy=prev, hotness=hotness)
+
+    _check(slots == [4, 5, 2, 3],
+           f"two coldest residents evicted in one plan: {slots}")
+    _check(hotness.reads[:4] == [1, 1, 1, 1],
+           f"each resident ranked once: {hotness.reads[:4]}")
+
+
+def test_stable_slots_batch_victims_preserve_tie_breaking():
+    """Equal-hotness victims retain the previous lowest-slot tie-break."""
+    prev = torch.full((6,), -1, dtype=torch.int32)
+    prev[:4] = torch.arange(4, dtype=torch.int32)
+    hotness = [1.0] * 6
+
+    slots = mcp._assign_slots_stable(
+        [4, 5], rank=0, num_device_experts=4,
+        prev_log2phy=prev, hotness=hotness)
+
+    _check(slots == [4, 5, 2, 3],
+           f"equal-hotness victims follow slot order: {slots}")
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

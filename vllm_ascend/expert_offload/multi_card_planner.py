@@ -288,21 +288,22 @@ def _assign_slots_stable(active_r, rank, num_device_experts,
     new_active = [int(e) for e in active_r if int(e) not in resident]
     if hotness is not None:
         new_active.sort(key=lambda e: -float(hotness[e]))
-    for eid in new_active:
-        free = next((s for s in range(num_device_experts)
-                     if result[s] == -1), None)
-        if free is not None:
-            result[free] = eid
-            continue
-        # No free slot: evict the coldest NON-active resident.
-        evictees = [s for s in range(num_device_experts)
-                    if result[s] >= 0 and result[s] not in active_set]
-        if not evictees:
-            break  # every slot holds an active expert this step; can't place
-        if hotness is not None:
-            slot = min(evictees, key=lambda s: float(hotness[int(result[s])]))
-        else:
-            slot = evictees[0]
+    # Rank all available destinations once instead of rescanning every slot
+    # for every new active expert. Preserve the old allocation semantics:
+    # consume free slots in slot order first, then evict non-active residents
+    # from coldest to hottest (slot order breaks equal-hotness ties).
+    free_slots = []
+    victim_slots = []
+    for slot, eid in enumerate(result):
+        if eid == -1:
+            free_slots.append(slot)
+        elif eid not in active_set:
+            victim_slots.append(slot)
+    if hotness is not None:
+        victim_slots.sort(
+            key=lambda slot: float(hotness[int(result[slot])]))
+    available_slots = iter(free_slots + victim_slots)
+    for eid, slot in zip(new_active, available_slots):
         result[slot] = eid
     while result and result[-1] == -1:
         result.pop()
