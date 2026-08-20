@@ -456,17 +456,28 @@ def select_moe_comm_method(
         _offload_config = get_ascend_config().expert_offload_config
         # Communication selection is process-wide rather than layer-specific,
         # so use the smallest configured layer capacity as the safe bound.
-        # Replicated CPU weights allow arbitrary cross-rank placement, hence
-        # the whole device pool is available.  Sharded CPU weights pin every
-        # expert to its owner rank; in the worst case all routes target one
-        # shard, so admission must fit that rank's slots by itself.
+        # Replicated CPU weights allow arbitrary cross-rank placement. SHARED
+        # MemFabric keeps Host weights sharded, but publishes every shard's
+        # source pointers to every EP rank, so target-model experts can also be
+        # placed across the whole logical NPU cache. Torch-backed shards remain
+        # owner constrained. Draft/MTP layers register after the target model's
+        # SHARED pointer publication and therefore remain owner constrained.
         _global_slots = min(_offload_config.num_device_experts_list)
         _ep_size = get_ep_group().world_size
-        _admission_slots = (
-            min(_offload_config.num_device_experts_for_rank(i, _ep_size)
-                for i in range(len(_offload_config.num_device_experts_list)))
-            if _offload_config.shard_per_rank else _global_slots
+        _h2d_backend = getattr(_offload_config, "h2d_backend", "torch")
+        _supports_global_placement = (
+            not _offload_config.shard_per_rank
+            or (_h2d_backend == "memfabric" and not is_draft_model)
         )
+        _admission_slots = (
+            _global_slots
+            if _supports_global_placement else min(
+                _offload_config.num_device_experts_for_rank(i, _ep_size)
+                for i in range(
+                    len(_offload_config.num_device_experts_list)))
+        )
+        _placement_scope = (
+            "global" if _supports_global_placement else "owner")
         _hf = getattr(vllm_config.model_config, "hf_config", None)
         if _hf is None:
             _hf = vllm_config.model_config.hf_text_config
@@ -499,16 +510,17 @@ def select_moe_comm_method(
             else:
                 _reason = "fits"
             logger.info(
-                "[MC_ADMISSION] cpu_mode=%s num_tokens=%s topk=%s "
+                "[MC_ADMISSION] cpu_mode=%s h2d_backend=%s "
+                "placement_scope=%s num_tokens=%s topk=%s "
                 "ep_size=%s global_slots=%s admission_slots=%s "
                 "route_upper_bound=%s "
                 "mc2_tokens_capacity=%s mc2_hard_limit=512 "
                 "buffer_fits=%s selected=%s reason=%s",
                 ("sharded" if _offload_config.shard_per_rank
                  else "replicated"),
-                num_tokens, _topk, _ep_size, _global_slots, _admission_slots,
-                _route_upper_bound, mc2_tokens_capacity, _buffer_fits,
-                moe_comm_type.name, _reason)
+                _h2d_backend, _placement_scope, num_tokens, _topk, _ep_size,
+                _global_slots, _admission_slots, _route_upper_bound,
+                mc2_tokens_capacity, _buffer_fits, moe_comm_type.name, _reason)
     elif moe_comm_policy is MoECommPolicy.ALLGATHER:
         moe_comm_type = MoECommType.ALLGATHER
     else:
