@@ -856,6 +856,45 @@ def test_single_card_update_submits_misses_as_one_batch():
     manager.load_stream.synchronize.assert_called_once_with()
 
 
+def test_single_card_update_ranks_all_lrc_victims_once():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig()
+    manager.topk = 2
+    manager._debug = False
+    manager.cache_policy = MagicMock()
+    manager.cache_policy.observe.return_value = {4, 5}
+    manager.cache_policy.choose_victims.return_value = [0, 1]
+    manager.load_stream = MagicMock()
+    manager._record_cache_stats = MagicMock()
+    manager._load_expert_weights_into_slots = MagicMock()
+    manager._synchronize_h2d = MagicMock()
+    topk_ids_h = torch.tensor([[4, 5]], dtype=torch.int32)
+    log2phy_h = torch.tensor([0, 1, -1, -1, -1, -1], dtype=torch.int32)
+    layer = SimpleNamespace()
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
+        return_value=nullcontext(),
+    ):
+        manager._update_weights((
+            topk_ids_h,
+            log2phy_h.numpy(),
+            layer,
+            0,
+            None,
+            False,
+        ))
+
+    manager.cache_policy.choose_victims.assert_called_once_with(
+        0, {0: 0, 1: 1}, protected={4, 5}, count=2)
+    loads = manager._load_expert_weights_into_slots.call_args.args[2]
+    assert {slot for slot, _ in loads} == {0, 1}
+    assert {eid for _, eid in loads} == {4, 5}
+    assert log2phy_h[:4].tolist() == [-1, -1, -1, -1]
+    assert set(log2phy_h[4:].tolist()) == {0, 1}
+    manager._synchronize_h2d.assert_called_once_with()
+
+
 def test_multi_card_misses_submit_one_batch_before_resident_commit():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager.load_stream = MagicMock()

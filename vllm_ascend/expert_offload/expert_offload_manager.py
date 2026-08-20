@@ -2753,13 +2753,17 @@ class ExpertOffloadManager:
 
             n_copies = 0
             planned_loads = []
+            victims = None
+            if self.cache_policy is not None:
+                victims = iter(self.cache_policy.choose_victims(
+                    layer_idx,
+                    slot_owner,
+                    protected=needed,
+                    count=len(need_to_load),
+                ))
             for eid in need_to_load:
                 if self.cache_policy is not None:
-                    victim = self.cache_policy.choose_victim(
-                        layer_idx,
-                        slot_owner,
-                        protected=needed,
-                    )
+                    victim = next(victims, None)
                     slot = int(log2phy_np[victim]) if victim is not None else -1
                 elif reusable_slots:
                     slot = reusable_slots.pop()
