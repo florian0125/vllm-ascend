@@ -13,7 +13,10 @@ from vllm_ascend.expert_offload.expert_offload_manager import (
     _expert_weight,
     _stable_int_checksum,
 )
-from vllm_ascend.expert_offload.h2d_transfer import H2DCopyTask
+from vllm_ascend.expert_offload.h2d_transfer import (
+    CopyDirection,
+    H2DCopyTask,
+)
 
 
 def _manager_for_prediction(next_layer, gate_weight, *, topk=2,
@@ -61,6 +64,45 @@ def test_cpu_tensor_storage_bytes_counts_unique_nested_storages():
 
     assert total == weight.untyped_storage().nbytes() + \
         scale.untyped_storage().nbytes()
+
+
+def test_exclusive_dynamic_allocates_only_cpu_owned_experts():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "storage_partition_mode": "exclusive_dynamic",
+        "num_device_experts": 2,
+    })
+    manager.num_total_experts = None
+    manager.w13_weights_cpu = []
+    manager.w2_weights_cpu = []
+    manager.scale_cpu_buffers = {}
+    manager.offset_cpu_buffers = {}
+    manager.scale_bias_cpu_buffers = {}
+    manager._cpu_slot_to_eid = []
+    manager._eid_to_cpu_slot = []
+    manager._npu_slot_to_eid = []
+    manager._eid_to_npu_slot = []
+    manager._exclusive_layer_locks = []
+    manager.moe_layers = []
+    manager.cache_policy = None
+    manager._allocate_expert_host_tensor = (
+        lambda shape, dtype: torch.empty(shape, dtype=dtype))
+    layer = SimpleNamespace(
+        global_num_experts=5,
+        w13_weight=torch.empty((2, 6, 4), dtype=torch.uint8),
+        w2_weight=torch.empty((2, 5, 4), dtype=torch.uint8),
+    )
+
+    manager.init_layer_cpu_buffers(layer, 0)
+
+    assert len(manager.w13_weights_cpu[0]) == 3
+    assert len(manager.w2_weights_cpu[0]) == 3
+    assert manager._npu_slot_to_eid[0] == [0, 1]
+    assert manager._cpu_slot_to_eid[0] == [2, 3, 4]
+    assert manager._eid_to_npu_slot[0] == [0, 1, -1, -1, -1]
+    assert manager._eid_to_cpu_slot[0] == [-1, -1, 0, 1, 2]
+    assert manager._cpu_local(0, 0) is None
+    assert manager._cpu_local(0, 4) == 2
 
 
 def test_replicated_cpu_memory_log_reports_full_copy_per_rank():
@@ -997,3 +1039,179 @@ def test_multi_card_hot_preload_loads_only_rank_owned_experts(tmp_path):
     manager.cache_policy.seed_layer_hotness.assert_called_once_with(
         0, {0: 0.9, 1: 0.8, 4: 0.5, 5: 0.4})
     layer.log2phy.copy_.assert_called_once_with(manager.log2phy_h)
+
+
+class _CopyingExpertTransport:
+
+    def __init__(self):
+        self.batches = []
+
+    def copy_batch(self, tasks):
+        self.batches.append(list(tasks))
+        for task in tasks:
+            task.destination.copy_(task.source)
+
+
+def _exclusive_runtime_manager():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "storage_partition_mode": "exclusive_dynamic",
+        "num_device_experts": 2,
+        "shard_per_rank": False,
+    })
+    manager._cpu_slot_to_eid = []
+    manager._eid_to_cpu_slot = []
+    manager._npu_slot_to_eid = []
+    manager._eid_to_npu_slot = []
+    manager._exclusive_layer_locks = []
+    manager._init_exclusive_ownership(0, ntotal=4, ndev=2)
+    manager.w13_expert_size_bytes = 4
+    manager.w2_expert_size_bytes = 2
+    manager.w13_weights_cpu = [[
+        torch.full((4,), 2, dtype=torch.uint8),
+        torch.full((4,), 3, dtype=torch.uint8),
+    ]]
+    manager.w2_weights_cpu = [[
+        torch.full((2,), 12, dtype=torch.uint8),
+        torch.full((2,), 13, dtype=torch.uint8),
+    ]]
+    manager.scale_cpu_buffers = {
+        "w13_weight_scale": [[
+            torch.tensor([2.0]),
+            torch.tensor([3.0]),
+        ]],
+    }
+    manager.offset_cpu_buffers = {}
+    manager.scale_bias_cpu_buffers = {}
+    manager._allocate_expert_host_tensor = (
+        lambda shape, dtype: torch.empty(shape, dtype=dtype))
+    manager.h2d_transport = _CopyingExpertTransport()
+    manager._synchronize_h2d = MagicMock()
+    return manager
+
+
+def test_exclusive_swap_preserves_victim_and_commits_after_copy():
+    manager = _exclusive_runtime_manager()
+    layer = SimpleNamespace(
+        w13_weight=torch.stack([
+            torch.zeros(4, dtype=torch.uint8),
+            torch.ones(4, dtype=torch.uint8),
+        ]),
+        w2_weight=torch.stack([
+            torch.full((2,), 10, dtype=torch.uint8),
+            torch.full((2,), 11, dtype=torch.uint8),
+        ]),
+        w13_weight_scale=torch.tensor([[0.0], [1.0]]),
+    )
+    log2phy = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
+
+    manager._swap_expert_weights(
+        layer, 0, [(0, 2, 0, 0)], log2phy.numpy())
+
+    tasks = manager.h2d_transport.batches[0]
+    assert [task.direction for task in tasks[:3]] == [
+        CopyDirection.D2H,
+        CopyDirection.D2H,
+        CopyDirection.D2H,
+    ]
+    assert [task.direction for task in tasks[3:]] == [
+        CopyDirection.H2D,
+        CopyDirection.H2D,
+        CopyDirection.H2D,
+    ]
+    assert torch.equal(
+        manager.w13_weights_cpu[0][0],
+        torch.zeros(4, dtype=torch.uint8),
+    )
+    assert torch.equal(
+        layer.w13_weight[0],
+        torch.full((4,), 2, dtype=torch.uint8),
+    )
+    assert manager.scale_cpu_buffers["w13_weight_scale"][0][0].item() == 0
+    assert layer.w13_weight_scale[0].item() == 2
+    assert manager._cpu_slot_to_eid[0] == [0, 3]
+    assert manager._npu_slot_to_eid[0] == [2, 1]
+    assert manager._eid_to_cpu_slot[0] == [0, -1, -1, 1]
+    assert manager._eid_to_npu_slot[0] == [-1, 1, 0, -1]
+    assert log2phy.tolist() == [-1, 1, 0, -1]
+    manager._synchronize_h2d.assert_called_once_with()
+
+
+def test_exclusive_prefill_resolves_npu_source_as_d2d_and_cpu_as_h2d():
+    manager = _exclusive_runtime_manager()
+    layer = SimpleNamespace(
+        w13_weight=torch.stack([
+            torch.zeros(4, dtype=torch.uint8),
+            torch.ones(4, dtype=torch.uint8),
+        ]),
+        w2_weight=torch.stack([
+            torch.full((2,), 10, dtype=torch.uint8),
+            torch.full((2,), 11, dtype=torch.uint8),
+        ]),
+    )
+    manager.moe_layers = [layer]
+    manager.scale_cpu_buffers = {}
+    manager._prefill_w13 = [torch.zeros((4, 4), dtype=torch.uint8)]
+    manager._prefill_w2 = [torch.zeros((4, 2), dtype=torch.uint8)]
+    manager._prefill_w13_scale = []
+    manager._prefill_w2_scale = []
+    manager._prefill_w13_offset = []
+    manager._prefill_w2_offset = []
+    manager._prefill_w13_scale_bias = []
+    manager._prefill_w2_scale_bias = []
+    manager._prefill_w13_scale_fp32 = []
+    manager.num_device_layers = 1
+    manager.num_total_experts = 4
+    manager._debug = False
+    manager.load_stream = MagicMock()
+
+    npu_tasks = manager._build_prefill_h2d_tasks(0, 0, 0, 0)
+    cpu_tasks = manager._build_prefill_h2d_tasks(0, 0, 2, 2)
+
+    assert {task.direction for task in npu_tasks} == {CopyDirection.D2D}
+    assert {task.direction for task in cpu_tasks} == {CopyDirection.H2D}
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
+        return_value=nullcontext(),
+    ):
+        manager._prefill_load_layer(0, torch.empty(0))
+
+    full_overwrite = manager.h2d_transport.batches[0]
+    assert len(full_overwrite) == 8
+    assert sum(task.direction == CopyDirection.D2D
+               for task in full_overwrite) == 4
+    assert sum(task.direction == CopyDirection.H2D
+               for task in full_overwrite) == 4
+    assert manager._npu_slot_to_eid[0] == [0, 1]
+    assert manager._cpu_slot_to_eid[0] == [2, 3]
+
+
+def test_exclusive_prefetch_uses_same_dynamic_swap_planner():
+    manager = _exclusive_runtime_manager()
+    manager.topk = 1
+    manager.prefetch_topk = 1
+    manager.cache_policy = None
+    manager._debug = False
+    manager.load_stream = MagicMock()
+    manager._swap_expert_weights = MagicMock()
+    topk_ids = torch.tensor([[2]], dtype=torch.int32)
+    log2phy = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
+    log2phy_np = log2phy.numpy()
+    layer = SimpleNamespace()
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
+        return_value=nullcontext(),
+    ):
+        manager._update_weights_exclusive_dynamic(
+            topk_ids,
+            log2phy_np,
+            layer,
+            0,
+            None,
+            True,
+        )
+
+    manager._swap_expert_weights.assert_called_once_with(
+        layer, 0, [(1, 2, 1, 0)], log2phy_np)

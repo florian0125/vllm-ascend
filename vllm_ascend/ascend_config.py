@@ -964,6 +964,12 @@ class ExpertOffloadConfig:
         "expert_prefetch_num": 2,
         "shard_per_rank": True,
         "enable_multi_card": False,
+        # CPU/NPU expert-weight ownership mode:
+        # - replicated: CPU retains every expert (legacy behavior).
+        # - exclusive_dynamic: single-card CPU and NPU hold disjoint canonical
+        #   expert sets; a miss swaps the incoming CPU expert with an NPU
+        #   victim.  Prefetch uses the same dynamic swap path.
+        "storage_partition_mode": "replicated",
         "hot_expert_preload": False,
         "hot_experts_file": "",
         "expert_substitution_enabled": False,
@@ -1133,6 +1139,11 @@ class ExpertOffloadConfig:
                 f"got {self.config['expert_prefetch_num']} instead")
         if not isinstance(self.config["enable_multi_card"], bool):
             raise TypeError("enable_multi_card must be a boolean")
+        storage_mode = self.config["storage_partition_mode"]
+        if storage_mode not in ("replicated", "exclusive_dynamic"):
+            raise ValueError(
+                "storage_partition_mode must be either 'replicated' or "
+                "'exclusive_dynamic'")
         if self.config["h2d_backend"] not in ("torch", "memfabric"):
             raise ValueError(
                 "h2d_backend must be either 'torch' or 'memfabric'")
@@ -1154,6 +1165,24 @@ class ExpertOffloadConfig:
                     and not self.config["shard_per_rank"]):
                 raise ValueError(
                     "multi-card MemFabric requires shard_per_rank=True")
+        if storage_mode == "exclusive_dynamic":
+            if self.config["enable_multi_card"]:
+                raise ValueError(
+                    "storage_partition_mode='exclusive_dynamic' currently "
+                    "supports single-card only; enable_multi_card must be False")
+            if self.config["h2d_backend"] != "torch":
+                raise ValueError(
+                    "storage_partition_mode='exclusive_dynamic' requires "
+                    "h2d_backend='torch' because each swap needs D2H and H2D")
+            if self.config["hot_expert_preload"]:
+                raise ValueError(
+                    "hot_expert_preload is incompatible with "
+                    "storage_partition_mode='exclusive_dynamic'; use dynamic "
+                    "expert prefetch instead")
+            if any(value <= 0 for value in self.num_device_experts_list):
+                raise ValueError(
+                    "num_device_experts must be > 0 when "
+                    "storage_partition_mode='exclusive_dynamic'")
         if not isinstance(self.config["expert_substitution_enabled"], bool):
             raise TypeError("expert_substitution_enabled must be a boolean")
         if not isinstance(self.config["expert_substitution_threshold"],

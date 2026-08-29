@@ -762,7 +762,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # ndev = per-rank device slot count (== device weight dim0). The loader
         # fills the device weight with experts [0, ndev); num_device_experts is
         # the TOTAL slot count, so divide by ep_size. ep_size=1 (single-card) is
-        # a no-op. CPU buffer still gets ALL experts (loaded above this guard).
+        # a no-op. Legacy storage still writes every expert to CPU. In
+        # exclusive_dynamic mode the manager skips CPU writes for [0, ndev),
+        # because those experts are initially canonical on NPU, and stores
+        # only [ndev, global_num_experts) in compact CPU slots.
         ndev = mgr.offload_config.num_device_experts_for_rank(
             layer_moe_idx, mgr.ep_size if self.enable_multi_card else 1)
 

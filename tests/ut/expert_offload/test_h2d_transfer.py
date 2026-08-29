@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from vllm_ascend.expert_offload.h2d_transfer import (
+    CopyDirection,
     H2DCopyTask,
     MemFabricLocalH2DTransport,
     MemFabricSharedH2DTransport,
@@ -42,6 +43,25 @@ def test_torch_transport_preserves_task_order_and_non_blocking_flags():
 
 def test_torch_transport_accepts_an_empty_batch():
     TorchCopyH2DTransport().copy_batch([])
+
+
+def test_torch_transport_accepts_all_expert_copy_directions():
+    destinations = [MagicMock(), MagicMock(), MagicMock()]
+    tasks = [
+        H2DCopyTask(
+            source=f"source-{direction.value}",
+            destination=destination,
+            nbytes=4,
+            direction=direction,
+        )
+        for direction, destination in zip(CopyDirection, destinations)
+    ]
+
+    TorchCopyH2DTransport().copy_batch(tasks)
+
+    for direction, destination in zip(CopyDirection, destinations):
+        destination.copy_.assert_called_once_with(
+            f"source-{direction.value}", non_blocking=True)
 
 
 def test_torch_transport_allocates_pinned_host_tensor():
@@ -200,6 +220,20 @@ def test_memfabric_transport_preserves_uint32_length_bits():
     assert MemFabricLocalH2DTransport._int32_bits((1 << 32) - 1) == -1
     with pytest.raises(ValueError, match="exceeds uint32"):
         MemFabricLocalH2DTransport._int32_bits(1 << 32)
+
+
+def test_memfabric_transport_rejects_non_h2d_copy_directions():
+    transport, _, offload_module = _make_memfabric_transport()
+    task = H2DCopyTask(
+        MagicMock(), MagicMock(), 4,
+        name="victim-d2h",
+        direction=CopyDirection.D2H,
+    )
+
+    with pytest.raises(RuntimeError, match="supports H2D only.*d2h"):
+        transport.copy_batch([task])
+
+    offload_module.sparse_copy.assert_not_called()
 
 
 def test_memfabric_transport_reports_sparse_copy_failure():

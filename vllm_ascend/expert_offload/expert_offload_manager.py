@@ -6,6 +6,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 
 import torch
 import torch_npu
@@ -16,6 +17,7 @@ from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.h2d_transfer import (
+    CopyDirection,
     H2DCopyTask,
     HostPointerSource,
     TorchCopyH2DTransport,
@@ -72,8 +74,9 @@ def _expert_weight(layer, name: str):
 class ExpertOffloadManager:
     """Singleton manager for expert weight offloading.
 
-    Stores all expert weights on CPU and pages the needed experts to NPU
-    during forward based on routing topk_ids.
+    In legacy mode, stores all expert weights on CPU and pages the needed
+    experts to NPU.  In ``exclusive_dynamic`` mode, CPU and NPU instead own
+    disjoint canonical expert sets and misses are served by two-way swaps.
     """
 
     _instance: "ExpertOffloadManager | None" = None
@@ -170,6 +173,18 @@ class ExpertOffloadManager:
         self.scale_cpu_buffers: dict[str, list[list[torch.Tensor]]] = {}
         self.offset_cpu_buffers: dict[str, list[list[torch.Tensor]]] = {}
         self.scale_bias_cpu_buffers: dict[str, list[list[torch.Tensor]]] = {}
+
+        # Single-card dynamic exclusive ownership.  Every expert has exactly
+        # one canonical location per layer: a compact CPU slot or an NPU slot.
+        # Initial NPU ownership is [0, num_device_experts), matching the
+        # wrapped checkpoint loader; the remaining experts are allocated in
+        # compact CPU buffers.  Runtime swaps update all four inverse maps only
+        # after D2H + H2D has synchronized successfully.
+        self._cpu_slot_to_eid: list[list[int]] = []
+        self._eid_to_cpu_slot: list[list[int]] = []
+        self._npu_slot_to_eid: list[list[int]] = []
+        self._eid_to_npu_slot: list[list[int]] = []
+        self._exclusive_layer_locks: list[threading.RLock] = []
 
         # Temporary per-expert storage for w13 scale/offset shard assembly.
         # Key: (layer_moe_idx, expert_id, attr_name), value: first shard.
@@ -336,6 +351,71 @@ class ExpertOffloadManager:
         """
         return self.offload_config.num_device_experts_for_layer(layer_idx)
 
+    @property
+    def exclusive_dynamic_enabled(self) -> bool:
+        """Whether CPU and NPU use disjoint, dynamically swapped ownership."""
+        return (self.offload_config.storage_partition_mode
+                == "exclusive_dynamic")
+
+    def _init_exclusive_ownership(self, layer_moe_idx: int, ntotal: int,
+                                  ndev: int) -> None:
+        """Create inverse CPU/NPU ownership maps for one MoE layer."""
+        if not 0 < ndev < ntotal:
+            raise ValueError(
+                "exclusive_dynamic requires 0 < num_device_experts < "
+                f"global_num_experts; layer={layer_moe_idx}, "
+                f"num_device_experts={ndev}, global_num_experts={ntotal}")
+
+        npu_slot_to_eid = list(range(ndev))
+        cpu_slot_to_eid = list(range(ndev, ntotal))
+        eid_to_npu_slot = [-1] * ntotal
+        eid_to_cpu_slot = [-1] * ntotal
+        for slot, eid in enumerate(npu_slot_to_eid):
+            eid_to_npu_slot[eid] = slot
+        for slot, eid in enumerate(cpu_slot_to_eid):
+            eid_to_cpu_slot[eid] = slot
+
+        if layer_moe_idx != len(self._cpu_slot_to_eid):
+            raise RuntimeError(
+                "MoE layers must register in contiguous order for "
+                f"exclusive ownership; got layer={layer_moe_idx}, "
+                f"registered={len(self._cpu_slot_to_eid)}")
+        self._cpu_slot_to_eid.append(cpu_slot_to_eid)
+        self._eid_to_cpu_slot.append(eid_to_cpu_slot)
+        self._npu_slot_to_eid.append(npu_slot_to_eid)
+        self._eid_to_npu_slot.append(eid_to_npu_slot)
+        self._exclusive_layer_locks.append(threading.RLock())
+        self._validate_exclusive_ownership(layer_moe_idx)
+
+    def _validate_exclusive_ownership(self, layer_idx: int) -> None:
+        """Validate the CPU/NPU partition and both inverse maps."""
+        cpu_eids = self._cpu_slot_to_eid[layer_idx]
+        npu_eids = self._npu_slot_to_eid[layer_idx]
+        ntotal = len(self._eid_to_cpu_slot[layer_idx])
+        if (len(cpu_eids) + len(npu_eids) != ntotal
+                or set(cpu_eids).intersection(npu_eids)
+                or set(cpu_eids).union(npu_eids) != set(range(ntotal))):
+            raise RuntimeError(
+                f"Invalid exclusive expert partition for layer {layer_idx}")
+        for slot, eid in enumerate(cpu_eids):
+            if self._eid_to_cpu_slot[layer_idx][eid] != slot:
+                raise RuntimeError(
+                    f"Invalid CPU ownership inverse for layer={layer_idx}, "
+                    f"expert={eid}, slot={slot}")
+            if self._eid_to_npu_slot[layer_idx][eid] != -1:
+                raise RuntimeError(
+                    f"Expert {eid} is owned by both CPU and NPU in layer "
+                    f"{layer_idx}")
+        for slot, eid in enumerate(npu_eids):
+            if self._eid_to_npu_slot[layer_idx][eid] != slot:
+                raise RuntimeError(
+                    f"Invalid NPU ownership inverse for layer={layer_idx}, "
+                    f"expert={eid}, slot={slot}")
+            if self._eid_to_cpu_slot[layer_idx][eid] != -1:
+                raise RuntimeError(
+                    f"Expert {eid} is owned by both NPU and CPU in layer "
+                    f"{layer_idx}")
+
     def init_layer_cpu_buffers(self, layer, layer_moe_idx: int):
         """Allocate CPU weight + scale/offset buffers for one MoE layer.
 
@@ -354,8 +434,27 @@ class ExpertOffloadManager:
         w13_shape = (_w13.shape[2], _w13.shape[1])
         w2_shape = (_w2.shape[2], _w2.shape[1])
 
-        use_shard = self.offload_config.shard_per_rank
-        if use_shard:
+        ndev = self.num_device_experts_for_layer(layer_moe_idx)
+        if self.exclusive_dynamic_enabled:
+            if _w13.shape[0] != ndev or _w2.shape[0] != ndev:
+                raise ValueError(
+                    "exclusive_dynamic device expert buffer does not match "
+                    f"num_device_experts: layer={layer_moe_idx}, "
+                    f"configured={ndev}, w13_slots={_w13.shape[0]}, "
+                    f"w2_slots={_w2.shape[0]}")
+            self._init_exclusive_ownership(layer_moe_idx, ntotal, ndev)
+            cpu_experts = ntotal - ndev
+            w13_list = [
+                self._allocate_expert_host_tensor(w13_shape, params_dtype)
+                for _ in range(cpu_experts)
+            ]
+            w2_list = [
+                self._allocate_expert_host_tensor(w2_shape, params_dtype)
+                for _ in range(cpu_experts)
+            ]
+            self.w13_weights_cpu.append(w13_list)
+            self.w2_weights_cpu.append(w2_list)
+        elif self.offload_config.shard_per_rank:
             # shard-per-rank: each rank holds ONLY its EP shard of weight
             # experts (ntotal // ep_size), as per-expert pinned tensors (like
             # the non-shared path, but shard-sized). No mmap, no cross-process
@@ -497,11 +596,15 @@ class ExpertOffloadManager:
         ))
         expert_bytes = weights_bytes + quant_bytes
         rss, hwm, available = self._host_memory_snapshot()
-        cpu_mode = ("sharded" if self.offload_config.shard_per_rank
-                    else "replicated")
+        cpu_mode = (
+            "exclusive_dynamic" if self.exclusive_dynamic_enabled else
+            "sharded" if self.offload_config.shard_per_rank else
+            "replicated")
         experts_per_layer = (
             len(self.w13_weights_cpu[0]) if self.w13_weights_cpu else 0)
-        replica_factor = 1 if self.offload_config.shard_per_rank else self.ep_size
+        replica_factor = (
+            1 if (self.exclusive_dynamic_enabled
+                  or self.offload_config.shard_per_rank) else self.ep_size)
 
         def mib(value):
             return None if value is None else round(value / (1024 ** 2), 1)
@@ -525,7 +628,11 @@ class ExpertOffloadManager:
         # global<->local via _shard_local (mirrors the weight path); non-shard
         # (single-card) keeps the full ntotal, global==local.
         use_shard = self.offload_config.shard_per_rank
-        nalloc = (ntotal // max(1, self.ep_size)) if use_shard else ntotal
+        if self.exclusive_dynamic_enabled:
+            nalloc = len(self._cpu_slot_to_eid[layer_moe_idx])
+        else:
+            nalloc = ((ntotal // max(1, self.ep_size))
+                      if use_shard else ntotal)
         attr_specs = [
             ("scale_cpu_buffers", "w13_weight_scale"),
             ("scale_cpu_buffers", "w2_weight_scale"),
@@ -745,9 +852,9 @@ class ExpertOffloadManager:
         can hold the packed bytes without reallocation.
         """
         num_moe_layers = len(self.w13_weights_cpu)
-        num_experts = len(self.w13_weights_cpu[0])
         use_shard = self.offload_config.shard_per_rank
         for layer_id in range(num_moe_layers):
+            num_experts = len(self.w13_weights_cpu[layer_id])
             w13 = torch.stack(self.w13_weights_cpu[layer_id]).to('npu')
             w2 = torch.stack(self.w2_weights_cpu[layer_id]).to('npu')
             if mxfp4:
@@ -793,7 +900,11 @@ class ExpertOffloadManager:
                 # remaps it to the local slot); w13/w2_storage are indexed by
                 # the local position in the stacked tensor (== global id when
                 # not sharded).
-                geid = (self._shard_base + local_i) if use_shard else local_i
+                if self.exclusive_dynamic_enabled:
+                    geid = self._cpu_slot_to_eid[layer_id][local_i]
+                else:
+                    geid = ((self._shard_base + local_i)
+                            if use_shard else local_i)
                 self._expert_dst_storage(layer_id, geid, 'w13').copy_(
                     w13_storage[local_i * per_w13 : (local_i + 1) * per_w13]
                 )
@@ -1113,13 +1224,20 @@ class ExpertOffloadManager:
         local = global_eid - self._shard_base
         return local if 0 <= local < self._shard_size else None
 
+    def _cpu_local(self, layer_idx: int, global_eid: int) -> int | None:
+        """Resolve an expert's current compact CPU slot, if CPU-owned."""
+        if self.exclusive_dynamic_enabled:
+            slot = self._eid_to_cpu_slot[layer_idx][global_eid]
+            return None if slot < 0 else slot
+        return self._shard_local(global_eid)
+
     def load_w13(self, layer_moe_idx: int, expert_id: int,
                  loaded_weight: torch.Tensor, shard_id: str):
         """Store w1/w3 shard to CPU buffer (transposed) via the load pool."""
         self._weight_load_calls += 1
-        idx = self._shard_local(expert_id)
+        idx = self._cpu_local(layer_moe_idx, expert_id)
         if idx is None:
-            return  # shard-per-rank: expert not owned by this rank
+            return  # sharded remote expert or exclusive NPU-owned expert
         cpu = self.w13_weights_cpu[layer_moe_idx][idx]
         intermed = cpu.shape[1] // 2
         if loaded_weight.ndim > 0 and loaded_weight.shape[0] > intermed:
@@ -1136,9 +1254,9 @@ class ExpertOffloadManager:
                 loaded_weight: torch.Tensor):
         """Store w2 weight to CPU buffer (transposed) via the load pool."""
         self._weight_load_calls += 1
-        idx = self._shard_local(expert_id)
+        idx = self._cpu_local(layer_moe_idx, expert_id)
         if idx is None:
-            return  # shard-per-rank: expert not owned by this rank
+            return  # sharded remote expert or exclusive NPU-owned expert
         dst = self.w2_weights_cpu[layer_moe_idx][idx]
         owned = loaded_weight.cpu().clone()
         fut = self._get_load_pool().submit(self._copy_w2, dst, owned)
@@ -1168,9 +1286,9 @@ class ExpertOffloadManager:
             target_dict = self.offset_cpu_buffers
         # shard-per-rank: skip scales for non-owned experts and index the
         # shard-sized buffer locally (mirrors load_w13/load_w2).
-        local_eid = self._shard_local(expert_id)
+        local_eid = self._cpu_local(layer_moe_idx, expert_id)
         if local_eid is None:
-            return  # shard-per-rank: scale not owned by this rank
+            return  # sharded remote expert or exclusive NPU-owned expert
         target = target_dict[attr_name][layer_moe_idx][local_eid]
         if attr_name.startswith("w13_"):
             key = (layer_moe_idx, expert_id, attr_name)
@@ -1335,33 +1453,56 @@ class ExpertOffloadManager:
         source_eid: int,
         destination_eid: int,
     ) -> list[H2DCopyTask]:
-        """Build weight and quant tasks for one prefill-pool expert."""
+        """Build mixed-source copies for one prefill-pool expert.
+
+        Legacy ownership always uses CPU H2D.  Dynamic exclusive ownership
+        resolves the current canonical source per expert: CPU residents use
+        H2D and NPU residents use D2D from their decode slot.  Prefill does not
+        mutate ownership; it remains a full overwrite of the prefill pool.
+        """
         w13_start = destination_eid * self.w13_expert_size_bytes
         w2_start = destination_eid * self.w2_expert_size_bytes
         w13_dst = self._prefill_w13[pool_slot].untyped_storage()[
             w13_start:w13_start + self.w13_expert_size_bytes]
         w2_dst = self._prefill_w2[pool_slot].untyped_storage()[
             w2_start:w2_start + self.w2_expert_size_bytes]
+        npu_slot = -1
+        direction = CopyDirection.H2D
+        if self.exclusive_dynamic_enabled:
+            npu_slot = self._eid_to_npu_slot[layer_idx][source_eid]
+        if npu_slot >= 0:
+            source_layer = self.moe_layers[layer_idx]
+            w13_source = self._expert_device_storage(
+                source_layer, npu_slot, "w13")
+            w2_source = self._expert_device_storage(
+                source_layer, npu_slot, "w2")
+            direction = CopyDirection.D2D
+        else:
+            w13_source = self._expert_src_storage(
+                layer_idx, source_eid, 'w13')
+            w2_source = self._expert_src_storage(
+                layer_idx, source_eid, 'w2')
+
         tasks = [
             H2DCopyTask(
-                source=self._expert_src_storage(
-                    layer_idx, source_eid, 'w13'),
+                source=w13_source,
                 destination=w13_dst,
                 nbytes=self.w13_expert_size_bytes,
                 name=(f"prefill-w13[L{layer_idx},E{source_eid}"
                       f"->P{pool_slot}:E{destination_eid}]"),
+                direction=direction,
             ),
             H2DCopyTask(
-                source=self._expert_src_storage(
-                    layer_idx, source_eid, 'w2'),
+                source=w2_source,
                 destination=w2_dst,
                 nbytes=self.w2_expert_size_bytes,
                 name=(f"prefill-w2[L{layer_idx},E{source_eid}"
                       f"->P{pool_slot}:E{destination_eid}]"),
+                direction=direction,
             ),
         ]
 
-        local_eid = self._shard_local(source_eid)
+        local_eid = self._cpu_local(layer_idx, source_eid)
         quant_specs = (
             (self.scale_cpu_buffers, "w13_weight_scale",
              self._prefill_w13_scale),
@@ -1382,21 +1523,29 @@ class ExpertOffloadManager:
                     or layer_idx >= len(cpu_buffers[attr_name])):
                 continue
             dst = prefill_buffers[pool_slot][destination_eid]
-            if (local_eid is not None
+            if npu_slot >= 0:
+                source_layer = self.moe_layers[layer_idx]
+                source = getattr(source_layer, attr_name).data[npu_slot]
+                nbytes = source.numel() * source.element_size()
+                attr_direction = CopyDirection.D2D
+            elif (local_eid is not None
                     and local_eid < len(cpu_buffers[attr_name][layer_idx])):
                 src_tensor = cpu_buffers[attr_name][layer_idx][local_eid]
                 source = src_tensor.reshape(dst.shape)
                 nbytes = src_tensor.numel() * src_tensor.element_size()
+                attr_direction = CopyDirection.H2D
             else:
                 source = self._shared_h2d_source(
                     layer_idx, source_eid, attr_name)
                 nbytes = dst.numel() * dst.element_size()
+                attr_direction = CopyDirection.H2D
             tasks.append(H2DCopyTask(
                 source=source,
                 destination=dst,
                 nbytes=nbytes,
                 name=(f"prefill-{attr_name}[L{layer_idx},E{source_eid}"
                       f"->P{pool_slot}:E{destination_eid}]"),
+                direction=attr_direction,
             ))
         return tasks
 
@@ -1420,19 +1569,28 @@ class ExpertOffloadManager:
         configured H2D transport, just like runtime prefill/decode loading.
         """
         del dev
-        num_source_experts = min(ntotal, len(self.w13_weights_cpu[0]))
-        with torch_npu.npu.stream(self.load_stream):
-            for slot in range(ndl):
-                tasks = []
-                for local_eid in range(num_source_experts):
-                    source_eid = (
-                        self._shard_base + local_eid
-                        if self.offload_config.shard_per_rank else local_eid)
-                    tasks.extend(self._build_prefill_h2d_tasks(
-                        0, slot, source_eid, local_eid))
-                self._get_h2d_transport().copy_batch(tasks)
-                self._refresh_prefill_fp32_scale(slot, num_source_experts)
-            self._synchronize_h2d()
+        if self.exclusive_dynamic_enabled:
+            source_eids = list(range(ntotal))
+        else:
+            num_source_experts = min(ntotal, len(self.w13_weights_cpu[0]))
+            source_eids = [
+                (self._shard_base + local_eid
+                 if self.offload_config.shard_per_rank else local_eid)
+                for local_eid in range(num_source_experts)
+            ]
+        lock = (self._exclusive_layer_locks[0]
+                if self.exclusive_dynamic_enabled else nullcontext())
+        with lock:
+            with torch_npu.npu.stream(self.load_stream):
+                for slot in range(ndl):
+                    tasks = []
+                    for destination_eid, source_eid in enumerate(source_eids):
+                        tasks.extend(self._build_prefill_h2d_tasks(
+                            0, slot, source_eid, destination_eid))
+                    self._get_h2d_transport().copy_batch(tasks)
+                    self._refresh_prefill_fp32_scale(
+                        slot, len(source_eids))
+                self._synchronize_h2d()
 
     def _prefill_load_layer(self, layer_idx: int, log2phy: torch.Tensor):
         """Load ALL experts for model layer layer_idx into the prefill pool.
@@ -1451,14 +1609,17 @@ class ExpertOffloadManager:
             logger.info("[PREFILL_LOAD] layer=%d pool_slot=%d ntotal=%d is_w8a8=%s",
                         layer_idx, pool_slot, ntotal, is_w8a8)
 
-        with torch_npu.npu.stream(self.load_stream):
-            tasks = []
-            for eid in range(ntotal):
-                tasks.extend(self._build_prefill_h2d_tasks(
-                    layer_idx, pool_slot, eid, eid))
-            self._get_h2d_transport().copy_batch(tasks)
-            self._refresh_prefill_fp32_scale(pool_slot, ntotal)
-            self._synchronize_h2d()
+        lock = (self._exclusive_layer_locks[layer_idx]
+                if self.exclusive_dynamic_enabled else nullcontext())
+        with lock:
+            with torch_npu.npu.stream(self.load_stream):
+                tasks = []
+                for eid in range(ntotal):
+                    tasks.extend(self._build_prefill_h2d_tasks(
+                        layer_idx, pool_slot, eid, eid))
+                self._get_h2d_transport().copy_batch(tasks)
+                self._refresh_prefill_fp32_scale(pool_slot, ntotal)
+                self._synchronize_h2d()
 
         # NOTE: Do NOT modify the layer's own log2phy here — decode path
         # relies on it staying with 32-expert mapping.  Prefill path in
@@ -1977,12 +2138,28 @@ class ExpertOffloadManager:
         Otherwise: the expert tensor's own (already pinned) storage, global eid.
         """
         cpu_buf = getattr(self, f'{which}_weights_cpu')[layer_idx]
+        if self.exclusive_dynamic_enabled:
+            local_eid = self._cpu_local(layer_idx, eid)
+            if local_eid is None:
+                raise RuntimeError(
+                    "Requested CPU source for an NPU-owned expert: "
+                    f"layer={layer_idx}, expert={eid}, weight={which}")
+            return cpu_buf[local_eid].untyped_storage()
         if self.offload_config.shard_per_rank:
             local_eid = self._shard_local(eid)
             if local_eid is not None:
                 return cpu_buf[local_eid].untyped_storage()
             return self._shared_h2d_source(layer_idx, eid, which)
         return cpu_buf[eid].untyped_storage()
+
+    def _expert_device_storage(self, layer, slot: int, which: str):
+        """Return one decode slot's raw device bytes without changing layout."""
+        size = (self.w13_expert_size_bytes if which == "w13"
+                else self.w2_expert_size_bytes)
+        start = slot * size
+        return _expert_weight(
+            layer, f"{which}_weight").data.untyped_storage()[
+                start:start + size]
 
     def _expert_dst_storage(self, layer_idx, eid, which='w13'):
         """Return expert eid's storage for fill **write**.
@@ -1991,6 +2168,13 @@ class ExpertOffloadManager:
         Otherwise: the expert tensor's own storage, global eid.
         """
         cpu_buf = getattr(self, f'{which}_weights_cpu')[layer_idx]
+        if self.exclusive_dynamic_enabled:
+            local_eid = self._cpu_local(layer_idx, eid)
+            if local_eid is None:
+                raise RuntimeError(
+                    "Requested CPU destination for an NPU-owned expert: "
+                    f"layer={layer_idx}, expert={eid}, weight={which}")
+            return cpu_buf[local_eid].untyped_storage()
         if self.offload_config.shard_per_rank:
             return cpu_buf[eid - self._shard_base].untyped_storage()
         return cpu_buf[eid].untyped_storage()
@@ -2066,7 +2250,7 @@ class ExpertOffloadManager:
                             self.offset_cpu_buffers,
                             self.scale_bias_cpu_buffers):
             for attr_name, buffers in buffer_dict.items():
-                local_eid = self._shard_local(eid)
+                local_eid = self._cpu_local(layer_idx, eid)
                 dev_tensor = getattr(layer, attr_name, None)
                 if dev_tensor is None or layer_idx >= len(buffers):
                     continue
@@ -2525,6 +2709,155 @@ class ExpertOffloadManager:
             self._build_quant_attr_h2d_tasks(layer, layer_idx, eid, slot))
         return tasks
 
+    def _iter_cpu_expert_buffers(self, layer_idx: int):
+        """Yield every canonical CPU buffer participating in a swap."""
+        yield "w13", self.w13_weights_cpu[layer_idx]
+        yield "w2", self.w2_weights_cpu[layer_idx]
+        for buffer_dict in (self.scale_cpu_buffers,
+                            self.offset_cpu_buffers,
+                            self.scale_bias_cpu_buffers):
+            for attr_name, layer_buffers in buffer_dict.items():
+                if (layer_idx < len(layer_buffers)
+                        and layer_buffers[layer_idx]):
+                    yield attr_name, layer_buffers[layer_idx]
+
+    def _allocate_exclusive_swap_bundle(
+            self, layer_idx: int, cpu_slot: int) -> dict[str, torch.Tensor]:
+        """Allocate transient pinned storage for one evicted expert.
+
+        A miss cannot overwrite its incoming CPU buffer until that buffer has
+        finished H2D.  One transient bundle per simultaneously swapped expert
+        is therefore required.  Bundles are transaction-local, so canonical
+        storage remains exactly ``CPU experts + NPU experts == all experts``
+        and the extra peak is limited to misses of the active layer.
+        """
+        bundle = {}
+        for name, buffers in self._iter_cpu_expert_buffers(layer_idx):
+            template = buffers[cpu_slot]
+            bundle[name] = self._allocate_expert_host_tensor(
+                template.shape, template.dtype)
+        return bundle
+
+    def _build_expert_d2h_tasks(
+        self,
+        layer,
+        layer_idx: int,
+        victim_eid: int,
+        victim_slot: int,
+        scratch: dict[str, torch.Tensor],
+    ) -> list[H2DCopyTask]:
+        """Build device-to-host copies for one evicted expert."""
+        tasks = [
+            H2DCopyTask(
+                source=self._expert_device_storage(
+                    layer, victim_slot, "w13"),
+                destination=scratch["w13"].untyped_storage(),
+                nbytes=self.w13_expert_size_bytes,
+                name=(f"swap-d2h-w13[L{layer_idx},E{victim_eid}"
+                      f"<-S{victim_slot}]"),
+                direction=CopyDirection.D2H,
+            ),
+            H2DCopyTask(
+                source=self._expert_device_storage(
+                    layer, victim_slot, "w2"),
+                destination=scratch["w2"].untyped_storage(),
+                nbytes=self.w2_expert_size_bytes,
+                name=(f"swap-d2h-w2[L{layer_idx},E{victim_eid}"
+                      f"<-S{victim_slot}]"),
+                direction=CopyDirection.D2H,
+            ),
+        ]
+        for buffer_dict in (self.scale_cpu_buffers,
+                            self.offset_cpu_buffers,
+                            self.scale_bias_cpu_buffers):
+            for attr_name, layer_buffers in buffer_dict.items():
+                if (layer_idx >= len(layer_buffers)
+                        or attr_name not in scratch):
+                    continue
+                dev_tensor = getattr(layer, attr_name, None)
+                if dev_tensor is None:
+                    continue
+                source = dev_tensor.data[victim_slot]
+                destination = scratch[attr_name].reshape(source.shape)
+                tasks.append(H2DCopyTask(
+                    source=source,
+                    destination=destination,
+                    nbytes=source.numel() * source.element_size(),
+                    name=(f"swap-d2h-{attr_name}[L{layer_idx},"
+                          f"E{victim_eid}<-S{victim_slot}]"),
+                    direction=CopyDirection.D2H,
+                ))
+        return tasks
+
+    def _commit_exclusive_swap(
+        self,
+        layer_idx: int,
+        log2phy_np,
+        swap,
+        scratch: dict[str, torch.Tensor],
+    ) -> None:
+        """Commit one synchronized swap to CPU buffers and ownership maps."""
+        slot, incoming_eid, victim_eid, cpu_slot = swap
+        for name, buffers in self._iter_cpu_expert_buffers(layer_idx):
+            buffers[cpu_slot] = scratch[name]
+
+        self._cpu_slot_to_eid[layer_idx][cpu_slot] = victim_eid
+        self._eid_to_cpu_slot[layer_idx][incoming_eid] = -1
+        self._eid_to_cpu_slot[layer_idx][victim_eid] = cpu_slot
+        self._npu_slot_to_eid[layer_idx][slot] = incoming_eid
+        self._eid_to_npu_slot[layer_idx][victim_eid] = -1
+        self._eid_to_npu_slot[layer_idx][incoming_eid] = slot
+        log2phy_np[victim_eid] = -1
+        log2phy_np[incoming_eid] = slot
+
+    def _swap_expert_weights(self, layer, layer_idx: int, swaps,
+                             log2phy_np) -> None:
+        """Execute a batch of exclusive CPU↔NPU swaps atomically.
+
+        All victim D2H copies are queued before any incoming H2D copy.  The
+        load stream then refreshes derived fp32 scales and synchronizes once.
+        Only after that barrier do the canonical CPU buffer references,
+        inverse ownership maps and log2phy change.
+        """
+        swaps = list(swaps)
+        if not swaps:
+            return
+        if len({swap[0] for swap in swaps}) != len(swaps):
+            raise RuntimeError(
+                f"Duplicate NPU slots in exclusive swap plan: {swaps}")
+        if len({swap[3] for swap in swaps}) != len(swaps):
+            raise RuntimeError(
+                f"Duplicate CPU slots in exclusive swap plan: {swaps}")
+
+        scratch_bundles = [
+            self._allocate_exclusive_swap_bundle(layer_idx, cpu_slot)
+            for _, _, _, cpu_slot in swaps
+        ]
+        d2h_tasks = []
+        h2d_tasks = []
+        for (slot, incoming_eid, victim_eid, _), scratch in zip(
+                swaps, scratch_bundles):
+            d2h_tasks.extend(self._build_expert_d2h_tasks(
+                layer, layer_idx, victim_eid, slot, scratch))
+            h2d_tasks.extend(self._build_expert_h2d_tasks(
+                layer, layer_idx, incoming_eid, slot))
+
+        self._get_h2d_transport().copy_batch(d2h_tasks + h2d_tasks)
+        for slot, _, _, _ in swaps:
+            self._refresh_expert_fp32_scale(layer, slot)
+        self._synchronize_h2d()
+
+        for swap, scratch in zip(swaps, scratch_bundles):
+            self._commit_exclusive_swap(
+                layer_idx, log2phy_np, swap, scratch)
+        self._validate_exclusive_ownership(layer_idx)
+
+    def _write_exclusive_log2phy(self, layer_idx: int, log2phy_np) -> None:
+        """Rebuild staged log2phy from the authoritative ownership map."""
+        log2phy_np.fill(-1)
+        for slot, eid in enumerate(self._npu_slot_to_eid[layer_idx]):
+            log2phy_np[eid] = slot
+
     @staticmethod
     def _refresh_expert_fp32_scale(layer, slot):
         if hasattr(layer, 'w13_weight_scale_fp32'):
@@ -2677,6 +3010,127 @@ class ExpertOffloadManager:
             max(0, len(replacements) - sample_limit),
         )
 
+    @staticmethod
+    def _ordered_unique_experts(topk_ids_h) -> list[int]:
+        """Flatten routed experts while retaining first-seen order."""
+        ordered = []
+        seen = set()
+        for eid in topk_ids_h.reshape(-1).tolist():
+            eid = int(eid)
+            if eid >= 0 and eid not in seen:
+                seen.add(eid)
+                ordered.append(eid)
+        return ordered
+
+    def _update_weights_exclusive_dynamic(
+        self,
+        topk_ids_h,
+        log2phy_np,
+        layer,
+        layer_idx: int,
+        topk_weights_h,
+        is_prefetch: bool,
+    ) -> None:
+        """Single-card decode/prefetch planner for exclusive ownership."""
+        lock = self._exclusive_layer_locks[layer_idx]
+        with lock:
+            with torch_npu.npu.stream(self.load_stream):
+                # CPU/NPU ownership is authoritative.  Rebuild the staged map
+                # before planning so a delayed host callback cannot reintroduce
+                # an older mapping snapshot.
+                self._write_exclusive_log2phy(layer_idx, log2phy_np)
+                ordered = self._ordered_unique_experts(topk_ids_h)
+                if not is_prefetch and self.cache_policy is not None:
+                    router_scores = (
+                        topk_weights_h.tolist()
+                        if topk_weights_h is not None else None)
+                    needed = self.cache_policy.observe(
+                        layer_idx,
+                        topk_ids_h.tolist(),
+                        router_scores=router_scores,
+                    )
+                else:
+                    needed = set(ordered)
+
+                slot_owner = {
+                    slot: eid for slot, eid in enumerate(
+                        self._npu_slot_to_eid[layer_idx])
+                }
+                on_device = set(slot_owner.values())
+                ordered_misses = [
+                    eid for eid in ordered if eid not in on_device]
+                if is_prefetch:
+                    ordered_misses = ordered_misses[:self.prefetch_topk]
+                else:
+                    # LRC observe currently returns the routed set.  Include
+                    # any future policy-added experts deterministically.
+                    ordered_misses.extend(sorted(
+                        (needed - on_device) - set(ordered_misses)))
+                need_to_load = set(ordered_misses)
+                already_there = needed & on_device
+
+                if self.cache_policy is not None:
+                    self._record_cache_stats(
+                        layer_idx, already_there, need_to_load,
+                        needed, on_device)
+
+                reusable_slots = [
+                    slot for slot, eid in slot_owner.items()
+                    if eid not in needed
+                ]
+                victims = None
+                if self.cache_policy is not None:
+                    victims = iter(self.cache_policy.choose_victims(
+                        layer_idx,
+                        slot_owner,
+                        protected=needed,
+                        count=len(ordered_misses),
+                    ))
+
+                swaps = []
+                used_slots = set()
+                for incoming_eid in ordered_misses:
+                    cpu_slot = self._eid_to_cpu_slot[
+                        layer_idx][incoming_eid]
+                    if cpu_slot < 0:
+                        raise RuntimeError(
+                            "Exclusive ownership expected incoming expert on "
+                            f"CPU: layer={layer_idx}, expert={incoming_eid}")
+                    if victims is not None:
+                        victim_eid = next(victims, None)
+                        slot = (-1 if victim_eid is None else
+                                self._eid_to_npu_slot[layer_idx][victim_eid])
+                    elif reusable_slots:
+                        slot = reusable_slots.pop()
+                        victim_eid = slot_owner[slot]
+                    else:
+                        slot = -1
+                        victim_eid = None
+                    if slot < 0 or slot in used_slots:
+                        if is_prefetch:
+                            break
+                        raise RuntimeError(
+                            "No evictable NPU expert slot for reactive "
+                            f"exclusive swap: layer={layer_idx}, "
+                            f"needed={sorted(needed)}, "
+                            f"resident={sorted(on_device)}")
+                    used_slots.add(slot)
+                    swaps.append((slot, incoming_eid,
+                                  int(victim_eid), cpu_slot))
+
+                if self._debug:
+                    flag = ("[PREFETCH-SWAP]" if is_prefetch
+                            else "[UPDATE-SWAP]")
+                    logger.info(
+                        "%s l=%d hit=%s miss=%s swaps=%s",
+                        flag, layer_idx, sorted(already_there),
+                        ordered_misses,
+                        [(slot, incoming, victim)
+                         for slot, incoming, victim, _ in swaps],
+                    )
+                self._swap_expert_weights(
+                    layer, layer_idx, swaps, log2phy_np)
+
     def _update_weights(self, args):
         if len(args) == 6:
             (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
@@ -2707,6 +3161,16 @@ class ExpertOffloadManager:
                 self._log_expert_substitution(
                     layer_idx, original_ids, substituted_ids)
             topk_ids_h[:, :self.topk].copy_(substituted_ids)
+        if self.exclusive_dynamic_enabled:
+            self._update_weights_exclusive_dynamic(
+                topk_ids_h,
+                log2phy_np,
+                layer,
+                layer_idx,
+                topk_weights_h,
+                is_prefetch,
+            )
+            return
         with torch_npu.npu.stream(self.load_stream):
             # Hotness observation only on the reactive (non-prefetch) H2D path
             # with LRC policy enabled.

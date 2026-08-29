@@ -518,8 +518,39 @@ class TestExpertOffloadConfig(TestBase):
         config = ExpertOffloadConfig({})
 
         self.assertEqual(config.h2d_backend, "torch")
+        self.assertEqual(config.storage_partition_mode, "replicated")
         self.assertEqual(config.memfabric_pool_size_gib, 0)
         self.assertEqual(config.memfabric_log_level, 3)
+
+    def test_exclusive_dynamic_storage_accepts_single_card_torch(self):
+        config = ExpertOffloadConfig({
+            "storage_partition_mode": "exclusive_dynamic",
+            "num_device_experts": 32,
+            "expert_prefetch_enabled": True,
+        })
+
+        self.assertEqual(config.storage_partition_mode, "exclusive_dynamic")
+        self.assertTrue(config.expert_prefetch_enabled)
+
+    def test_exclusive_dynamic_storage_validation(self):
+        with self.assertRaisesRegex(ValueError, "storage_partition_mode"):
+            ExpertOffloadConfig({"storage_partition_mode": "static"})
+        with self.assertRaisesRegex(ValueError, "single-card only"):
+            ExpertOffloadConfig({
+                "storage_partition_mode": "exclusive_dynamic",
+                "enable_multi_card": True,
+            })
+        with self.assertRaisesRegex(ValueError, "requires.*torch"):
+            ExpertOffloadConfig({
+                "storage_partition_mode": "exclusive_dynamic",
+                "h2d_backend": "memfabric",
+                "memfabric_pool_size_gib": 16,
+            })
+        with self.assertRaisesRegex(ValueError, "num_device_experts.*> 0"):
+            ExpertOffloadConfig({
+                "storage_partition_mode": "exclusive_dynamic",
+                "num_device_experts": 0,
+            })
 
     def test_memfabric_h2d_accepts_local_and_shared_configs(self):
         local = ExpertOffloadConfig({
