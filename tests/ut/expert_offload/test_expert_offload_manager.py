@@ -17,6 +17,7 @@ from vllm_ascend.expert_offload.h2d_transfer import (
     CopyDirection,
     H2DCopyTask,
 )
+from vllm_ascend.expert_offload.utils import init_expert_offload_config
 
 
 def _manager_for_prediction(next_layer, gate_weight, *, topk=2,
@@ -69,6 +70,7 @@ def test_cpu_tensor_storage_bytes_counts_unique_nested_storages():
 def test_exclusive_dynamic_allocates_only_cpu_owned_experts():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager.offload_config = ExpertOffloadConfig({
+        "expert_offload": True,
         "storage_partition_mode": "exclusive_dynamic",
         "num_device_experts": 2,
     })
@@ -103,6 +105,57 @@ def test_exclusive_dynamic_allocates_only_cpu_owned_experts():
     assert manager._eid_to_cpu_slot[0] == [-1, -1, 0, 1, 2]
     assert manager._cpu_local(0, 0) is None
     assert manager._cpu_local(0, 4) == 2
+
+
+def test_exclusive_dynamic_allocates_each_layer_capacity_from_list():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "storage_partition_mode": "exclusive_dynamic",
+        "num_device_experts": [2, 3],
+    })
+    manager.num_total_experts = None
+    manager.w13_weights_cpu = []
+    manager.w2_weights_cpu = []
+    manager.scale_cpu_buffers = {}
+    manager.offset_cpu_buffers = {}
+    manager.scale_bias_cpu_buffers = {}
+    manager._cpu_slot_to_eid = []
+    manager._eid_to_cpu_slot = []
+    manager._npu_slot_to_eid = []
+    manager._eid_to_npu_slot = []
+    manager._exclusive_layer_locks = []
+    manager.moe_layers = []
+    manager.cache_policy = None
+    manager._allocate_expert_host_tensor = (
+        lambda shape, dtype: torch.empty(shape, dtype=dtype))
+    layers = [
+        SimpleNamespace(
+            global_num_experts=5,
+            w13_weight=torch.empty((2, 6, 4), dtype=torch.uint8),
+            w2_weight=torch.empty((2, 5, 4), dtype=torch.uint8),
+        ),
+        SimpleNamespace(
+            global_num_experts=5,
+            w13_weight=torch.empty((3, 6, 4), dtype=torch.uint8),
+            w2_weight=torch.empty((3, 5, 4), dtype=torch.uint8),
+        ),
+    ]
+
+    for layer_idx, layer in enumerate(layers):
+        manager.init_layer_cpu_buffers(layer, layer_idx)
+
+    assert [len(buffers) for buffers in manager.w13_weights_cpu] == [3, 2]
+    assert [len(buffers) for buffers in manager.w2_weights_cpu] == [3, 2]
+    assert manager._npu_slot_to_eid == [[0, 1], [0, 1, 2]]
+    assert manager._cpu_slot_to_eid == [[2, 3, 4], [3, 4]]
+    assert manager._eid_to_npu_slot == [
+        [0, 1, -1, -1, -1],
+        [0, 1, 2, -1, -1],
+    ]
+    assert manager._eid_to_cpu_slot == [
+        [-1, -1, 0, 1, 2],
+        [-1, -1, -1, 0, 1],
+    ]
 
 
 def test_replicated_cpu_memory_log_reports_full_copy_per_rank():
@@ -957,38 +1010,84 @@ def test_multi_card_misses_submit_one_batch_before_resident_commit():
     manager.load_stream.synchronize.assert_called_once_with()
 
 
-def test_single_card_hot_preload_uses_format_aware_shared_copy(tmp_path):
+def test_single_card_hot_preload_builds_initial_expert_map_without_copy(
+        tmp_path):
     ranking_path = tmp_path / "hot.json"
     ranking_path.write_text(json.dumps({"0": [[3, 0.9], [1, 0.8],
                                                    [2, 0.7]]}))
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
+    config = ExpertOffloadConfig({
+        "expert_offload": True,
         "num_device_experts": 2,
         "hot_expert_preload": True,
         "hot_experts_file": str(ranking_path),
     })
+    enabled, expert_map, ndev = init_expert_offload_config(
+        config, num_experts=4, layer_idx=0)
+    _, ordinary_map, _ = init_expert_offload_config(
+        ExpertOffloadConfig({
+            "expert_offload": True,
+            "num_device_experts": 2,
+        }),
+        num_experts=4,
+        layer_idx=0,
+    )
+
+    assert enabled
+    assert ndev == 2
+    assert expert_map.tolist() == [-1, 1, -1, 0]
+    assert ordinary_map.tolist() == [0, 1, -1, -1]
+
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = config
     manager.enable_multi_card = False
-    manager.cache_policy = None
+    manager.num_total_experts = 4
+    manager.cache_policy = MagicMock()
     manager._debug = False
-    manager.load_stream = MagicMock()
-    manager.log2phy_h = torch.full((4,), -1, dtype=torch.int32)
-    manager.log2phy_np = manager.log2phy_h.numpy()
-    layer = SimpleNamespace(log2phy=MagicMock())
-    manager.moe_layers = [layer]
+    manager.moe_layers = [SimpleNamespace()]
     manager._load_expert_weights_into_slot = MagicMock()
+    manager._synchronize_h2d = MagicMock()
 
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
-        return_value=nullcontext(),
-    ):
-        manager._preload_hot_experts()
+    manager._preload_hot_experts()
 
-    assert manager._load_expert_weights_into_slot.call_args_list == [
-        call(layer, 0, 3, 0),
-        call(layer, 0, 1, 1),
+    manager._load_expert_weights_into_slot.assert_not_called()
+    manager._synchronize_h2d.assert_not_called()
+    manager.cache_policy.seed_layer_hotness.assert_called_once_with(
+        0, {3: 0.9, 1: 0.8})
+
+
+def test_single_card_weight_loader_maps_hot_global_expert_to_device_slot():
+    from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
+
+    original_loader = MagicMock()
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    runner.moe_instance_id = 0
+    runner.enable_multi_card = False
+    runner._expert_map_offload = torch.tensor(
+        [-1, 1, -1, 0], dtype=torch.int32)
+    runner.routed_experts = SimpleNamespace(weight_loader=original_loader)
+    manager = SimpleNamespace(
+        offload_config=SimpleNamespace(
+            num_device_experts_for_rank=MagicMock(return_value=2)),
+        load_w13=MagicMock(),
+        load_w2=MagicMock(),
+        _load_scale_shard=MagicMock(),
+    )
+    loaded_weight = torch.ones((2, 2))
+
+    with patch.object(
+            ExpertOffloadManager, "get_instance", return_value=manager):
+        runner._wrap_weight_loader_for_offload()
+
+    wrapped_loader = runner.routed_experts.weight_loader
+    wrapped_loader(None, loaded_weight, "w13_weight", "w1", 3)
+    wrapped_loader(None, loaded_weight, "w13_weight", "w1", 0)
+
+    assert manager.load_w13.call_args_list == [
+        call(0, 3, loaded_weight, "w1"),
+        call(0, 0, loaded_weight, "w1"),
     ]
-    assert manager.log2phy_h.tolist() == [-1, 1, -1, 0]
-    layer.log2phy.copy_.assert_called_once_with(manager.log2phy_h)
+    original_loader.assert_called_once_with(
+        None, loaded_weight, "w13_weight", "w1", 0)
 
 
 def test_multi_card_hot_preload_loads_only_rank_owned_experts(tmp_path):
@@ -1137,6 +1236,77 @@ def test_exclusive_swap_preserves_victim_and_commits_after_copy():
     manager._synchronize_h2d.assert_called_once_with()
 
 
+def test_hot_preload_with_exclusive_dynamic_and_layer_capacities(tmp_path):
+    ranking_path = tmp_path / "hot.json"
+    ranking_path.write_text(json.dumps({
+        "0": [[2, 0.9], [1, 0.8], [4, 0.7]],
+        "1": [[4, 0.95], [1, 0.85], [3, 0.75]],
+    }))
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "expert_offload": True,
+        "storage_partition_mode": "exclusive_dynamic",
+        "num_device_experts": [2, 3],
+        "hot_expert_preload": True,
+        "hot_experts_file": str(ranking_path),
+        "shard_per_rank": False,
+    })
+    manager.enable_multi_card = False
+    manager.num_total_experts = None
+    manager.w13_weights_cpu = []
+    manager.w2_weights_cpu = []
+    manager.scale_cpu_buffers = {}
+    manager.offset_cpu_buffers = {}
+    manager.scale_bias_cpu_buffers = {}
+    manager._cpu_slot_to_eid = []
+    manager._eid_to_cpu_slot = []
+    manager._npu_slot_to_eid = []
+    manager._eid_to_npu_slot = []
+    manager._exclusive_layer_locks = []
+    manager.moe_layers = []
+    manager.cache_policy = None
+    manager._allocate_expert_host_tensor = (
+        lambda shape, dtype: torch.empty(shape, dtype=dtype))
+    manager.h2d_transport = _CopyingExpertTransport()
+    manager._synchronize_h2d = MagicMock()
+    manager._debug = False
+    layers = [
+        SimpleNamespace(
+            global_num_experts=5,
+            w13_weight=torch.empty((2, 6, 4), dtype=torch.uint8),
+            w2_weight=torch.empty((2, 5, 4), dtype=torch.uint8),
+        ),
+        SimpleNamespace(
+            global_num_experts=5,
+            w13_weight=torch.empty((3, 6, 4), dtype=torch.uint8),
+            w2_weight=torch.empty((3, 5, 4), dtype=torch.uint8),
+        ),
+    ]
+
+    for layer_idx, layer in enumerate(layers):
+        manager.init_layer_cpu_buffers(layer, layer_idx)
+
+    manager.cache_policy = MagicMock()
+    manager._preload_hot_experts()
+
+    assert manager._npu_slot_to_eid == [[2, 1], [4, 1, 3]]
+    assert manager._cpu_slot_to_eid == [[0, 3, 4], [0, 2]]
+    assert manager._eid_to_npu_slot == [
+        [-1, 1, 0, -1, -1],
+        [-1, 1, -1, 2, 0],
+    ]
+    assert manager._eid_to_cpu_slot == [
+        [0, -1, -1, 1, 2],
+        [0, -1, 1, -1, -1],
+    ]
+    assert manager.h2d_transport.batches == []
+    manager._synchronize_h2d.assert_not_called()
+    assert manager.cache_policy.seed_layer_hotness.call_args_list == [
+        call(0, {2: 0.9, 1: 0.8}),
+        call(1, {4: 0.95, 1: 0.85, 3: 0.75}),
+    ]
+
+
 def test_exclusive_prefill_resolves_npu_source_as_d2d_and_cpu_as_h2d():
     manager = _exclusive_runtime_manager()
     layer = SimpleNamespace(
@@ -1215,3 +1385,48 @@ def test_exclusive_prefetch_uses_same_dynamic_swap_planner():
 
     manager._swap_expert_weights.assert_called_once_with(
         layer, 0, [(1, 2, 1, 0)], log2phy_np)
+
+
+def test_exclusive_debug_log_includes_cache_observability_and_swaps():
+    manager = _exclusive_runtime_manager()
+    manager.topk = 2
+    manager.cache_policy = None
+    manager._debug = True
+    manager.load_stream = MagicMock()
+    manager._swap_expert_weights = MagicMock()
+    topk_ids = torch.tensor([[2, 1]], dtype=torch.int32)
+    log2phy = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
+    layer = SimpleNamespace()
+
+    with (
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager."
+            "torch_npu.npu.stream",
+            return_value=nullcontext(),
+        ),
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
+        ) as log_info,
+    ):
+        manager._update_weights((
+            topk_ids,
+            log2phy.numpy(),
+            layer,
+            0,
+            None,
+            False,
+        ))
+
+    log_args = log_info.call_args.args
+    assert "expert_hit=%s expert_miss=%s hit_rate=%.2f" in log_args[0]
+    assert log_args[1:8] == (
+        "[UPDATE-SWAP]",
+        0,
+        [1],
+        [2],
+        0.5,
+        {1},
+        {1, 2},
+    )
+    assert log_args[8] is topk_ids
+    assert log_args[9] == [(0, 2, 0)]

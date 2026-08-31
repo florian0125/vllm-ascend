@@ -532,6 +532,35 @@ class TestExpertOffloadConfig(TestBase):
         self.assertEqual(config.storage_partition_mode, "exclusive_dynamic")
         self.assertTrue(config.expert_prefetch_enabled)
 
+    def test_exclusive_dynamic_accepts_hot_preload_with_all_capacities(self):
+        with (
+            patch("vllm_ascend.ascend_config.os.path.exists",
+                  return_value=True),
+            patch("vllm_ascend.ascend_config.os.access", return_value=True),
+        ):
+            scalar = ExpertOffloadConfig({
+                "expert_offload": True,
+                "storage_partition_mode": "exclusive_dynamic",
+                "num_device_experts": 16,
+                "hot_expert_preload": True,
+                "hot_experts_file": "hot.json",
+            })
+            per_layer = ExpertOffloadConfig({
+                "expert_offload": True,
+                "storage_partition_mode": "exclusive_dynamic",
+                "num_device_experts": [16, 24, 32],
+                "hot_expert_preload": True,
+                "hot_experts_file": "hot.json",
+            })
+
+        self.assertTrue(scalar.hot_expert_preload)
+        self.assertEqual(scalar.num_device_experts_for_layer(2), 16)
+        self.assertTrue(per_layer.hot_expert_preload)
+        self.assertEqual(
+            [per_layer.num_device_experts_for_layer(i) for i in range(3)],
+            [16, 24, 32],
+        )
+
     def test_exclusive_dynamic_storage_validation(self):
         with self.assertRaisesRegex(ValueError, "storage_partition_mode"):
             ExpertOffloadConfig({"storage_partition_mode": "static"})

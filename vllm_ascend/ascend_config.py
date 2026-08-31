@@ -985,6 +985,7 @@ class ExpertOffloadConfig:
         if user_config is None:
             user_config = {}
         self.config = self._defaults.copy()
+        self._hot_experts_cache: dict[str, Any] | None = None
         if user_config and isinstance(user_config, dict):
             for key, value in user_config.items():
                 if key in self.config:
@@ -1037,6 +1038,86 @@ class ExpertOffloadConfig:
                 f"layer={layer_idx}, capacity={capacity}, ep_size={ep_size}")
         return capacity // ep_size
 
+    def _resolved_hot_experts_path(self) -> str:
+        path = self.hot_experts_file
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(__file__), "expert_offload",
+                                path)
+        return path
+
+    def hot_expert_pairs_for_layer(
+        self,
+        layer_idx: int,
+        num_experts: int,
+    ) -> list[tuple[int, float]]:
+        """Return one layer's validated offline hot-expert ranking."""
+        if not self.hot_expert_preload:
+            return []
+        if self._hot_experts_cache is None:
+            with open(self._resolved_hot_experts_path(), encoding="utf-8") as f:
+                hot = json.load(f)
+            if not isinstance(hot, dict):
+                raise ValueError("hot_experts_file root must be a JSON object")
+            self._hot_experts_cache = hot
+
+        raw_pairs = self._hot_experts_cache.get(str(layer_idx), [])
+        if not isinstance(raw_pairs, list):
+            raise ValueError(
+                "Hot expert ranking for each layer must be a list; "
+                f"layer={layer_idx}, value={raw_pairs!r}")
+
+        normalized = []
+        seen = set()
+        for pair in raw_pairs:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError(
+                    "Each hot expert entry must be [expert_id, weight]; "
+                    f"layer={layer_idx}, entry={pair!r}")
+            try:
+                eid = int(pair[0])
+                weight = float(pair[1])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Invalid hot expert entry: "
+                    f"layer={layer_idx}, entry={pair!r}") from exc
+            if not 0 <= eid < num_experts:
+                raise ValueError(
+                    f"Hot expert id is outside [0, {num_experts}): "
+                    f"layer={layer_idx}, expert={eid}")
+            if eid in seen:
+                raise ValueError(
+                    f"Duplicate hot expert id: layer={layer_idx}, "
+                    f"expert={eid}")
+            seen.add(eid)
+            normalized.append((eid, weight))
+        return normalized
+
+    def initial_device_experts_for_layer(
+        self,
+        layer_idx: int,
+        num_experts: int,
+    ) -> list[int]:
+        """Resolve the experts loaded directly into single-card NPU slots."""
+        capacity = self.num_device_experts_for_layer(layer_idx)
+        if not 0 <= capacity <= num_experts:
+            raise ValueError(
+                "num_device_experts must not exceed num_experts; "
+                f"layer={layer_idx}, capacity={capacity}, "
+                f"num_experts={num_experts}")
+        if not self.hot_expert_preload or self.enable_multi_card:
+            return list(range(capacity))
+
+        ranked = self.hot_expert_pairs_for_layer(layer_idx, num_experts)
+        initial = [eid for eid, _ in ranked[:capacity]]
+        selected = set(initial)
+        for eid in range(num_experts):
+            if len(initial) == capacity:
+                break
+            if eid not in selected:
+                initial.append(eid)
+                selected.add(eid)
+        return initial
+
     def validate_num_moe_layers(self, num_moe_layers: int) -> None:
         """Validate current target layers while allowing later MTP layers."""
         nde_list = self.num_device_experts_list
@@ -1070,10 +1151,7 @@ class ExpertOffloadConfig:
             if not self.hot_experts_file.endswith(".json"):
                 raise TypeError("hot_experts_file must be a .json file")
             # 相对路径相对 expert_offload 模块目录 resolve（热点 JSON 始终放该目录）
-            hot_path = self.hot_experts_file
-            if not os.path.isabs(hot_path):
-                hot_path = os.path.join(os.path.dirname(__file__),
-                                        "expert_offload", hot_path)
+            hot_path = self._resolved_hot_experts_path()
             if not (os.path.exists(hot_path) and os.access(hot_path, os.R_OK)):
                 raise ValueError(
                     f"hot_experts_file not found or unreadable: "
@@ -1174,11 +1252,6 @@ class ExpertOffloadConfig:
                 raise ValueError(
                     "storage_partition_mode='exclusive_dynamic' requires "
                     "h2d_backend='torch' because each swap needs D2H and H2D")
-            if self.config["hot_expert_preload"]:
-                raise ValueError(
-                    "hot_expert_preload is incompatible with "
-                    "storage_partition_mode='exclusive_dynamic'; use dynamic "
-                    "expert prefetch instead")
             if any(value <= 0 for value in self.num_device_experts_list):
                 raise ValueError(
                     "num_device_experts must be > 0 when "

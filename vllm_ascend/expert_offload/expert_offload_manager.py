@@ -357,8 +357,13 @@ class ExpertOffloadManager:
         return (self.offload_config.storage_partition_mode
                 == "exclusive_dynamic")
 
-    def _init_exclusive_ownership(self, layer_moe_idx: int, ntotal: int,
-                                  ndev: int) -> None:
+    def _init_exclusive_ownership(
+        self,
+        layer_moe_idx: int,
+        ntotal: int,
+        ndev: int,
+        npu_eids: list[int] | None = None,
+    ) -> None:
         """Create inverse CPU/NPU ownership maps for one MoE layer."""
         if not 0 < ndev < ntotal:
             raise ValueError(
@@ -366,8 +371,18 @@ class ExpertOffloadManager:
                 f"global_num_experts; layer={layer_moe_idx}, "
                 f"num_device_experts={ndev}, global_num_experts={ntotal}")
 
-        npu_slot_to_eid = list(range(ndev))
-        cpu_slot_to_eid = list(range(ndev, ntotal))
+        npu_slot_to_eid = (
+            list(range(ndev)) if npu_eids is None else list(npu_eids))
+        if (len(npu_slot_to_eid) != ndev
+                or len(set(npu_slot_to_eid)) != ndev
+                or any(eid < 0 or eid >= ntotal for eid in npu_slot_to_eid)):
+            raise ValueError(
+                "Initial exclusive NPU experts must be unique, in range, and "
+                f"match device capacity; layer={layer_moe_idx}, "
+                f"ndev={ndev}, experts={npu_slot_to_eid}")
+        npu_set = set(npu_slot_to_eid)
+        cpu_slot_to_eid = [
+            eid for eid in range(ntotal) if eid not in npu_set]
         eid_to_npu_slot = [-1] * ntotal
         eid_to_cpu_slot = [-1] * ntotal
         for slot, eid in enumerate(npu_slot_to_eid):
@@ -442,7 +457,11 @@ class ExpertOffloadManager:
                     f"num_device_experts: layer={layer_moe_idx}, "
                     f"configured={ndev}, w13_slots={_w13.shape[0]}, "
                     f"w2_slots={_w2.shape[0]}")
-            self._init_exclusive_ownership(layer_moe_idx, ntotal, ndev)
+            initial_npu_eids = (
+                self.offload_config.initial_device_experts_for_layer(
+                    layer_moe_idx, ntotal))
+            self._init_exclusive_ownership(
+                layer_moe_idx, ntotal, ndev, initial_npu_eids)
             cpu_experts = ntotal - ndev
             w13_list = [
                 self._allocate_expert_host_tensor(w13_shape, params_dtype)
@@ -3121,13 +3140,28 @@ class ExpertOffloadManager:
                 if self._debug:
                     flag = ("[PREFETCH-SWAP]" if is_prefetch
                             else "[UPDATE-SWAP]")
+                    already_there_layer = (
+                        set(topk_ids_h[0].tolist()) & on_device)
+                    requests = len(already_there) + len(need_to_load)
+                    hit_rate = (len(already_there) / requests
+                                if requests else 0.0)
                     logger.info(
-                        "%s l=%d hit=%s miss=%s swaps=%s",
+                        "%s l=%d expert_hit=%s expert_miss=%s "
+                        "hit_rate=%.2f layer_expert_hit=%s needed=%s "
+                        "topk_ids_h=%s swaps=%s",
                         flag, layer_idx, sorted(already_there),
-                        ordered_misses,
+                        sorted(need_to_load), hit_rate,
+                        already_there_layer, needed, topk_ids_h,
                         [(slot, incoming, victim)
                          for slot, incoming, victim, _ in swaps],
                     )
+                    if len(swaps) < len(ordered_misses):
+                        logger.info(
+                            "%s l=%d SHORTFALL: need %d load but only %d "
+                            "swaps planned, to_load=%s",
+                            flag, layer_idx, len(ordered_misses), len(swaps),
+                            ordered_misses[len(swaps):][:20],
+                        )
                 self._swap_expert_weights(
                     layer, layer_idx, swaps, log2phy_np)
 
@@ -3278,98 +3312,104 @@ class ExpertOffloadManager:
             is_prefetch,
         )
 
+    def _seed_single_card_hot_experts(self) -> None:
+        """Seed cache state for experts already placed during weight load."""
+        for layer_idx in range(len(self.moe_layers)):
+            pairs = self.offload_config.hot_expert_pairs_for_layer(
+                layer_idx, self.num_total_experts)
+            if not pairs:
+                logger.warning("[HOT-PRELOAD] l=%d missing in json; "
+                               "using ordinary initial placement", layer_idx)
+                continue
+            ndev = self.num_device_experts_for_layer(layer_idx)
+            weights = dict(pairs[:ndev])
+            if self.exclusive_dynamic_enabled:
+                expected = (
+                    self.offload_config.initial_device_experts_for_layer(
+                        layer_idx, self.num_total_experts))
+                actual = self._npu_slot_to_eid[layer_idx]
+                if actual != expected:
+                    raise RuntimeError(
+                        "Exclusive hot experts were not placed during weight "
+                        f"initialization: layer={layer_idx}, "
+                        f"expected={expected}, actual={actual}")
+                self._validate_exclusive_ownership(layer_idx)
+            if self.cache_policy is not None:
+                self.cache_policy.seed_layer_hotness(layer_idx, weights)
+            if self._debug:
+                logger.info(
+                    "[HOT-PRELOAD] l=%d initialized %d hot experts, ids=%s",
+                    layer_idx, len(weights), list(weights)[:20])
+
     def _preload_hot_experts(self):
-        """Preload each layer's top-N hot experts into device resident slots
-        from offline statistics, and seed LRC hotness so they aren't evicted
-        before runtime observe() builds up real stats.
+        """Finalize offline hot-expert placement and seed LRC hotness.
 
         Triggered from _finalize_offload() when hot_expert_preload is on.
-        Reads hot_experts_file: {"<layer_idx>": [[expert_id, weight], ...]},
-        weight descending. Slot i = the i-th hottest expert. Fully rewrites
-        layer.log2phy (non-preloaded experts -> -1). No-op when the switch
-        is off, so default behavior is unchanged.
+        Single-card weights are already loaded directly into their ranked
+        device slots, so this path only seeds the cache. Multi-card placement
+        still requires its collective rank planner and retains the historical
+        post-load H2D path. No-op when the switch is off.
         """
         if not self.offload_config.hot_expert_preload:
             return
-        path = self.offload_config.hot_experts_file
-        if not path:
-            logger.warning("[HOT-PRELOAD] hot_expert_preload=true but "
-                           "hot_experts_file empty, skip")
+        if not self.enable_multi_card:
+            self._seed_single_card_hot_experts()
             return
-        # 相对路径相对 expert_offload 模块目录 resolve（热点 JSON 始终放该目录）
-        if not os.path.isabs(path):
-            path = os.path.join(os.path.dirname(__file__), path)
-        import json
-        with open(path) as f:
-            hot = json.load(f)                  # {"<layer_idx>": [[eid,w],...]}
-        if self.enable_multi_card and self.cache_policy is not None:
+        if self.cache_policy is not None:
             # Multi-card decode uses _mc_lrc; share the already configured
             # per-layer policy so offline seeds and runtime observations evolve
             # from the same state.
             self._mc_lrc = self.cache_policy
         with torch_npu.npu.stream(self.load_stream):
             for layer_idx, layer in enumerate(self.moe_layers):
-                pairs = hot.get(str(layer_idx))
+                pairs = self.offload_config.hot_expert_pairs_for_layer(
+                    layer_idx, self.num_total_experts)
                 if not pairs:
                     logger.warning("[HOT-PRELOAD] l=%d missing in json, skip",
                                    layer_idx)
                     continue
-                if self.enable_multi_card:
-                    from vllm_ascend.expert_offload.multi_card_planner import (
-                        plan_hot_preload)
-                    per_rank_slots = (
-                        self.offload_config.num_device_experts_for_rank(
-                            layer_idx, self.ep_size))
-                    force_shard = (
-                        getattr(self, '_shard_size', None)
-                        if (self.offload_config.shard_per_rank
-                            and not self._shared_h2d_layer_ready(layer_idx))
-                        else None)
-                    placement = plan_hot_preload(
-                        pairs,
-                        global_num_experts=self.num_total_experts,
-                        ep_size=self.ep_size,
-                        num_device_experts=per_rank_slots,
-                        force_shard=force_shard,
-                    )
-                    my_experts = placement.per_rank_experts[self.ep_rank]
-                    for slot, eid in enumerate(my_experts):
-                        if eid >= 0:
-                            self._load_expert_weights_into_slot(
-                                layer, layer_idx, eid, slot)
-                    self.log2phy_h.copy_(placement.log2phy)
-                    self._mc_prev_log2phy[layer_idx] = (
-                        placement.log2phy.clone())
-                    self._mc_resident[layer_idx] = {
-                        slot: int(eid)
-                        for slot, eid in enumerate(my_experts) if eid >= 0
-                    }
-                    pair_weights = {int(eid): float(weight)
-                                    for eid, weight in pairs}
-                    weights = {
-                        eid: pair_weights[eid]
-                        for eid, physical_id in enumerate(
-                            placement.log2phy.tolist())
-                        if physical_id >= 0
-                    }
-                else:
-                    ndev = self.num_device_experts_for_layer(layer_idx)
-                    selected_pairs = pairs[:ndev]
-                    self.log2phy_np[:] = -1
-                    weights = {}
-                    for slot, (eid, weight) in enumerate(selected_pairs):
+                from vllm_ascend.expert_offload.multi_card_planner import (
+                    plan_hot_preload)
+                per_rank_slots = (
+                    self.offload_config.num_device_experts_for_rank(
+                        layer_idx, self.ep_size))
+                force_shard = (
+                    getattr(self, '_shard_size', None)
+                    if (self.offload_config.shard_per_rank
+                        and not self._shared_h2d_layer_ready(layer_idx))
+                    else None)
+                placement = plan_hot_preload(
+                    pairs,
+                    global_num_experts=self.num_total_experts,
+                    ep_size=self.ep_size,
+                    num_device_experts=per_rank_slots,
+                    force_shard=force_shard,
+                )
+                my_experts = placement.per_rank_experts[self.ep_rank]
+                for slot, eid in enumerate(my_experts):
+                    if eid >= 0:
                         self._load_expert_weights_into_slot(
                             layer, layer_idx, eid, slot)
-                        self.log2phy_np[eid] = slot
-                        weights[eid] = weight
+                self.log2phy_h.copy_(placement.log2phy)
+                self._mc_prev_log2phy[layer_idx] = placement.log2phy.clone()
+                self._mc_resident[layer_idx] = {
+                    slot: int(eid)
+                    for slot, eid in enumerate(my_experts) if eid >= 0
+                }
+                pair_weights = dict(pairs)
+                weights = {
+                    eid: pair_weights[eid]
+                    for eid, physical_id in enumerate(
+                        placement.log2phy.tolist())
+                    if physical_id >= 0
+                }
                 layer.log2phy.copy_(self.log2phy_h)         # H2D writeback
                 if self.cache_policy is not None:
                     self.cache_policy.seed_layer_hotness(layer_idx, weights)
                 if self._debug:
-                    logger.info("[HOT-PRELOAD] l=%d loaded %d hot experts, "
-                                "ids=%s",
-                                layer_idx, len(weights),
-                                list(weights)[:20])
+                    logger.info(
+                        "[HOT-PRELOAD] l=%d loaded %d hot experts, ids=%s",
+                        layer_idx, len(weights), list(weights)[:20])
             self._synchronize_h2d()
 
     def predict_next_layer_experts_npu(

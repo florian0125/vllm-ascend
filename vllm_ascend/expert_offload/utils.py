@@ -8,7 +8,9 @@ def init_expert_offload_config(offload_config, num_experts: int,
     """Prepare pre-super().__init__() expert offload setup.
 
     Builds an expert_map_offload that the upstream layer.py hook reads
-    to shrink the device weight and skip loading cold experts.
+    to shrink the device weight and skip loading cold experts. Single-card
+    hot preload maps the ranked global expert IDs directly to initial slots;
+    otherwise the ordinary contiguous ``[0, ndev)`` placement is retained.
 
     Args:
         offload_config: ExpertOffloadConfig instance from AscendConfig.
@@ -27,13 +29,31 @@ def init_expert_offload_config(offload_config, num_experts: int,
     if not enable:
         return False, None, ndev
 
+    initial_eids = offload_config.initial_device_experts_for_layer(
+        layer_idx, num_experts)
     emap = torch.full((num_experts,), -1, dtype=torch.int32)
-    emap[:ndev] = torch.arange(ndev, dtype=torch.int32)
+    for slot, eid in enumerate(initial_eids):
+        emap[eid] = slot
     return True, emap, ndev
 
 
-def init_log2phy_for_offload(global_num_experts: int, num_device_experts: int):
+def init_log2phy_for_offload(
+    global_num_experts: int,
+    num_device_experts: int,
+    expert_map: torch.Tensor | None = None,
+):
     """Initialize the forward-pass log2phy mapping table."""
+    if expert_map is not None:
+        if expert_map.shape != (global_num_experts,):
+            raise ValueError(
+                "expert_map must cover every global expert; "
+                f"expected={global_num_experts}, actual={expert_map.shape}")
+        resident_count = int((expert_map >= 0).sum())
+        if resident_count != num_device_experts:
+            raise ValueError(
+                "expert_map resident count does not match device capacity; "
+                f"expected={num_device_experts}, actual={resident_count}")
+        return expert_map.to(device="npu", dtype=torch.int32)
     log2phy = torch.arange(global_num_experts, dtype=torch.int32, device='npu')
     log2phy[num_device_experts:].fill_(-1)
     return log2phy

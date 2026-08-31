@@ -623,7 +623,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         tuple(self._expert_map.shape))
             else:
                 self.log2phy = init_log2phy_for_offload(
-                    self.global_num_experts, _layer_capacity)
+                    self.global_num_experts,
+                    _layer_capacity,
+                    expert_map=self._expert_map_offload,
+                )
 
         moe_config.global_redundant_expert_num = self.global_redundant_expert_num
         local_num_experts = moe_config.num_local_experts
@@ -693,8 +696,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # must operate on routed_experts, not the runner. Propagate the offload
         # flags + global_num_experts onto it (apply's offload block reads them
         # from layer=routed_experts), wrap routed_experts.weight_loader so
-        # checkpoint loading stashes experts >= ndev into the CPU buffer,
-        # re-create its device weights at the offload slot size
+        # checkpoint loading sends the configured initial experts to their
+        # device slots and the remaining experts to CPU, re-create its device
+        # weights at the offload slot size
         # (num_device_experts//ep_size) so the freshly-wrapped loader takes
         # effect on the new params, and register per-layer CPU buffers. ---
         if self.enable_expert_offload:
@@ -759,39 +763,45 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # goes through the offload interceptor. Re-create weights after this so
         # the new params capture the wrapped loader.
         orig_wl = self.routed_experts.weight_loader
-        # ndev = per-rank device slot count (== device weight dim0). The loader
-        # fills the device weight with experts [0, ndev); num_device_experts is
-        # the TOTAL slot count, so divide by ep_size. ep_size=1 (single-card) is
-        # a no-op. Legacy storage still writes every expert to CPU. In
-        # exclusive_dynamic mode the manager skips CPU writes for [0, ndev),
-        # because those experts are initially canonical on NPU, and stores
-        # only [ndev, global_num_experts) in compact CPU slots.
+        # ndev = per-rank device slot count (== device weight dim0).
+        # Single-card initialization may map arbitrary hot global experts to
+        # those slots. Multi-card retains the historical contiguous bootstrap;
+        # its collective hot placement is finalized after weight loading.
         ndev = mgr.offload_config.num_device_experts_for_rank(
             layer_moe_idx, mgr.ep_size if self.enable_multi_card else 1)
+        if self.enable_multi_card:
+            initial_device_slots = {eid: eid for eid in range(ndev)}
+        else:
+            initial_device_slots = {
+                eid: int(slot)
+                for eid, slot in enumerate(self._expert_map_offload.tolist())
+                if slot >= 0
+            }
 
         def _offload_weight_loader(param, loaded_weight, weight_name, shard_id,
                                    expert_id, **kwargs):
+            device_slot = initial_device_slots.get(expert_id)
             # --- Handle scale/offset/scale_bias params (quantized models) ---
             if "weight_scale" in weight_name:
                 mgr._load_scale_shard(layer_moe_idx, expert_id,
                                       "w13_weight_scale" if shard_id in ("w1", "w3")
                                       else "w2_weight_scale",
                                       shard_id, loaded_weight)
-                if expert_id >= ndev:
+                if device_slot is None:
                     return None
             elif "weight_offset" in weight_name:
                 mgr._load_scale_shard(layer_moe_idx, expert_id,
                                       "w13_weight_offset" if shard_id in ("w1", "w3")
                                       else "w2_weight_offset",
                                       shard_id, loaded_weight)
-                if expert_id >= ndev:
+                if device_slot is None:
                     return None
             elif "scale_bias" in weight_name:
                 mgr._load_scale_shard(layer_moe_idx, expert_id,
                                       "w13_scale_bias" if shard_id in ("w1", "w3")
                                       else "w2_scale_bias",
                                       shard_id, loaded_weight)
-                if expert_id >= ndev:
+                if device_slot is None:
                     return None
             else:
                 # --- Handle weight params (existing logic) ---
@@ -799,11 +809,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                     mgr.load_w13(layer_moe_idx, expert_id, loaded_weight, shard_id)
                 elif shard_id == "w2":
                     mgr.load_w2(layer_moe_idx, expert_id, loaded_weight)
-                # Only load to device if expert_id < num_device_experts
-                if shard_id in ("w1", "w2", "w3") and expert_id >= ndev:
+                if (shard_id in ("w1", "w2", "w3")
+                        and device_slot is None):
                     return None
             return orig_wl(param, loaded_weight, weight_name, shard_id,
-                           expert_id, **kwargs)
+                           device_slot, **kwargs)
 
         self.routed_experts.weight_loader = _offload_weight_loader
 
