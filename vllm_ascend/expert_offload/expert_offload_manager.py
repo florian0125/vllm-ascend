@@ -21,6 +21,7 @@ from vllm_ascend.expert_offload.h2d_transfer import (
     H2DCopyTask,
     HostPointerSource,
     TorchCopyH2DTransport,
+    TorchSharedCPUWeightPool,
     create_h2d_transport,
 )
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
@@ -245,12 +246,19 @@ class ExpertOffloadManager:
             self.h2d_transport = self._create_h2d_transport()
         self._shared_h2d_sources = {}
         self._shared_h2d_sources_ready = False
+        self._torch_shared_cpu_pool = None
+        self._torch_shared_cpu_buffers: dict[
+            tuple[int, str], torch.Tensor] = {}
+        self._torch_shared_cpu_sources_ready = False
+        self._torch_shared_cpu_ready_layers: set[int] = set()
         logger.info(
             "[EXPERT-OFFLOAD-H2D] backend=%s mode=%s "
             "memfabric_pool_size_gib=%d",
             self.offload_config.h2d_backend,
-            ("shared" if self.enable_multi_card else "local")
-            if self.offload_config.h2d_backend == "memfabric" else "copy",
+            ("torch-shared-staging"
+             if self.torch_shared_cpu_weights_enabled else
+             ("shared" if self.enable_multi_card else "local")
+             if self.offload_config.h2d_backend == "memfabric" else "copy"),
             self.offload_config.memfabric_pool_size_gib,
         )
 
@@ -335,6 +343,7 @@ class ExpertOffloadManager:
                 self.offload_config.memfabric_pool_size_gib),
             memfabric_log_level=self.offload_config.memfabric_log_level,
             enable_multi_card=enable_shared,
+            enable_torch_shared_cpu=self.torch_shared_cpu_weights_enabled,
             world_size=self.ep_size if enable_shared else 1,
             rank_id=self.ep_rank if enable_shared else 0,
         )
@@ -356,6 +365,71 @@ class ExpertOffloadManager:
         """Whether CPU and NPU use disjoint, dynamically swapped ownership."""
         return (self.offload_config.storage_partition_mode
                 == "exclusive_dynamic")
+
+    @property
+    def torch_shared_cpu_weights_enabled(self) -> bool:
+        """Whether canonical CPU expert data uses one same-node Torch mmap."""
+        return bool(self.offload_config.shared_cpu_weights)
+
+    def _ensure_torch_shared_cpu_pool(self) -> TorchSharedCPUWeightPool:
+        if self._torch_shared_cpu_pool is None:
+            from vllm.distributed.parallel_state import get_ep_group
+            self._torch_shared_cpu_pool = TorchSharedCPUWeightPool(
+                self.offload_config.shared_cpu_weights_dir,
+                world_size=self.ep_size,
+                rank_id=self.ep_rank,
+                cpu_group=get_ep_group().cpu_group,
+            )
+            logger.info(
+                "[EXPERT-OFFLOAD-H2D] initialized same-node Torch shared "
+                "CPU pool: rank=%d/%d dir=%s",
+                self.ep_rank, self.ep_size,
+                self.offload_config.shared_cpu_weights_dir)
+        return self._torch_shared_cpu_pool
+
+    def _allocate_torch_shared_expert_buffer(
+        self,
+        layer_idx: int,
+        name: str,
+        per_expert_shape,
+        dtype,
+    ) -> list[torch.Tensor]:
+        """Allocate one global mmap and return this rank's writable shard."""
+        global_buffer = self._ensure_torch_shared_cpu_pool().allocate(
+            f"L{layer_idx}-{name}",
+            (self.num_total_experts,) + tuple(per_expert_shape),
+            dtype,
+        )
+        self._torch_shared_cpu_buffers[(layer_idx, name)] = global_buffer
+        return [
+            global_buffer[eid]
+            for eid in range(self._shard_base,
+                             self._shard_base + self._shard_size)
+        ]
+
+    def _replace_torch_shared_expert_buffer(
+        self,
+        layer_idx: int,
+        name: str,
+        local_values: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """Replace a post-processed quant buffer with another shared mmap."""
+        if len(local_values) != self._shard_size or not local_values:
+            raise RuntimeError(
+                "Torch shared CPU replacement must cover the local shard: "
+                f"layer={layer_idx}, name={name}, values={len(local_values)}, "
+                f"shard={self._shard_size}")
+        template = local_values[0]
+        if any(value.shape != template.shape or value.dtype != template.dtype
+               for value in local_values):
+            raise RuntimeError(
+                "Torch shared CPU replacement tensors must have one shape "
+                f"and dtype: layer={layer_idx}, name={name}")
+        destinations = self._allocate_torch_shared_expert_buffer(
+            layer_idx, name, template.shape, template.dtype)
+        for destination, value in zip(destinations, local_values):
+            destination.copy_(value)
+        return destinations
 
     def _init_exclusive_ownership(
         self,
@@ -473,6 +547,24 @@ class ExpertOffloadManager:
             ]
             self.w13_weights_cpu.append(w13_list)
             self.w2_weights_cpu.append(w2_list)
+        elif self.torch_shared_cpu_weights_enabled:
+            # Checkpoint ownership stays sharded: rank r writes only
+            # [r*shard:(r+1)*shard). All ranks map the same global backing
+            # tensors, so decode can read any expert after finalization.
+            if ntotal % self.ep_size != 0:
+                raise ValueError(
+                    "Torch shared CPU weights require global_num_experts "
+                    "to be divisible by EP size: "
+                    f"experts={ntotal}, ep_size={self.ep_size}")
+            shard = ntotal // self.ep_size
+            self._shard_size = shard
+            self._shard_base = self.ep_rank * shard
+            self.w13_weights_cpu.append(
+                self._allocate_torch_shared_expert_buffer(
+                    layer_moe_idx, "w13", w13_shape, params_dtype))
+            self.w2_weights_cpu.append(
+                self._allocate_torch_shared_expert_buffer(
+                    layer_moe_idx, "w2", w2_shape, params_dtype))
         elif self.offload_config.shard_per_rank:
             # shard-per-rank: each rank holds ONLY its EP shard of weight
             # experts (ntotal // ep_size), as per-expert pinned tensors (like
@@ -617,6 +709,7 @@ class ExpertOffloadManager:
         rss, hwm, available = self._host_memory_snapshot()
         cpu_mode = (
             "exclusive_dynamic" if self.exclusive_dynamic_enabled else
+            "torch_shared" if self.torch_shared_cpu_weights_enabled else
             "sharded" if self.offload_config.shard_per_rank else
             "replicated")
         experts_per_layer = (
@@ -681,10 +774,15 @@ class ExpertOffloadManager:
             buffers = buffer_dict[attr_name]
             while len(buffers) <= layer_moe_idx:
                 buffers.append([])
-            for _ in range(nalloc):
-                buffers[layer_moe_idx].append(
-                    self._allocate_expert_host_tensor(
-                        per_expert_shape, dtype))
+            if self.torch_shared_cpu_weights_enabled:
+                buffers[layer_moe_idx] = (
+                    self._allocate_torch_shared_expert_buffer(
+                        layer_moe_idx, attr_name, per_expert_shape, dtype))
+            else:
+                for _ in range(nalloc):
+                    buffers[layer_moe_idx].append(
+                        self._allocate_expert_host_tensor(
+                            per_expert_shape, dtype))
 
     def _finalize_offload(self, model):
         """Post-weight-loading finalization.
@@ -988,13 +1086,20 @@ class ExpertOffloadManager:
         """
         for attr_name, layer_buffers in self.scale_bias_cpu_buffers.items():
             for layer_idx, expert_buffers in enumerate(layer_buffers):
-                new_buffers = []
-                for buf in expert_buffers:
-                    transformed = buf.transpose(0, 1).contiguous().sum(dim=0)
-                    backend_buffer = self._allocate_expert_host_tensor(
-                        transformed.shape, transformed.dtype)
-                    backend_buffer.copy_(transformed)
-                    new_buffers.append(backend_buffer)
+                transformed_buffers = [
+                    buf.transpose(0, 1).contiguous().sum(dim=0)
+                    for buf in expert_buffers
+                ]
+                if self.torch_shared_cpu_weights_enabled:
+                    new_buffers = self._replace_torch_shared_expert_buffer(
+                        layer_idx, attr_name, transformed_buffers)
+                else:
+                    new_buffers = []
+                    for transformed in transformed_buffers:
+                        backend_buffer = self._allocate_expert_host_tensor(
+                            transformed.shape, transformed.dtype)
+                        backend_buffer.copy_(transformed)
+                        new_buffers.append(backend_buffer)
                 layer_buffers[layer_idx] = new_buffers
 
     def _encode_w4a8_dynamic_weight_scales(self):
@@ -1023,7 +1128,7 @@ class ExpertOffloadManager:
                 continue
             for layer_idx, expert_buffers in enumerate(
                     self.scale_cpu_buffers[attr_name]):
-                encoded_buffers = []
+                encoded_values = []
                 for buf in expert_buffers:
                     # buf: float32, shape per-expert (e.g. (2*IN,) for w13)
                     scale_np = np.ascontiguousarray(
@@ -1035,10 +1140,17 @@ class ExpertOffloadManager:
                     encoded = scale_np.astype(np.int64)
                     encoded_tensor = torch.from_numpy(np.ascontiguousarray(
                         encoded.copy()))
-                    encoded_buf = self._allocate_expert_host_tensor(
-                        encoded_tensor.shape, encoded_tensor.dtype)
-                    encoded_buf.copy_(encoded_tensor)
-                    encoded_buffers.append(encoded_buf)
+                    encoded_values.append(encoded_tensor)
+                if self.torch_shared_cpu_weights_enabled:
+                    encoded_buffers = self._replace_torch_shared_expert_buffer(
+                        layer_idx, attr_name, encoded_values)
+                else:
+                    encoded_buffers = []
+                    for encoded_tensor in encoded_values:
+                        encoded_buf = self._allocate_expert_host_tensor(
+                            encoded_tensor.shape, encoded_tensor.dtype)
+                        encoded_buf.copy_(encoded_tensor)
+                        encoded_buffers.append(encoded_buf)
                 self.scale_cpu_buffers[attr_name][layer_idx] = encoded_buffers
 
     # ------------------------------------------------------------------ #
@@ -1685,7 +1797,8 @@ class ExpertOffloadManager:
         shard = self.mc_shard_size
         base = self.ep_rank * shard
 
-        if self.offload_config.h2d_backend == "memfabric":
+        if (self.offload_config.h2d_backend == "memfabric"
+                or self.torch_shared_cpu_weights_enabled):
             with torch_npu.npu.stream(self.load_stream):
                 tasks = []
                 for local_i, eid in enumerate(range(base, base + shard)):
@@ -2164,6 +2277,9 @@ class ExpertOffloadManager:
                     "Requested CPU source for an NPU-owned expert: "
                     f"layer={layer_idx}, expert={eid}, weight={which}")
             return cpu_buf[local_eid].untyped_storage()
+        if self.torch_shared_cpu_weights_enabled:
+            return self._torch_shared_cpu_weight_storage(
+                layer_idx, eid, which)
         if self.offload_config.shard_per_rank:
             local_eid = self._shard_local(eid)
             if local_eid is not None:
@@ -2194,11 +2310,39 @@ class ExpertOffloadManager:
                     "Requested CPU destination for an NPU-owned expert: "
                     f"layer={layer_idx}, expert={eid}, weight={which}")
             return cpu_buf[local_eid].untyped_storage()
+        if self.torch_shared_cpu_weights_enabled:
+            return self._torch_shared_cpu_weight_storage(
+                layer_idx, eid, which)
         if self.offload_config.shard_per_rank:
             return cpu_buf[eid - self._shard_base].untyped_storage()
         return cpu_buf[eid].untyped_storage()
 
+    def _torch_shared_cpu_weight_storage(self, layer_idx, eid, which):
+        tensor = self._torch_shared_cpu_buffers.get((layer_idx, which))
+        if tensor is None:
+            raise RuntimeError(
+                "Missing Torch shared CPU weight buffer: "
+                f"layer={layer_idx}, expert={eid}, name={which}")
+        per_expert = (self.w13_expert_size_bytes if which == "w13"
+                      else self.w2_expert_size_bytes)
+        start = eid * per_expert
+        return tensor.untyped_storage()[start:start + per_expert]
+
+    def _torch_shared_cpu_attr_source(self, layer_idx, eid, name):
+        tensor = self._torch_shared_cpu_buffers.get((layer_idx, name))
+        if tensor is None:
+            raise RuntimeError(
+                "Missing Torch shared CPU quantization buffer: "
+                f"layer={layer_idx}, expert={eid}, name={name}")
+        return tensor[eid]
+
     def _shared_h2d_source(self, layer_idx, eid, name):
+        if self.torch_shared_cpu_weights_enabled:
+            if name in ("w13", "w2"):
+                return self._torch_shared_cpu_weight_storage(
+                    layer_idx, eid, name)
+            return self._torch_shared_cpu_attr_source(
+                layer_idx, eid, name)
         pointer = self._shared_h2d_sources.get((layer_idx, eid, name))
         if pointer is None:
             raise RuntimeError(
@@ -2207,6 +2351,13 @@ class ExpertOffloadManager:
         return HostPointerSource(pointer)
 
     def _shared_h2d_layer_ready(self, layer_idx: int) -> bool:
+        if self.torch_shared_cpu_weights_enabled:
+            return (
+                getattr(self, '_torch_shared_cpu_sources_ready', False)
+                and layer_idx in self._torch_shared_cpu_ready_layers
+                and (layer_idx, "w13") in self._torch_shared_cpu_buffers
+                and (layer_idx, "w2") in self._torch_shared_cpu_buffers
+            )
         if not getattr(self, '_shared_h2d_sources_ready', False):
             return False
         shared_sources = getattr(self, '_shared_h2d_sources', {})
@@ -2216,7 +2367,25 @@ class ExpertOffloadManager:
             for name in ("w13", "w2"))
 
     def _publish_shared_h2d_sources(self) -> None:
-        """All-gather peer shard pointers once after format conversion."""
+        """Make all same-node shared sources visible after conversion."""
+        if self.torch_shared_cpu_weights_enabled:
+            from torch import distributed as dist
+            from vllm.distributed.parallel_state import get_ep_group
+            dist.barrier(group=get_ep_group().cpu_group)
+            self._torch_shared_cpu_ready_layers.update(
+                range(len(self.w13_weights_cpu)))
+            self._torch_shared_cpu_sources_ready = True
+            if not all(self._shared_h2d_layer_ready(layer_idx)
+                       for layer_idx in range(len(self.w13_weights_cpu))):
+                raise RuntimeError("Incomplete Torch shared CPU source table")
+            logger.info(
+                "[EXPERT-OFFLOAD-H2D] Torch shared CPU sources ready: "
+                "layers=%d experts=%d ranks=%d",
+                len(self.w13_weights_cpu), self.num_total_experts,
+                self.ep_size)
+            return
+
+        # MemFabric SHARED publishes pointer-valued peer shard sources.
         transport = self._get_h2d_transport()
         if not getattr(transport, "supports_remote_sources", False):
             return
@@ -2279,8 +2448,9 @@ class ExpertOffloadManager:
                     src_tensor = buffers[layer_idx][local_eid]
                     source = src_tensor.reshape(dst.shape)
                     nbytes = src_tensor.numel() * src_tensor.element_size()
-                elif getattr(self._get_h2d_transport(),
-                             "supports_remote_sources", False):
+                elif (self.torch_shared_cpu_weights_enabled
+                      or getattr(self._get_h2d_transport(),
+                                 "supports_remote_sources", False)):
                     source = self._shared_h2d_source(
                         layer_idx, eid, attr_name)
                     nbytes = dst.numel() * dst.element_size()
@@ -2460,8 +2630,10 @@ class ExpertOffloadManager:
         # unrelated weights via a spread log2phy and silently corrupting output.
         if placement.unassigned:
             layer_capacity = per_rank_slots * self.ep_size
-            cpu_mode = ("sharded" if self.offload_config.shard_per_rank
-                        else "replicated")
+            cpu_mode = (
+                "torch_shared" if self.torch_shared_cpu_weights_enabled else
+                "sharded" if self.offload_config.shard_per_rank else
+                "replicated")
             sample = [int(eid) for eid in placement.unassigned[
                 :self._DEBUG_EXPERT_SAMPLE_LIMIT]]
             raise RuntimeError(
@@ -2538,8 +2710,10 @@ class ExpertOffloadManager:
             not placement.unassigned
             and all(count <= per_rank_slots for count in assigned_per_rank)
         )
-        cpu_mode = ("sharded" if self.offload_config.shard_per_rank
-                    else "replicated")
+        cpu_mode = (
+            "torch_shared" if self.torch_shared_cpu_weights_enabled else
+            "sharded" if self.offload_config.shard_per_rank else
+            "replicated")
         unassigned = [int(eid) for eid in placement.unassigned]
         logger.info(
             "[MC_OBS] rank=%s L=%s DECODE plan: cpu_mode=%s "
@@ -2700,6 +2874,9 @@ class ExpertOffloadManager:
         if transport is not None:
             transport.synchronize(self.load_stream)
             transport.close()
+        shared_pool = getattr(self, '_torch_shared_cpu_pool', None)
+        if shared_pool is not None:
+            shared_pool.close()
 
     def _build_expert_h2d_tasks(self, layer, layer_idx, eid,
                                 slot) -> list[H2DCopyTask]:
@@ -2906,10 +3083,15 @@ class ExpertOffloadManager:
                 and misses):
             remote_count = sum(
                 self._shard_local(eid) is None for _, eid in misses)
+            shared_backend = (
+                "TORCH-SHARED-CPU-H2D"
+                if self.torch_shared_cpu_weights_enabled
+                else "MEMFABRIC-SHARED-H2D")
             logger.info(
-                "[MEMFABRIC-SHARED-H2D] layer=%d rank=%d loads=%d "
+                "[%s] layer=%d rank=%d loads=%d "
                 "remote=%d local=%d",
-                layer_idx, self.ep_rank, len(misses), remote_count,
+                shared_backend, layer_idx, self.ep_rank, len(misses),
+                remote_count,
                 len(misses) - remote_count)
         if not self._debug:
             with torch_npu.npu.stream(self.load_stream):
@@ -2973,8 +3155,10 @@ class ExpertOffloadManager:
         }
         requests = len(hits) + len(misses)
         hit_rate = len(hits) / requests if requests else 1.0
-        cpu_mode = ("sharded" if self.offload_config.shard_per_rank
-                    else "replicated")
+        cpu_mode = (
+            "torch_shared" if self.torch_shared_cpu_weights_enabled else
+            "sharded" if self.offload_config.shard_per_rank else
+            "replicated")
         if not misses and not resident_mismatches and not mapping_mismatches:
             return
         sample_limit = self._DEBUG_EXPERT_SAMPLE_LIMIT
@@ -3404,6 +3588,11 @@ class ExpertOffloadManager:
                     if physical_id >= 0
                 }
                 layer.log2phy.copy_(self.log2phy_h)         # H2D writeback
+                if self.torch_shared_cpu_weights_enabled:
+                    # Release pageable->pinned staging after each layer so
+                    # offline hot preload cannot retain a model-wide pinned
+                    # duplicate until the final synchronization.
+                    self._synchronize_h2d()
                 if self.cache_policy is not None:
                     self.cache_policy.seed_layer_hotness(layer_idx, weights)
                 if self._debug:

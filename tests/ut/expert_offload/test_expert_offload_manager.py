@@ -786,6 +786,70 @@ def test_memfabric_shared_resolves_remote_expert_pointer():
     assert source.data_ptr() == 123456
 
 
+def test_torch_shared_cpu_resolves_remote_weight_and_quant_sources():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "h2d_backend": "torch",
+        "enable_multi_card": True,
+        "shard_per_rank": True,
+        "shared_cpu_weights": True,
+    })
+    manager._shard_base = 0
+    manager._shard_size = 2
+    manager.w13_expert_size_bytes = 8
+    global_w13 = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    global_scale = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    manager._torch_shared_cpu_buffers = {
+        (0, "w13"): global_w13,
+        (0, "w13_weight_scale"): global_scale,
+    }
+    manager.w13_weights_cpu = [[global_w13[0], global_w13[1]]]
+
+    weight_source = manager._expert_src_storage(0, 3, "w13")
+    scale_source = manager._shared_h2d_source(
+        0, 3, "w13_weight_scale")
+
+    assert weight_source.nbytes() == 8
+    assert weight_source.data_ptr() == (
+        global_w13.untyped_storage().data_ptr() + 3 * 8)
+    assert torch.equal(scale_source, global_scale[3])
+
+
+def test_torch_shared_cpu_publish_barrier_marks_target_layers_ready():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = ExpertOffloadConfig({
+        "h2d_backend": "torch",
+        "enable_multi_card": True,
+        "shard_per_rank": True,
+        "shared_cpu_weights": True,
+    })
+    manager._ep_size = 2
+    manager._ep_rank = 0
+    manager._ep_info_resolved = True
+    manager.num_total_experts = 4
+    manager.w13_weights_cpu = [[torch.zeros(1), torch.zeros(1)]]
+    manager.w2_weights_cpu = [[torch.zeros(1), torch.zeros(1)]]
+    manager._torch_shared_cpu_buffers = {
+        (0, "w13"): torch.zeros(4, 1),
+        (0, "w2"): torch.zeros(4, 1),
+    }
+    manager._torch_shared_cpu_sources_ready = False
+    manager._torch_shared_cpu_ready_layers = set()
+    ep_group = SimpleNamespace(cpu_group=object())
+
+    with (
+        patch("torch.distributed.barrier") as barrier,
+        patch("vllm.distributed.parallel_state.get_ep_group",
+              return_value=ep_group),
+    ):
+        manager._publish_shared_h2d_sources()
+
+    barrier.assert_called_once_with(group=ep_group.cpu_group)
+    assert manager._torch_shared_cpu_sources_ready is True
+    assert manager._shared_h2d_layer_ready(0) is True
+    assert manager._shared_h2d_layer_ready(1) is False
+
+
 def test_memfabric_shared_publishes_complete_peer_pointer_table():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager.offload_config = ExpertOffloadConfig({

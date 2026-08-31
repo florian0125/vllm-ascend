@@ -427,17 +427,21 @@ def select_moe_comm_method(
         # Communication selection is process-wide rather than layer-specific,
         # so use the smallest configured layer capacity as the safe bound.
         # Replicated CPU weights allow arbitrary cross-rank placement. SHARED
-        # MemFabric keeps Host weights sharded, but publishes every shard's
-        # source pointers to every EP rank, so target-model experts can also be
-        # placed across the whole logical NPU cache. Torch-backed shards remain
-        # owner constrained. Draft/MTP layers register after the target model's
-        # SHARED pointer publication and therefore remain owner constrained.
+        # MemFabric publishes every shard's source pointers to every EP rank.
+        # Torch shared-CPU mode instead maps one global Host pool into every
+        # rank. Both let target-model experts use the whole logical NPU cache.
+        # Ordinary Torch shards remain owner constrained. Draft/MTP layers
+        # register after the target model's shared-source finalization and
+        # therefore remain owner constrained.
         _global_slots = min(_offload_config.num_device_experts_list)
         _ep_size = get_ep_group().world_size
         _h2d_backend = getattr(_offload_config, "h2d_backend", "torch")
+        _torch_shared_cpu = getattr(
+            _offload_config, "shared_cpu_weights", False)
         _supports_global_placement = (
             not _offload_config.shard_per_rank
             or (_h2d_backend == "memfabric" and not is_draft_model)
+            or (_torch_shared_cpu and not is_draft_model)
         )
         _admission_slots = (
             _global_slots

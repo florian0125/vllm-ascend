@@ -977,6 +977,12 @@ class ExpertOffloadConfig:
         # Expert weight H2D backend. MemFabric selects LOCAL for single-card
         # and SHARED DRAM for multi-card expert offload.
         "h2d_backend": "torch",  # Options: "torch", "memfabric"
+        # Same-node Torch mode: every rank maps one file-backed global CPU
+        # expert pool while checkpoint writes remain shard-per-rank. Runtime
+        # H2D uses a small rank-local pinned staging copy because mmap pages
+        # themselves cannot be pinned.
+        "shared_cpu_weights": False,
+        "shared_cpu_weights_dir": "/dev/shm",
         "memfabric_pool_size_gib": 0,
         "memfabric_log_level": 3,
     }
@@ -1217,6 +1223,17 @@ class ExpertOffloadConfig:
                 f"got {self.config['expert_prefetch_num']} instead")
         if not isinstance(self.config["enable_multi_card"], bool):
             raise TypeError("enable_multi_card must be a boolean")
+        if not isinstance(self.config["shard_per_rank"], bool):
+            raise TypeError("shard_per_rank must be a boolean")
+        if not isinstance(self.config["shared_cpu_weights"], bool):
+            raise TypeError("shared_cpu_weights must be a boolean")
+        shared_cpu_dir = self.config["shared_cpu_weights_dir"]
+        if not isinstance(shared_cpu_dir, str):
+            raise TypeError("shared_cpu_weights_dir must be a string")
+        if self.config["shared_cpu_weights"] and not shared_cpu_dir:
+            raise ValueError(
+                "shared_cpu_weights_dir must not be empty when "
+                "shared_cpu_weights=True")
         storage_mode = self.config["storage_partition_mode"]
         if storage_mode not in ("replicated", "exclusive_dynamic"):
             raise ValueError(
@@ -1243,6 +1260,20 @@ class ExpertOffloadConfig:
                     and not self.config["shard_per_rank"]):
                 raise ValueError(
                     "multi-card MemFabric requires shard_per_rank=True")
+        if self.config["shared_cpu_weights"]:
+            if self.config["h2d_backend"] != "torch":
+                raise ValueError(
+                    "shared_cpu_weights=True requires h2d_backend='torch'")
+            if not self.config["enable_multi_card"]:
+                raise ValueError(
+                    "shared_cpu_weights=True requires enable_multi_card=True")
+            if not self.config["shard_per_rank"]:
+                raise ValueError(
+                    "shared_cpu_weights=True requires shard_per_rank=True")
+            if storage_mode != "replicated":
+                raise ValueError(
+                    "shared_cpu_weights=True requires "
+                    "storage_partition_mode='replicated'")
         if storage_mode == "exclusive_dynamic":
             if self.config["enable_multi_card"]:
                 raise ValueError(

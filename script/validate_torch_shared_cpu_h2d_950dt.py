@@ -2,14 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Validate one shared CPU expert pool feeding arbitrary Ascend 950DT ranks.
 
-This is an independent API smoke test, not a production-path test of
-``ExpertOffloadManager``.  It validates four prerequisites for a Torch-only
-shared Host-weight design on one machine:
+This is not a full ``ExpertOffloadManager`` model-path test. It validates five
+prerequisites for a Torch-only shared Host-weight design on one machine:
 
 1. Every rank maps the same file-backed CPU storage and observes peer writes.
 2. Every rank can ``copy_`` an expert owned by another logical rank to its NPU.
 3. All ranks can concurrently read one expert from the shared CPU pool.
 4. A per-rank pinned staging buffer supports non-blocking Torch H2D.
+5. The repository's production shared-pool and staging-transport classes can
+   load a peer-owned expert after each rank writes only its checkpoint shard.
 
 The default payload models one DeepSeek-V4-Flash expert by raw byte count:
 8 MiB w13, 4 MiB w2, and 768 KiB quantization metadata (12.75 MiB total).
@@ -40,6 +41,10 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 MIB = 1 << 20
 KIB = 1 << 10
@@ -192,6 +197,67 @@ def copy_via_pinned_staging(
             staging[segment.name], non_blocking=True
         )
     torch.npu.synchronize()
+
+
+def validate_production_pool_and_transport(
+    shared_dir: Path,
+    rank: int,
+    world_size: int,
+    remote_expert: int,
+    experts_per_rank: int,
+    expert_bytes: int,
+    segments: tuple[Segment, ...],
+    destinations: dict[str, torch.Tensor],
+) -> None:
+    """Exercise the repository's shared pool and Torch staging transport."""
+    from vllm_ascend.expert_offload.h2d_transfer import (
+        H2DCopyTask,
+        TorchSharedCPUH2DTransport,
+        TorchSharedCPUWeightPool,
+    )
+
+    production_pool = TorchSharedCPUWeightPool(
+        str(shared_dir),
+        world_size=world_size,
+        rank_id=rank,
+        cpu_group=dist.group.WORLD,
+    )
+    transport = TorchSharedCPUH2DTransport()
+    try:
+        num_experts = world_size * experts_per_rank
+        pool = production_pool.allocate(
+            "950dt-production-slice",
+            (num_experts, expert_bytes),
+            torch.uint8,
+        )
+        shard_base = rank * experts_per_rank
+        shard_end = shard_base + experts_per_rank
+        for expert_id in range(shard_base, shard_end):
+            for segment_id, segment in enumerate(segments):
+                pool[expert_id, segment.start : segment.stop].fill_(
+                    pattern(expert_id, segment_id))
+        dist.barrier()
+        if rank == 0:
+            pool[0, 0] = 233
+        dist.barrier()
+
+        tasks = [
+            H2DCopyTask(
+                source=pool[
+                    remote_expert, segment.start : segment.stop],
+                destination=destinations[segment.name],
+                nbytes=segment.nbytes,
+                name=(f"950dt-{segment.name}[rank={rank},"
+                      f"expert={remote_expert}]"),
+            )
+            for segment in segments
+        ]
+        transport.copy_batch(tasks)
+        transport.synchronize(torch.npu.current_stream())
+        validate_expert(remote_expert, destinations, segments)
+    finally:
+        transport.close()
+        production_pool.close()
 
 
 def percentile(samples: list[float], fraction: float) -> float:
@@ -354,6 +420,27 @@ def main() -> int:
             record_failure(failures, rank, "pinned_staging", error)
         dist.barrier()
 
+        try:
+            validate_production_pool_and_transport(
+                shared_path.parent,
+                rank,
+                world_size,
+                remote_expert,
+                args.experts_per_rank,
+                expert_bytes,
+                segments,
+                destinations,
+            )
+            print(
+                f"[TORCH_SHARED_CPU][rank={rank}][PASS] "
+                "production_pool_transport",
+                flush=True,
+            )
+        except BaseException as error:
+            record_failure(
+                failures, rank, "production_pool_transport", error)
+        dist.barrier()
+
         if not failures:
             metrics["direct_pageable"] = benchmark(
                 lambda: copy_direct(
@@ -425,7 +512,8 @@ def main() -> int:
         if rank == 0:
             print(
                 "[TORCH_SHARED_CPU][PASS] all ranks completed; "
-                "this remains an independent API smoke test",
+                "includes the production pool/transport slice but not the "
+                "full ExpertOffloadManager model path",
                 flush=True,
             )
     finally:

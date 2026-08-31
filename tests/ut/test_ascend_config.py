@@ -518,6 +518,8 @@ class TestExpertOffloadConfig(TestBase):
         config = ExpertOffloadConfig({})
 
         self.assertEqual(config.h2d_backend, "torch")
+        self.assertFalse(config.shared_cpu_weights)
+        self.assertEqual(config.shared_cpu_weights_dir, "/dev/shm")
         self.assertEqual(config.storage_partition_mode, "replicated")
         self.assertEqual(config.memfabric_pool_size_gib, 0)
         self.assertEqual(config.memfabric_log_level, 3)
@@ -609,6 +611,52 @@ class TestExpertOffloadConfig(TestBase):
                 "memfabric_pool_size_gib": 16,
                 "enable_multi_card": True,
                 "shard_per_rank": False,
+            })
+
+    def test_torch_shared_cpu_accepts_same_node_multi_card_config(self):
+        config = ExpertOffloadConfig({
+            "h2d_backend": "torch",
+            "enable_multi_card": True,
+            "shard_per_rank": True,
+            "shared_cpu_weights": True,
+            "shared_cpu_weights_dir": "/mnt/shared-memory",
+        })
+
+        self.assertTrue(config.shared_cpu_weights)
+        self.assertEqual(
+            config.shared_cpu_weights_dir, "/mnt/shared-memory")
+
+    def test_torch_shared_cpu_config_validation(self):
+        common = {
+            "enable_multi_card": True,
+            "shard_per_rank": True,
+            "shared_cpu_weights": True,
+        }
+        with self.assertRaisesRegex(ValueError, "requires.*torch"):
+            ExpertOffloadConfig({
+                **common,
+                "h2d_backend": "memfabric",
+                "memfabric_pool_size_gib": 16,
+            })
+        with self.assertRaisesRegex(ValueError, "enable_multi_card=True"):
+            ExpertOffloadConfig({
+                **common,
+                "enable_multi_card": False,
+            })
+        with self.assertRaisesRegex(ValueError, "shard_per_rank=True"):
+            ExpertOffloadConfig({
+                **common,
+                "shard_per_rank": False,
+            })
+        with self.assertRaisesRegex(ValueError, "storage_partition_mode"):
+            ExpertOffloadConfig({
+                **common,
+                "storage_partition_mode": "exclusive_dynamic",
+            })
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            ExpertOffloadConfig({
+                **common,
+                "shared_cpu_weights_dir": "",
             })
 
     def test_expert_substitution_defaults_and_override(self):

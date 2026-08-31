@@ -361,17 +361,20 @@ def test_multi_card_torch_offload_admission_uses_owner_capacity_when_sharded(
 
 
 @pytest.mark.parametrize(
-    ("h2d_backend", "is_draft_model", "expected", "admission_slots",
-     "placement_scope"),
+    ("h2d_backend", "shared_cpu_weights", "is_draft_model", "expected",
+     "admission_slots", "placement_scope"),
     [
-        ("torch", False, MoECommType.ALLTOALL, 6, "owner"),
-        ("memfabric", False, MoECommType.MC2, 48, "global"),
-        ("memfabric", True, MoECommType.ALLTOALL, 6, "owner"),
+        ("torch", False, False, MoECommType.ALLTOALL, 6, "owner"),
+        ("torch", True, False, MoECommType.MC2, 48, "global"),
+        ("torch", True, True, MoECommType.ALLTOALL, 6, "owner"),
+        ("memfabric", False, False, MoECommType.MC2, 48, "global"),
+        ("memfabric", False, True, MoECommType.ALLTOALL, 6, "owner"),
     ],
 )
-def test_multi_card_memfabric_admission_uses_global_target_capacity(
+def test_multi_card_shared_h2d_admission_uses_global_target_capacity(
     monkeypatch,
     h2d_backend,
+    shared_cpu_weights,
     is_draft_model,
     expected,
     admission_slots,
@@ -389,6 +392,7 @@ def test_multi_card_memfabric_admission_uses_global_target_capacity(
         moe_offload_debug=True,
         shard_per_rank=True,
         h2d_backend=h2d_backend,
+        shared_cpu_weights=shared_cpu_weights,
         num_device_experts_list=[48],
         num_device_experts_for_rank=lambda _layer, ep_size: 48 // ep_size,
     )

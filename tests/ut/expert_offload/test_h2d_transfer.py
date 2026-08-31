@@ -1,7 +1,9 @@
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+import torch
 
 from vllm_ascend.expert_offload.h2d_transfer import (
     CopyDirection,
@@ -10,6 +12,8 @@ from vllm_ascend.expert_offload.h2d_transfer import (
     MemFabricSharedH2DTransport,
     ONE_GIB,
     TorchCopyH2DTransport,
+    TorchSharedCPUH2DTransport,
+    TorchSharedCPUWeightPool,
     create_h2d_transport,
 )
 
@@ -75,6 +79,102 @@ def test_torch_transport_allocates_pinned_host_tensor():
     assert result is expected
     empty.assert_called_once_with(
         (2, 3), dtype="dtype", device="cpu", pin_memory=True)
+
+
+def test_torch_shared_transport_stages_until_sync_then_reuses_buffer():
+    transport = TorchSharedCPUH2DTransport()
+    source = MagicMock()
+    destination = MagicMock()
+    staging = MagicMock()
+    staging_storage = MagicMock()
+    staging.untyped_storage.return_value = staging_storage
+    task = H2DCopyTask(source, destination, 16)
+
+    with patch(
+        "vllm_ascend.expert_offload.h2d_transfer.torch.empty",
+        return_value=staging,
+    ) as empty:
+        transport.copy_batch([task])
+        assert transport._inflight_staging[0][1] is staging
+
+        stream = MagicMock()
+        transport.synchronize(stream)
+        assert transport._inflight_staging == []
+
+        transport.copy_batch([task])
+
+    empty.assert_called_once_with(
+        (16,), dtype=torch.uint8, device="cpu", pin_memory=True)
+    assert staging_storage.copy_.call_args_list == [call(source), call(source)]
+    assert destination.copy_.call_args_list == [
+        call(staging_storage, non_blocking=True),
+        call(staging_storage, non_blocking=True),
+    ]
+    assert transport._inflight_staging[0][1] is staging
+
+    stream.synchronize.assert_called_once_with()
+
+
+class _FakeCollectives:
+
+    def __init__(self, world_size):
+        self.world_size = world_size
+        self.barriers = 0
+
+    def all_gather_object(self, output, value, group):
+        del group
+        for rank in range(self.world_size):
+            output[rank] = value
+
+    def barrier(self, group):
+        del group
+        self.barriers += 1
+
+
+def test_torch_shared_weight_pool_maps_and_unlinks_backing_file(tmp_path):
+    collectives = _FakeCollectives(world_size=2)
+    scalar = MagicMock()
+    scalar.element_size.return_value = 4
+    mapped = MagicMock()
+    expected = object()
+    mapped.reshape.return_value = expected
+    with (
+        patch(
+            "vllm_ascend.expert_offload.h2d_transfer.torch.empty",
+            return_value=scalar,
+        ),
+        patch(
+            "vllm_ascend.expert_offload.h2d_transfer.torch.from_file",
+            return_value=mapped,
+        ) as from_file,
+    ):
+        pool = TorchSharedCPUWeightPool(
+            str(tmp_path), 2, 0, object(), dist_module=collectives)
+        result = pool.allocate("layer/0:w13", (2, 3), "dtype")
+
+    assert result is expected
+    path = from_file.call_args.args[0]
+    from_file.assert_called_once_with(
+        path, shared=True, size=6, dtype="dtype")
+    assert not os.path.exists(path)
+    assert collectives.barriers == 1
+    run_dir = pool.run_dir
+
+    pool.close()
+
+    assert not os.path.exists(run_dir)
+
+
+def test_factory_selects_torch_shared_staging_transport():
+    transport = create_h2d_transport(
+        "torch",
+        device_id=0,
+        memfabric_pool_size_gib=0,
+        memfabric_log_level=3,
+        enable_torch_shared_cpu=True,
+    )
+
+    assert isinstance(transport, TorchSharedCPUH2DTransport)
 
 
 class _FakeDescriptor:

@@ -1,6 +1,10 @@
 """Host-to-device transfer abstractions for expert offload."""
 
 import atexit
+import os
+import shutil
+import socket
+import tempfile
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -105,6 +109,240 @@ class TorchCopyH2DTransport:
     @staticmethod
     def close() -> None:
         return
+
+
+class TorchSharedCPUH2DTransport(TorchCopyH2DTransport):
+    """Torch H2D from pageable shared mappings via pinned staging buffers.
+
+    ``torch.from_file`` mappings cannot be pinned. Keeping the canonical
+    expert weights in one shared mapping therefore needs a short-lived,
+    rank-local pinned copy before an asynchronous NPU ``copy_``. Staging
+    tensors are retained until ``synchronize`` so their storage cannot be
+    recycled while the device copy is still in flight.
+    """
+
+    supports_shared_cpu_sources = True
+
+    def __init__(self) -> None:
+        self._inflight_staging: list[tuple[tuple, torch.Tensor]] = []
+        self._free_staging: dict[tuple, list[torch.Tensor]] = {}
+        self._staging_lock = threading.Lock()
+
+    def _acquire_staging(self, key: tuple, shape, dtype) -> torch.Tensor:
+        available = self._free_staging.get(key)
+        if available:
+            return available.pop()
+        return torch.empty(
+            shape, dtype=dtype, device="cpu", pin_memory=True)
+
+    def _stage_source(
+        self, task: H2DCopyTask
+    ) -> tuple[tuple, torch.Tensor, Any]:
+        if isinstance(task.source, torch.Tensor):
+            key = ("tensor", tuple(task.source.shape), task.source.dtype)
+            staging = self._acquire_staging(
+                key, task.source.shape, task.source.dtype)
+            staging.copy_(task.source)
+            return key, staging, staging
+
+        key = ("storage", task.nbytes, torch.uint8)
+        staging = self._acquire_staging(
+            key, (task.nbytes,), torch.uint8)
+        staging.untyped_storage().copy_(task.source)
+        return key, staging, staging.untyped_storage()
+
+    def copy_batch(self, tasks: list[H2DCopyTask]) -> None:
+        with self._staging_lock:
+            for task in tasks:
+                source = task.source
+                if task.direction == CopyDirection.H2D:
+                    key, staging, source = self._stage_source(task)
+                    self._inflight_staging.append((key, staging))
+                task.destination.copy_(
+                    source, non_blocking=task.non_blocking)
+
+    def synchronize(self, stream) -> None:
+        with self._staging_lock:
+            stream.synchronize()
+            for key, staging in self._inflight_staging:
+                self._free_staging.setdefault(key, []).append(staging)
+            self._inflight_staging.clear()
+
+    def close(self) -> None:
+        with self._staging_lock:
+            self._inflight_staging.clear()
+            self._free_staging.clear()
+
+
+class TorchSharedCPUWeightPool:
+    """Collectively allocate same-node file-backed CPU tensors.
+
+    Every rank maps the same file with ``MAP_SHARED`` semantics. The backing
+    file is unlinked after all ranks have mapped it, so the physical pages
+    live exactly as long as the tensors and no large files remain after an
+    abnormal process exit. Calls to :meth:`allocate` must occur in identical
+    order on every rank in ``cpu_group``.
+    """
+
+    def __init__(
+        self,
+        base_dir: str,
+        world_size: int,
+        rank_id: int,
+        cpu_group,
+        *,
+        dist_module=None,
+    ) -> None:
+        if world_size <= 1:
+            raise ValueError(
+                "Torch shared CPU weights require world_size > 1")
+        if not 0 <= rank_id < world_size:
+            raise ValueError(
+                f"Invalid Torch shared CPU rank: {rank_id}/{world_size}")
+        if not base_dir:
+            raise ValueError("Torch shared CPU weight directory is empty")
+        if dist_module is None:
+            from torch import distributed as dist
+            dist_module = dist
+
+        self.base_dir = os.path.abspath(base_dir)
+        self.world_size = world_size
+        self.rank_id = rank_id
+        self.cpu_group = cpu_group
+        self._dist = dist_module
+        self._allocation_index = 0
+        self._closed = False
+
+        hostnames = [None] * world_size
+        self._dist.all_gather_object(
+            hostnames, socket.gethostname(), group=cpu_group)
+        if len(set(hostnames)) != 1:
+            raise RuntimeError(
+                "Torch shared CPU weights are same-node only; EP ranks are "
+                f"on different hosts: {hostnames}")
+
+        local_run_dir = None
+        local_run_dir_error = None
+        if rank_id == 0:
+            try:
+                os.makedirs(self.base_dir, exist_ok=True)
+                local_run_dir = tempfile.mkdtemp(
+                    prefix="vllm-ascend-torch-shared-",
+                    dir=self.base_dir,
+                )
+            except OSError as exc:
+                local_run_dir_error = f"{type(exc).__name__}: {exc}"
+        run_dir_states = [None] * world_size
+        self._dist.all_gather_object(
+            run_dir_states,
+            (local_run_dir, local_run_dir_error),
+            group=cpu_group,
+        )
+        run_dir, run_dir_error = run_dir_states[0]
+        if run_dir_error is not None:
+            raise RuntimeError(
+                "Failed to create Torch shared CPU weight directory: "
+                f"{run_dir_error}")
+        if not isinstance(run_dir, str) or not os.path.isabs(run_dir):
+            raise RuntimeError(
+                "Failed to create Torch shared CPU weight directory: "
+                f"{run_dir!r}")
+        if not os.path.isdir(run_dir):
+            raise RuntimeError(
+                "Torch shared CPU weight directory is not visible to all "
+                f"ranks: {run_dir}")
+        self.run_dir = run_dir
+
+    @staticmethod
+    def _safe_name(name: str) -> str:
+        safe = "".join(
+            char if char.isalnum() or char in "-_." else "_"
+            for char in name)
+        return safe[:96] or "buffer"
+
+    def allocate(self, name: str, shape, dtype) -> torch.Tensor:
+        if self._closed:
+            raise RuntimeError("Torch shared CPU weight pool is closed")
+        shape = tuple(int(dim) for dim in shape)
+        if not shape or any(dim <= 0 for dim in shape):
+            raise ValueError(
+                f"Shared CPU tensor shape must be positive; got {shape}")
+        element_size = torch.empty((), dtype=dtype).element_size()
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        nbytes = numel * element_size
+        index = self._allocation_index
+        self._allocation_index += 1
+        path = os.path.join(
+            self.run_dir, f"{index:05d}-{self._safe_name(name)}.bin")
+
+        local_create_error = None
+        if self.rank_id == 0:
+            try:
+                descriptor = os.open(
+                    path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                try:
+                    os.ftruncate(descriptor, nbytes)
+                finally:
+                    os.close(descriptor)
+            except OSError as exc:
+                local_create_error = f"{type(exc).__name__}: {exc}"
+        create_errors = [None] * self.world_size
+        self._dist.all_gather_object(
+            create_errors, local_create_error, group=self.cpu_group)
+        create_error = create_errors[0]
+        if create_error is not None:
+            raise RuntimeError(
+                "Failed to create Torch shared CPU weight file "
+                f"{path}: {create_error}")
+
+        tensor = None
+        map_error = None
+        try:
+            tensor = torch.from_file(
+                path, shared=True, size=numel, dtype=dtype).reshape(shape)
+        except Exception as exc:
+            map_error = f"rank={self.rank_id} {type(exc).__name__}: {exc}"
+        map_errors = [None] * self.world_size
+        self._dist.all_gather_object(
+            map_errors, map_error, group=self.cpu_group)
+        failures = [error for error in map_errors if error is not None]
+        if failures:
+            if self.rank_id == 0:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+            raise RuntimeError(
+                "Failed to map Torch shared CPU weight file: "
+                + "; ".join(failures))
+
+        # Ensure every successful mapping exists before rank 0 unlinks the
+        # name. The mappings keep the inode/pages alive after this point.
+        self._dist.barrier(group=self.cpu_group)
+        local_unlink_error = None
+        if self.rank_id == 0:
+            try:
+                os.unlink(path)
+            except OSError as exc:
+                local_unlink_error = f"{type(exc).__name__}: {exc}"
+        unlink_errors = [None] * self.world_size
+        self._dist.all_gather_object(
+            unlink_errors, local_unlink_error, group=self.cpu_group)
+        unlink_error = unlink_errors[0]
+        if unlink_error is not None:
+            raise RuntimeError(
+                "Failed to unlink mapped Torch shared CPU weight file "
+                f"{path}: {unlink_error}")
+        return tensor
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.rank_id == 0:
+            shutil.rmtree(self.run_dir, ignore_errors=True)
 
 
 class MemFabricLocalH2DTransport:
@@ -311,10 +549,13 @@ def create_h2d_transport(
     memfabric_pool_size_gib: int,
     memfabric_log_level: int,
     enable_multi_card: bool = False,
+    enable_torch_shared_cpu: bool = False,
     world_size: int = 1,
     rank_id: int = 0,
 ) -> ExpertH2DTransport:
     if backend == "torch":
+        if enable_torch_shared_cpu:
+            return TorchSharedCPUH2DTransport()
         return TorchCopyH2DTransport()
     if backend == "memfabric":
         if enable_multi_card:

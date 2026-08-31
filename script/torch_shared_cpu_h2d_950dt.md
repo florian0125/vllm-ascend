@@ -4,7 +4,7 @@
 
 这组脚本验证：在同一台 950DT 服务器上，全局只保留一份文件映射的 CPU 专家权重，所有 EP rank 都能通过 Torch 从任意专家切片加载到本 rank 的 NPU。
 
-这是独立 API smoke test，不是 `ExpertOffloadManager` 生产调用链测试。它不覆盖：
+这不是完整的 `ExpertOffloadManager` 模型链路测试。脚本除独立 API smoke test 外，还会直接调用仓库中的 `TorchSharedCPUWeightPool` 和 `TorchSharedCPUH2DTransport`，验证每个 rank 只写自己的 checkpoint shard 后，其他 rank 能通过生产共享池/transport 加载该专家。它仍不覆盖：
 
 - 路由、LRC、`log2phy` 和专家替换；
 - prefill 的 EP shard/ALLTOALL 路径；
@@ -12,11 +12,13 @@
 - NZ、FP4 等格式元数据及真实 GMM 精度；
 - ACL Graph host callback、预取流和计算重叠。
 
+仓库现已提供对应的生产调用链实现，但本脚本本身仍只是独立的前置条件验证，不能替代真实模型精度和性能测试。
+
 950DT 文档中的“不支持内存共享（IPC）”是指 NPU Device Tensor IPC。本测试不共享 NPU Tensor，只使用 Linux `MAP_SHARED` CPU 文件映射，然后执行 CPU 到本地 NPU 的 `copy_`。
 
 ## 文件
 
-- `validate_torch_shared_cpu_h2d_950dt.py`：多 rank 功能、并发、pinned staging 和时延测试。
+- `validate_torch_shared_cpu_h2d_950dt.py`：多 rank 功能、并发、pinned staging、生产 pool/transport 切片和时延测试。
 - `inspect_torch_shared_cpu_pss.sh`：从 `/proc/<pid>/smaps` 汇总共享映射的 PSS。
 - `run_torch_shared_cpu_h2d_950dt.sh`：环境打印和 `torchrun` 启动入口。
 
@@ -60,6 +62,36 @@ export SHARED_FILE=/dev/shm/torch_shared_cpu_h2d_run1.bin
 
 bash script/run_torch_shared_cpu_h2d_950dt.sh
 ```
+
+## vLLM Ascend 生产配置
+
+同一台机器上的多 rank expert offload 可使用：
+
+```json
+{
+  "expert_offload_config": {
+    "expert_offload": true,
+    "enable_multi_card": true,
+    "storage_partition_mode": "replicated",
+    "h2d_backend": "torch",
+    "shard_per_rank": true,
+    "shared_cpu_weights": true,
+    "shared_cpu_weights_dir": "/dev/shm"
+  }
+}
+```
+
+该组合的语义是：
+
+- checkpoint 加载仍由每个 rank 只写自己的 EP shard；
+- w13、w2、scale、offset 和 scale-bias 的底层 CPU 存储由所有 rank 共同映射，全局常驻数据是一份完整专家权重；
+- target model finalize 完成并经过 CPU group barrier 后，decode 可以把任意专家放到任意 rank 的 NPU slot；
+- Torch H2D 先复制到 rank 本地 pinned staging，再执行 `non_blocking=True` 的 NPU `copy_`；staging 是有界临时工作集，不是第二份常驻完整权重；
+- multi-card prefill 仍只加载本 rank 的静态 EP shard，并走 ALLTOALL/标准 EP 计算边界；
+- target finalize 之后才注册的 draft/MTP 层仍保持 owner-shard placement；
+- 该模式只支持同机 rank，不提供跨机器 CPU 共享。
+
+配置校验会拒绝以下组合：非 Torch backend、`enable_multi_card=false`、`shard_per_rank=false`，以及 `storage_partition_mode="exclusive_dynamic"`。共享目录创建或映射失败时会显式报错，不会静默退化成每 rank 一份完整权重。
 
 如果 Gloo 初始化失败：
 
@@ -163,6 +195,16 @@ bash script/run_torch_shared_cpu_h2d_950dt.sh \
   --quant-bytes 786432
 ```
 
+### 6. 生产 pool/transport 切片
+
+每个 rank 只填充共享池中自己的逻辑专家 shard，然后选择下一 rank 拥有的专家，通过仓库的 `H2DCopyTask` 和 `TorchSharedCPUH2DTransport` 加载到本 rank NPU。通过标志：
+
+```text
+[PASS] production_pool_transport
+```
+
+这一项覆盖本次实现的共享文件协调、共享 tensor 解析、pinned staging 生命周期和 Torch H2D，但仍不覆盖完整模型加载、路由、`log2phy`、量化 GMM 精度或 ACL Graph。
+
 ## pinned_mem_register A/B 测试
 
 950DT 支持 TorchNPU pinned allocator 的 `pinned_mem_register`。其要求包括 TorchNPU 26.0.0 及以上、HDK 26.0.RC1 及以上、CANN 8.5.0 及以上，并且不能和 `pin_memory_expandable_segments` 同时启用。
@@ -181,20 +223,20 @@ bash script/run_torch_shared_cpu_h2d_950dt.sh
 
 | 结果 | 结论 |
 |---|---|
-| direct、concurrent、staging 全通过，PSS 约一份 | 可继续设计 Torch shared Host 专家池 |
+| direct、concurrent、staging、production slice 全通过，PSS 约一份 | 共享 CPU 与生产 pool/transport 前置验证通过，可继续跑完整模型验证 |
 | direct 失败，staging 通过 | mmap 可共享，但当前栈不能直接 H2D；使用小型 pinned staging |
 | direct 通过，`pool_is_pinned=false` | 功能成立，但不证明异步传输或计算重叠 |
 | CPU 共享通过，所有 H2D 失败 | CPU mmap 正常，TorchNPU/CANN 不接受当前 Host 源 |
 | PSS 接近 rank 数倍 | 未实现单份物理专家池，需排查私有副本 |
 
-## 进入生产集成前还需验证
+## 在 950DT 上启用生产配置前还需验证
 
-1. 用真实 checkpoint 的 `w13/w2`、scale/offset/scale-bias 和格式转换后字节建立共享池。
-2. 复用生产 `H2DCopyTask`、NPU连续 slot storage 和 load stream。
-3. 验证 W8A8、W4A8 dynamic、MXFP4 的 GMM 精度，而不只是原始字节一致。
-4. 验证初始化 barrier、只读阶段、异常退出清理和 MTP 后注册层。
-5. 分别测 direct、staging 的 H2D 带宽、p50/p99、NUMA影响以及计算重叠。
-6. 再验证 MC2 decode 的全局 placement、`log2phy` 和 ALLTOALL prefill 边界。
+1. 用真实 checkpoint 检查 w13/w2、scale/offset/scale-bias 格式转换后的跨 rank 字节一致性。
+2. 验证 W8A8、W4A8 dynamic、MXFP4 的 GMM 精度，而不只是原始字节一致。
+3. 检查 `/dev/shm` 容量、进程 PSS、NUMA 位置以及 pinned staging 峰值。
+4. 验证初始化 barrier、异常退出、target/draft 生命周期和重复启动清理。
+5. 测量 decode miss 的 H2D p50/p99、吞吐和计算重叠。
+6. 验证 MC2 decode 的全局 placement、`log2phy` 与 ALLTOALL prefill 边界。
 
 ## 官方参考
 
