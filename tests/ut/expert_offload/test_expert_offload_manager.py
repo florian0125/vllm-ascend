@@ -1204,14 +1204,14 @@ def test_exclusive_prefetch_uses_same_dynamic_swap_planner():
         "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
         return_value=nullcontext(),
     ):
-        manager._update_weights_exclusive_dynamic(
+        manager._update_weights((
             topk_ids,
             log2phy_np,
             layer,
             0,
             None,
             True,
-        )
+        ))
 
     manager._swap_expert_weights.assert_called_once_with(
         layer, 0, [(1, 2, 1, 0)], log2phy_np)

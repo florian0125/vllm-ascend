@@ -3131,46 +3131,16 @@ class ExpertOffloadManager:
                 self._swap_expert_weights(
                     layer, layer_idx, swaps, log2phy_np)
 
-    def _update_weights(self, args):
-        if len(args) == 6:
-            (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
-             is_prefetch) = args
-            do_substitution = False
-            router_logits_h = None
-            scoring_func = "softmax"
-            correction_bias_h = None
-        else:
-            (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
-             is_prefetch, do_substitution, router_logits_h, scoring_func,
-             correction_bias_h) = args
-        if do_substitution:
-            original_ids = (
-                topk_ids_h[:, :self.topk].clone()
-                if self._debug else None
-            )
-            substituted_ids = substitute_experts(
-                router_logits_h,
-                topk_ids_h[:, :self.topk],
-                torch.from_numpy(log2phy_np),
-                expert_substitution_threshold=(
-                    self.offload_config.expert_substitution_threshold),
-                scoring_func=scoring_func,
-                e_score_correction_bias=correction_bias_h,
-            )
-            if original_ids is not None:
-                self._log_expert_substitution(
-                    layer_idx, original_ids, substituted_ids)
-            topk_ids_h[:, :self.topk].copy_(substituted_ids)
-        if self.exclusive_dynamic_enabled:
-            self._update_weights_exclusive_dynamic(
-                topk_ids_h,
-                log2phy_np,
-                layer,
-                layer_idx,
-                topk_weights_h,
-                is_prefetch,
-            )
-            return
+    def _update_weights_replicated(
+        self,
+        topk_ids_h,
+        log2phy_np,
+        layer,
+        layer_idx: int,
+        topk_weights_h,
+        is_prefetch: bool,
+    ) -> None:
+        """Single-card decode/prefetch planner for replicated CPU storage."""
         with torch_npu.npu.stream(self.load_stream):
             # Hotness observation only on the reactive (non-prefetch) H2D path
             # with LRC policy enabled.
@@ -3261,6 +3231,52 @@ class ExpertOffloadManager:
             self._load_expert_weights_into_slots(
                 layer, layer_idx, planned_loads)
             self._synchronize_h2d()
+
+    def _update_weights(self, args):
+        """Apply common routing updates, then dispatch by storage strategy."""
+        if len(args) == 6:
+            (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
+             is_prefetch) = args
+            do_substitution = False
+            router_logits_h = None
+            scoring_func = "softmax"
+            correction_bias_h = None
+        else:
+            (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
+             is_prefetch, do_substitution, router_logits_h, scoring_func,
+             correction_bias_h) = args
+        if do_substitution:
+            original_ids = (
+                topk_ids_h[:, :self.topk].clone()
+                if self._debug else None
+            )
+            substituted_ids = substitute_experts(
+                router_logits_h,
+                topk_ids_h[:, :self.topk],
+                torch.from_numpy(log2phy_np),
+                expert_substitution_threshold=(
+                    self.offload_config.expert_substitution_threshold),
+                scoring_func=scoring_func,
+                e_score_correction_bias=correction_bias_h,
+            )
+            if original_ids is not None:
+                self._log_expert_substitution(
+                    layer_idx, original_ids, substituted_ids)
+            topk_ids_h[:, :self.topk].copy_(substituted_ids)
+
+        update_strategy = (
+            self._update_weights_exclusive_dynamic
+            if self.exclusive_dynamic_enabled
+            else self._update_weights_replicated
+        )
+        update_strategy(
+            topk_ids_h,
+            log2phy_np,
+            layer,
+            layer_idx,
+            topk_weights_h,
+            is_prefetch,
+        )
 
     def _preload_hot_experts(self):
         """Preload each layer's top-N hot experts into device resident slots
