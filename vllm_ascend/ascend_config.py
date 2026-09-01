@@ -966,9 +966,11 @@ class ExpertOffloadConfig:
         "enable_multi_card": False,
         # CPU/NPU expert-weight ownership mode:
         # - replicated: CPU retains every expert (legacy behavior).
-        # - exclusive_dynamic: single-card CPU and NPU hold disjoint canonical
-        #   expert sets; a miss swaps the incoming CPU expert with an NPU
-        #   victim.  Prefetch uses the same dynamic swap path.
+        # - exclusive_dynamic: CPU and NPU hold disjoint canonical expert
+        #   sets; a miss swaps the incoming CPU expert with an NPU victim.
+        #   Multi-card requires same-node Torch shared CPU weights. The NPU
+        #   ownership is global across EP ranks and prefill reads remote NPU
+        #   residents through direct device P2P.
         "storage_partition_mode": "replicated",
         "hot_expert_preload": False,
         "hot_experts_file": "",
@@ -977,10 +979,11 @@ class ExpertOffloadConfig:
         # Expert weight H2D backend. MemFabric selects LOCAL for single-card
         # and SHARED DRAM for multi-card expert offload.
         "h2d_backend": "torch",  # Options: "torch", "memfabric"
-        # Same-node Torch mode: every rank maps one file-backed global CPU
-        # expert pool while checkpoint writes remain shard-per-rank. Runtime
-        # H2D uses a small rank-local pinned staging copy because mmap pages
-        # themselves cannot be pinned.
+        # Same-node Torch mode: every rank maps one file-backed CPU expert
+        # pool while checkpoint writes remain partitioned across ranks. The
+        # replicated mode maps all experts; exclusive_dynamic maps only the
+        # compact CPU-owned set. Runtime H2D uses a small rank-local pinned
+        # staging copy because mmap pages themselves cannot be pinned.
         "shared_cpu_weights": False,
         "shared_cpu_weights_dir": "/dev/shm",
         "memfabric_pool_size_gib": 0,
@@ -1110,7 +1113,13 @@ class ExpertOffloadConfig:
                 "num_device_experts must not exceed num_experts; "
                 f"layer={layer_idx}, capacity={capacity}, "
                 f"num_experts={num_experts}")
-        if not self.hot_expert_preload or self.enable_multi_card:
+        multi_card_exclusive = (
+            self.enable_multi_card
+            and self.storage_partition_mode == "exclusive_dynamic"
+            and self.shared_cpu_weights
+        )
+        if not self.hot_expert_preload or (
+                self.enable_multi_card and not multi_card_exclusive):
             return list(range(capacity))
 
         ranked = self.hot_expert_pairs_for_layer(layer_idx, num_experts)
@@ -1270,15 +1279,12 @@ class ExpertOffloadConfig:
             if not self.config["shard_per_rank"]:
                 raise ValueError(
                     "shared_cpu_weights=True requires shard_per_rank=True")
-            if storage_mode != "replicated":
-                raise ValueError(
-                    "shared_cpu_weights=True requires "
-                    "storage_partition_mode='replicated'")
         if storage_mode == "exclusive_dynamic":
-            if self.config["enable_multi_card"]:
+            if (self.config["enable_multi_card"]
+                    and not self.config["shared_cpu_weights"]):
                 raise ValueError(
-                    "storage_partition_mode='exclusive_dynamic' currently "
-                    "supports single-card only; enable_multi_card must be False")
+                    "multi-card storage_partition_mode='exclusive_dynamic' "
+                    "requires shared_cpu_weights=True")
             if self.config["h2d_backend"] != "torch":
                 raise ValueError(
                     "storage_partition_mode='exclusive_dynamic' requires "

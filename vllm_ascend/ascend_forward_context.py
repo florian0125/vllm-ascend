@@ -428,8 +428,10 @@ def select_moe_comm_method(
         # so use the smallest configured layer capacity as the safe bound.
         # Replicated CPU weights allow arbitrary cross-rank placement. SHARED
         # MemFabric publishes every shard's source pointers to every EP rank.
-        # Torch shared-CPU mode instead maps one global Host pool into every
-        # rank. Both let target-model experts use the whole logical NPU cache.
+        # Torch shared-CPU mode instead maps one Host pool into every rank
+        # (all experts in replicated mode, the compact CPU-owned set in
+        # exclusive mode). Both let target-model experts use the whole logical
+        # NPU cache.
         # Ordinary Torch shards remain owner constrained. Draft/MTP layers
         # register after the target model's shared-source finalization and
         # therefore remain owner constrained.

@@ -566,7 +566,7 @@ class TestExpertOffloadConfig(TestBase):
     def test_exclusive_dynamic_storage_validation(self):
         with self.assertRaisesRegex(ValueError, "storage_partition_mode"):
             ExpertOffloadConfig({"storage_partition_mode": "static"})
-        with self.assertRaisesRegex(ValueError, "single-card only"):
+        with self.assertRaisesRegex(ValueError, "shared_cpu_weights=True"):
             ExpertOffloadConfig({
                 "storage_partition_mode": "exclusive_dynamic",
                 "enable_multi_card": True,
@@ -626,6 +626,19 @@ class TestExpertOffloadConfig(TestBase):
         self.assertEqual(
             config.shared_cpu_weights_dir, "/mnt/shared-memory")
 
+    def test_torch_shared_cpu_accepts_multi_card_exclusive_dynamic(self):
+        config = ExpertOffloadConfig({
+            "h2d_backend": "torch",
+            "enable_multi_card": True,
+            "shard_per_rank": True,
+            "shared_cpu_weights": True,
+            "storage_partition_mode": "exclusive_dynamic",
+            "num_device_experts": 32,
+        })
+
+        self.assertEqual(config.storage_partition_mode, "exclusive_dynamic")
+        self.assertEqual(config.num_device_experts_for_rank(0, 8), 4)
+
     def test_torch_shared_cpu_config_validation(self):
         common = {
             "enable_multi_card": True,
@@ -647,11 +660,6 @@ class TestExpertOffloadConfig(TestBase):
             ExpertOffloadConfig({
                 **common,
                 "shard_per_rank": False,
-            })
-        with self.assertRaisesRegex(ValueError, "storage_partition_mode"):
-            ExpertOffloadConfig({
-                **common,
-                "storage_partition_mode": "exclusive_dynamic",
             })
         with self.assertRaisesRegex(ValueError, "must not be empty"):
             ExpertOffloadConfig({

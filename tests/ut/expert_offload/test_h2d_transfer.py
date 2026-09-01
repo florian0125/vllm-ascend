@@ -1,4 +1,5 @@
 import os
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -163,6 +164,49 @@ def test_torch_shared_weight_pool_maps_and_unlinks_backing_file(tmp_path):
     pool.close()
 
     assert not os.path.exists(run_dir)
+
+
+def test_torch_shared_weight_pool_reads_deleted_mapping_pss():
+    pool = TorchSharedCPUWeightPool.__new__(TorchSharedCPUWeightPool)
+    pool.run_dir = "/dev/shm/vllm-ascend-torch-shared-test"
+    smaps = (
+        "1000-3000 rw-s 00000000 00:01 10 "
+        f"{pool.run_dir}/00000-w13.bin (deleted)\n"
+        "Size:                  8 kB\n"
+        "Rss:                   8 kB\n"
+        "Pss:                   4 kB\n"
+        "SwapPss:               1 kB\n"
+        "3000-4000 rw-p 00000000 00:00 0 [heap]\n"
+        "Size:                  4 kB\n"
+        "Rss:                   4 kB\n"
+        "Pss:                   4 kB\n"
+        "SwapPss:               0 kB\n"
+        "4000-5000 rw-s 00000000 00:01 11 "
+        f"{pool.run_dir}/00001-w2.bin (deleted)\n"
+        "Size:                  4 kB\n"
+        "Rss:                   4 kB\n"
+        "Pss:                   2 kB\n"
+        "SwapPss:               0 kB\n"
+    )
+
+    with patch("builtins.open", return_value=StringIO(smaps)):
+        snapshot = pool.mapping_memory_snapshot()
+
+    assert snapshot == {
+        "size_bytes": 12 * 1024,
+        "rss_bytes": 12 * 1024,
+        "pss_bytes": 6 * 1024,
+        "swap_pss_bytes": 1024,
+        "mapping_count": 2,
+    }
+
+
+def test_torch_shared_weight_pool_reports_unavailable_smaps():
+    pool = TorchSharedCPUWeightPool.__new__(TorchSharedCPUWeightPool)
+    pool.run_dir = "/dev/shm/vllm-ascend-torch-shared-test"
+
+    with patch("builtins.open", side_effect=PermissionError):
+        assert pool.mapping_memory_snapshot() is None
 
 
 def test_factory_selects_torch_shared_staging_transport():

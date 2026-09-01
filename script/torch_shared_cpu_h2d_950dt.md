@@ -2,7 +2,7 @@
 
 ## 目标和边界
 
-这组脚本验证：在同一台 950DT 服务器上，全局只保留一份文件映射的 CPU 专家权重，所有 EP rank 都能通过 Torch 从任意专家切片加载到本 rank 的 NPU。
+这组脚本验证：在同一台 950DT 服务器上，全局只保留一份文件映射的 CPU 专家权重，所有 EP rank 都能通过 Torch 从任意专家切片加载到本 rank 的 NPU。生产代码还支持 `exclusive_dynamic`：共享 CPU 只保存当前不在任何 NPU 上的紧凑专家集合，全部 rank 的 decode NPU 槽与该 CPU 集合共同组成唯一一份 canonical 权重。
 
 这不是完整的 `ExpertOffloadManager` 模型链路测试。脚本除独立 API smoke test 外，还会直接调用仓库中的 `TorchSharedCPUWeightPool` 和 `TorchSharedCPUH2DTransport`，验证每个 rank 只写自己的 checkpoint shard 后，其他 rank 能通过生产共享池/transport 加载该专家。它仍不覆盖：
 
@@ -12,7 +12,7 @@
 - NZ、FP4 等格式元数据及真实 GMM 精度；
 - ACL Graph host callback、预取流和计算重叠。
 
-仓库现已提供对应的生产调用链实现，但本脚本本身仍只是独立的前置条件验证，不能替代真实模型精度和性能测试。
+仓库现已提供对应的生产调用链实现，包括 `exclusive_dynamic` 的跨 rank 原子 swap 和 prefill HCCL P2P，但本脚本本身仍只是独立的前置条件验证，不能替代真实模型精度和性能测试，也不验证跨卡 D2D。
 
 950DT 文档中的“不支持内存共享（IPC）”是指 NPU Device Tensor IPC。本测试不共享 NPU Tensor，只使用 Linux `MAP_SHARED` CPU 文件映射，然后执行 CPU 到本地 NPU 的 `copy_`。
 
@@ -65,7 +65,7 @@ bash script/run_torch_shared_cpu_h2d_950dt.sh
 
 ## vLLM Ascend 生产配置
 
-同一台机器上的多 rank expert offload 可使用：
+同一台机器上的多 rank replicated expert offload 可使用：
 
 ```json
 {
@@ -91,7 +91,35 @@ bash script/run_torch_shared_cpu_h2d_950dt.sh
 - target finalize 之后才注册的 draft/MTP 层仍保持 owner-shard placement；
 - 该模式只支持同机 rank，不提供跨机器 CPU 共享。
 
-配置校验会拒绝以下组合：非 Torch backend、`enable_multi_card=false`、`shard_per_rank=false`，以及 `storage_partition_mode="exclusive_dynamic"`。共享目录创建或映射失败时会显式报错，不会静默退化成每 rank 一份完整权重。
+如果要求 CPU 与全部 decode NPU 在全局共同只保存一份 canonical 权重，使用方案 A 的正式配置：
+
+```json
+{
+  "expert_offload_config": {
+    "expert_offload": true,
+    "enable_multi_card": true,
+    "storage_partition_mode": "exclusive_dynamic",
+    "num_device_experts": 32,
+    "h2d_backend": "torch",
+    "shard_per_rank": true,
+    "shared_cpu_weights": true,
+    "shared_cpu_weights_dir": "/dev/shm",
+    "moe_offload_debug": true
+  }
+}
+```
+
+其中 `num_device_experts` 是每层全局 decode NPU 容量。例如 EP=8、配置值为 32 时，每 rank 分配 4 个 decode 专家槽；假设模型有 128 个专家，共享 CPU 紧凑池只分配 `128 - 32 = 96` 个专家槽。
+
+该模式的正式数据流是：
+
+1. 初始化时，全局初始 NPU 专家按 physical slot 切到各 rank，checkpoint 直接写入对应 rank 的 decode NPU 槽；剩余专家按紧凑 CPU slot 分配唯一 writer rank，写入所有 rank 共同映射的 mmap。
+2. Decode placement 保留未迁移专家的 rank 和 slot。miss 发生时，槽所在 rank 先把 victim D2H 到小型 pinned scratch，同时把 incoming 从共享 CPU H2D 到该槽；设备复制成功后才把 victim 写回 incoming 原来的紧凑 CPU slot。
+3. 全部 rank 通过 CPU group 汇总 device-copy 和 CPU-commit 状态；任一 rank 失败都会显式报错，所有权表和 `log2phy` 不会提交新版本。
+4. Prefill 仍使用静态 EP shard。CPU-owned 专家从共享 mmap H2D；本 rank NPU-owned 专家本地 D2D；其他 rank NPU-owned 专家通过 EP HCCL device group 直接 `isend/irecv` 到目标 prefill slot。
+5. Prefill 只是向 prefill pool 写快照，不改变 canonical 所有权或 decode `log2phy`。正式路径不创建 CPU snapshot，也不提供远端 NPU→CPU→NPU 的静默回退。
+
+配置校验会拒绝非 Torch backend、`enable_multi_card=false` 或 `shard_per_rank=false` 的共享 CPU 组合；多卡 `exclusive_dynamic` 若没有 `shared_cpu_weights=true` 也会被拒绝。共享目录、共享源、HCCL P2P 或分布式 swap 任一环节不可用时都会显式报错。
 
 如果 Gloo 初始化失败：
 
@@ -121,6 +149,36 @@ bash script/inspect_torch_shared_cpu_pss.sh \
 - `pss_to_file_ratio` 接近 `1`：共享映射驻留物理页约为一份文件大小；
 - 接近 rank 数：可能发生了私有复制，需要检查 `clone()`、`pin_memory()` 或映射方式；
 - 明显小于 `1`：部分页未驻留，或测试还没进入 HOLD 阶段。
+
+完整模型在设置 `moe_offload_debug=true` 后，会在共享专家源发布完成时自动汇总所有 EP rank 的共享映射 PSS，并由 rank 0 输出一行：
+
+```text
+[TORCH_SHARED_CPU_PSS] ranks=2 expected_shared_expert_mib=140352.0 mapped_size_per_rank_mib=140352.1..140352.1 mappings_per_rank=258..258 mapping_total_rss_mib=140352.0 mapping_total_pss_mib=140351.8 mapping_total_swap_pss_mib=0.0 pss_to_expected_ratio=1.000 result=PASS_ONE_PHYSICAL_COPY
+```
+
+- `PASS_ONE_PHYSICAL_COPY`：每个 rank 都映射了完整的共享 CPU pool（replicated 为全部专家，exclusive 为紧凑 CPU-owned 专家），汇总 PSS 在该 pool 一份数据的 ±5% 内且没有 Swap；
+- `FAIL_MAPPING_SIZE_MISMATCH`：至少一个 rank 的映射不完整或存在多余映射；
+- `FAIL_EXTRA_PHYSICAL_PAGES`：汇总 PSS 超过一份完整数据的允许误差；
+- `INCONCLUSIVE_NOT_FULLY_RESIDENT`：部分权重页尚未驻留，暂时不能判断；
+- `INCONCLUSIVE_SWAPPED`：共享权重发生换页，不能只用驻留 PSS 下结论；
+- `UNAVAILABLE`：当前系统不允许读取 `/proc/self/smaps`。
+
+`exclusive_dynamic` 初始化还会输出：
+
+```text
+[EXCLUSIVE-SHARED-AUDIT] ranks=8 layers=61 compact_shared_cpu_mib=... global_decode_npu_mib=... canonical_total_mib=... expected_one_model_mib=... cpu_experts_per_layer=[96, ...] global_npu_experts_per_layer=[32, ...] result=PASS_ONE_CANONICAL_MODEL
+```
+
+这里的 `PASS_ONE_CANONICAL_MODEL` 验证逻辑容量和实际 storage 字节：紧凑共享 CPU 加全部 rank 的 decode NPU canonical storage 等于一份完整模型专家权重。它不包含 prefill pool、pinned swap scratch、Torch staging 和派生 fp32 scale；这些都是运行工作区或派生数据，不属于 canonical 权重。CPU 是否确实只有一份物理页仍以同一次运行中的 `TORCH_SHARED_CPU_PSS` 为准。
+
+发生 decode 迁移和 prefill 跨卡直传时可分别检查：
+
+```text
+[EXCLUSIVE-SHARED-SWAP] layer=... rank=... global_swaps=... local_swaps=...
+[PREFILL-D2D] layer=... rank=... local_tasks=... p2p_ops=... global_remote_experts=...
+```
+
+要证明“直接跨卡 D2D”实际生效，至少应看到 `p2p_ops > 0`，并结合 HCCL profiler/trace 确认对应 send/recv；只有源码或单测不能证明 950DT 实机链路已经通过。
 
 ## 测试内容和通过标准
 
@@ -236,7 +294,7 @@ bash script/run_torch_shared_cpu_h2d_950dt.sh
 3. 检查 `/dev/shm` 容量、进程 PSS、NUMA 位置以及 pinned staging 峰值。
 4. 验证初始化 barrier、异常退出、target/draft 生命周期和重复启动清理。
 5. 测量 decode miss 的 H2D p50/p99、吞吐和计算重叠。
-6. 验证 MC2 decode 的全局 placement、`log2phy` 与 ALLTOALL prefill 边界。
+6. 对 `exclusive_dynamic` 验证 MC2 decode 的全局 ownership、原子 swap、`log2phy` 一致性，以及 ALLTOALL prefill 的 HCCL P2P；同时确认没有 NPU→CPU→NPU 的远端回退。
 
 ## 官方参考
 

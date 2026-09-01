@@ -2,6 +2,7 @@
 
 import atexit
 import os
+import re
 import shutil
 import socket
 import tempfile
@@ -15,6 +16,7 @@ import torch
 
 ONE_GIB = 1 << 30
 UINT32_MAX = (1 << 32) - 1
+_SMAPS_HEADER_RE = re.compile(r"^[0-9A-Fa-f]+-[0-9A-Fa-f]+\s")
 
 
 class CopyDirection(str, Enum):
@@ -336,6 +338,49 @@ class TorchSharedCPUWeightPool:
                 "Failed to unlink mapped Torch shared CPU weight file "
                 f"{path}: {unlink_error}")
         return tensor
+
+    def mapping_memory_snapshot(self) -> dict[str, int] | None:
+        """Return this process's smaps accounting for pool mappings.
+
+        Backing files are unlinked after every rank maps them, but Linux keeps
+        the original path with a ``(deleted)`` suffix in ``/proc/self/smaps``.
+        Matching the per-run directory therefore excludes unrelated model and
+        process memory while retaining the shared expert mappings.
+        """
+        totals = {
+            "size_bytes": 0,
+            "rss_bytes": 0,
+            "pss_bytes": 0,
+            "swap_pss_bytes": 0,
+        }
+        mapping_count = 0
+        in_pool_mapping = False
+        mapping_prefix = self.run_dir + os.sep
+        smaps_keys = {
+            "Size": "size_bytes",
+            "Rss": "rss_bytes",
+            "Pss": "pss_bytes",
+            "SwapPss": "swap_pss_bytes",
+        }
+        try:
+            with open("/proc/self/smaps", encoding="utf-8") as smaps_file:
+                for line in smaps_file:
+                    if _SMAPS_HEADER_RE.match(line):
+                        in_pool_mapping = mapping_prefix in line
+                        if in_pool_mapping:
+                            mapping_count += 1
+                        continue
+                    if not in_pool_mapping:
+                        continue
+                    key, separator, value = line.partition(":")
+                    output_key = smaps_keys.get(key)
+                    if separator and output_key is not None:
+                        totals[output_key] += (
+                            int(value.strip().split()[0]) * 1024)
+        except (OSError, ValueError, IndexError):
+            return None
+        totals["mapping_count"] = mapping_count
+        return totals
 
     def close(self) -> None:
         if self._closed:

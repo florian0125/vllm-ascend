@@ -765,11 +765,24 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         orig_wl = self.routed_experts.weight_loader
         # ndev = per-rank device slot count (== device weight dim0).
         # Single-card initialization may map arbitrary hot global experts to
-        # those slots. Multi-card retains the historical contiguous bootstrap;
-        # its collective hot placement is finalized after weight loading.
+        # those slots. Multi-card replicated mode retains the historical
+        # contiguous bootstrap. Multi-card exclusive mode divides one global
+        # canonical NPU set across ranks and loads each expert directly into
+        # its owning rank's local slot.
         ndev = mgr.offload_config.num_device_experts_for_rank(
             layer_moe_idx, mgr.ep_size if self.enable_multi_card else 1)
-        if self.enable_multi_card:
+        if (self.enable_multi_card
+                and mgr.exclusive_shared_cpu_enabled):
+            global_initial = (
+                mgr.offload_config.initial_device_experts_for_layer(
+                    layer_moe_idx, self.routed_experts.global_num_experts))
+            start = mgr.ep_rank * ndev
+            initial_device_slots = {
+                int(eid): local_slot
+                for local_slot, eid in enumerate(
+                    global_initial[start:start + ndev])
+            }
+        elif self.enable_multi_card:
             initial_device_slots = {eid: eid for eid in range(ndev)}
         else:
             initial_device_slots = {

@@ -9,8 +9,9 @@ def init_expert_offload_config(offload_config, num_experts: int,
 
     Builds an expert_map_offload that the upstream layer.py hook reads
     to shrink the device weight and skip loading cold experts. Single-card
-    hot preload maps the ranked global expert IDs directly to initial slots;
-    otherwise the ordinary contiguous ``[0, ndev)`` placement is retained.
+    hot preload maps the ranked global expert IDs directly to initial slots
+    for single-card and multi-card exclusive shared ownership; otherwise the
+    ordinary contiguous ``[0, ndev)`` placement is retained.
 
     Args:
         offload_config: ExpertOffloadConfig instance from AscendConfig.
