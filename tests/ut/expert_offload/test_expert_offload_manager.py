@@ -1433,6 +1433,8 @@ def _exclusive_shared_runtime_manager():
     manager._npu_slot_to_eid = []
     manager._eid_to_npu_slot = []
     manager._exclusive_layer_locks = []
+    manager._exclusive_prefill_comm_lock = threading.Lock()
+    manager._exclusive_prefill_comm_buffers = {}
     manager._exclusive_shared_local_cpu_slots = [[0]]
     manager._exclusive_shared_cpu_slot_to_local = [{0: 0}]
     manager._init_exclusive_ownership(
@@ -1518,7 +1520,7 @@ def test_exclusive_shared_swap_commits_compact_cpu_and_global_ownership():
     assert torch.equal(log2phy, placement.log2phy)
 
 
-def test_exclusive_shared_prefill_uses_direct_hccl_p2p_for_remote_npu():
+def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
     manager = _exclusive_shared_runtime_manager()
     manager._npu_slot_to_eid[0] = [2, 1]
     manager._eid_to_npu_slot[0] = [-1, 1, 0, -1]
@@ -1531,23 +1533,52 @@ def test_exclusive_shared_prefill_uses_direct_hccl_p2p_for_remote_npu():
         w2_weight=torch.stack([
             torch.full((2,), 32, dtype=torch.uint8),
         ]),
+        w13_weight_scale=torch.tensor([[1.25]]),
     )
     manager.moe_layers = [layer]
     manager._prefill_w13 = [torch.zeros((2, 4), dtype=torch.uint8)]
     manager._prefill_w2 = [torch.zeros((2, 2), dtype=torch.uint8)]
-    manager._prefill_w13_scale = []
+    manager._prefill_w13_scale = [torch.zeros((2, 1))]
     manager._prefill_w13_scale_fp32 = []
     manager._prefill_w2_scale = []
     manager._prefill_w13_offset = []
     manager._prefill_w2_offset = []
     manager._prefill_w13_scale_bias = []
     manager._prefill_w2_scale_bias = []
+    manager.scale_cpu_buffers = {
+        "w13_weight_scale": [[
+            torch.tensor([2.5]),
+            torch.tensor([3.5]),
+        ]],
+    }
+    manager._torch_shared_cpu_buffers[(
+        0, "w13_weight_scale")] = torch.tensor([[2.5], [3.5]])
     manager.num_device_layers = 1
     manager._exclusive_layer_locks = [threading.RLock()]
     manager._exclusive_prefill_p2p_warmed = True
     ep_group = SimpleNamespace(
         cpu_group=object(), device_group=object(), ranks=[10, 11])
-    requests = [SimpleNamespace(wait=MagicMock()) for _ in range(4)]
+
+    def as_bytes(*tensors):
+        return torch.cat([
+            tensor.contiguous().view(torch.uint8).reshape(-1)
+            for tensor in tensors
+        ])
+
+    remote_payload = as_bytes(
+        torch.full((4,), 41, dtype=torch.uint8),
+        torch.full((2,), 51, dtype=torch.uint8),
+        torch.tensor([6.25]),
+    )
+    requests = []
+
+    def exchange(ops):
+        for args, _ in ops:
+            if args[0] is torch.distributed.irecv:
+                args[1].copy_(remote_payload)
+        requests.extend(
+            SimpleNamespace(wait=MagicMock()) for _ in ops)
+        return requests
 
     with (
         patch("vllm.distributed.parallel_state.get_ep_group",
@@ -1555,7 +1586,7 @@ def test_exclusive_shared_prefill_uses_direct_hccl_p2p_for_remote_npu():
         patch("torch.distributed.P2POp", side_effect=lambda *args, **kwargs:
               (args, kwargs)) as p2p_op,
         patch("torch.distributed.batch_isend_irecv",
-              return_value=requests) as batch,
+              side_effect=exchange) as batch,
         patch("torch.distributed.barrier") as barrier,
         patch(
             "vllm_ascend.expert_offload.expert_offload_manager."
@@ -1565,19 +1596,81 @@ def test_exclusive_shared_prefill_uses_direct_hccl_p2p_for_remote_npu():
     ):
         manager._prefill_load_layer_shard_exclusive_shared(0, 0)
 
-    assert p2p_op.call_count == 4
+    assert p2p_op.call_count == 2
     assert batch.call_count == 1
     assert all(request.wait.call_count == 1 for request in requests)
     assert all(call_args.args[2] == 11
                for call_args in p2p_op.call_args_list)
-    assert all(isinstance(call_args.args[1], torch.Tensor)
-               for call_args in p2p_op.call_args_list)
+    communication_buffers = [
+        call_args.args[1] for call_args in p2p_op.call_args_list
+    ]
+    assert all(buffer.dtype == torch.uint8
+               for buffer in communication_buffers)
+    assert all(buffer.is_contiguous() for buffer in communication_buffers)
+    assert all(buffer.storage_offset() == 0
+               for buffer in communication_buffers)
+    assert all(buffer.numel() == 10 for buffer in communication_buffers)
+    send_buffer = next(
+        call_args.args[1] for call_args in p2p_op.call_args_list
+        if call_args.args[0] is torch.distributed.isend)
+    assert torch.equal(send_buffer, as_bytes(
+        layer.w13_weight[0],
+        layer.w2_weight[0],
+        layer.w13_weight_scale[0],
+    ))
     barrier.assert_called_once_with(group=ep_group.cpu_group)
     # Static-shard expert 0 is CPU-owned and was loaded through shared H2D.
     assert torch.equal(
         manager._prefill_w13[0][0],
         manager._torch_shared_cpu_buffers[(0, "w13")][0],
     )
+    assert torch.equal(
+        manager._prefill_w13[0][1],
+        torch.full((4,), 41, dtype=torch.uint8),
+    )
+    assert torch.equal(
+        manager._prefill_w2[0][1],
+        torch.full((2,), 51, dtype=torch.uint8),
+    )
+    assert manager._prefill_w13_scale[0][:, 0].tolist() == [2.5, 6.25]
+    pack_names = [
+        task.name.split("[")[0]
+        for task in manager.h2d_transport.batches[0]
+        if task.name.startswith("prefill-p2p-pack-")
+    ]
+    unpack_names = [
+        task.name.split("[")[0]
+        for task in manager.h2d_transport.batches[1]
+    ]
+    assert pack_names == [
+        "prefill-p2p-pack-w13",
+        "prefill-p2p-pack-w2",
+        "prefill-p2p-pack-w13_weight_scale",
+    ]
+    assert unpack_names == [
+        "prefill-p2p-unpack-w13",
+        "prefill-p2p-unpack-w2",
+        "prefill-p2p-unpack-w13_weight_scale",
+    ]
+
+
+def test_exclusive_prefill_comm_buffer_reuses_zero_offset_prefix():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager._exclusive_prefill_comm_buffers = {}
+
+    initial = manager._get_exclusive_prefill_comm_buffer(
+        "send", 1, 16, torch.device("cpu"))
+    smaller = manager._get_exclusive_prefill_comm_buffer(
+        "send", 1, 8, torch.device("cpu"))
+    grown = manager._get_exclusive_prefill_comm_buffer(
+        "send", 1, 32, torch.device("cpu"))
+
+    assert initial.dtype == smaller.dtype == grown.dtype == torch.uint8
+    assert initial.storage_offset() == 0
+    assert smaller.storage_offset() == 0
+    assert grown.storage_offset() == 0
+    assert initial.data_ptr() == smaller.data_ptr()
+    assert grown.numel() == 32
 
 
 def test_exclusive_shared_prefill_uses_raw_storage_for_local_npu():

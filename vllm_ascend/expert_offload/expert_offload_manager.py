@@ -194,6 +194,13 @@ class ExpertOffloadManager:
         self._exclusive_shared_local_cpu_slots: list[list[int]] = []
         self._exclusive_shared_cpu_slot_to_local: list[dict[int, int]] = []
         self._exclusive_prefill_p2p_warmed = False
+        # Cross-rank prefill transfers cannot pass internal-format expert
+        # slices directly to torch.distributed because those views commonly
+        # have a non-zero storage_offset. Serialize buffer reuse and keep one
+        # base-format uint8 send/receive allocation per EP peer.
+        self._exclusive_prefill_comm_lock = threading.Lock()
+        self._exclusive_prefill_comm_buffers: dict[
+            tuple[str, int], torch.Tensor] = {}
 
         # Temporary per-expert storage for w13 scale/offset shard assembly.
         # Key: (layer_moe_idx, expert_id, attr_name), value: first shard.
@@ -1935,7 +1942,7 @@ class ExpertOffloadManager:
         *,
         include_weights: bool = True,
     ) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
-        """Return typed tensors required by prefill communication."""
+        """Return matching typed views for local or buffered prefill copies."""
         layer = self.moe_layers[layer_idx]
         components = []
         if include_weights:
@@ -1965,24 +1972,119 @@ class ExpertOffloadManager:
         for name, source, destination in components:
             if source.shape != destination.shape or source.dtype != destination.dtype:
                 raise RuntimeError(
-                    "Direct prefill D2D requires matching expert tensors: "
+                    "Prefill copies require matching expert tensors: "
                     f"layer={layer_idx}, name={name}, "
                     f"source={tuple(source.shape)}/{source.dtype}, "
                     f"destination={tuple(destination.shape)}/{destination.dtype}")
         return components
+
+    @staticmethod
+    def _prefill_tensor_byte_storage(tensor: torch.Tensor, name: str):
+        """Return exactly one contiguous tensor view as raw storage bytes."""
+        if not tensor.is_contiguous():
+            raise RuntimeError(
+                "Cross-rank prefill metadata must be contiguous before raw "
+                f"byte packing: name={name}, shape={tuple(tensor.shape)}, "
+                f"stride={tuple(tensor.stride())}")
+        nbytes = tensor.numel() * tensor.element_size()
+        start = tensor.storage_offset() * tensor.element_size()
+        return tensor.untyped_storage()[start:start + nbytes], nbytes
+
+    def _prefill_raw_device_components(
+        self,
+        layer_idx: int,
+        pool_slot: int,
+        source_slot: int,
+        destination_slot: int,
+    ) -> list[tuple[str, object, object, int]]:
+        """Return byte-preserving sources and destinations for one expert.
+
+        Weight components always use raw storage because their typed tensors
+        may carry an Ascend internal format. Quantization metadata is ordinary
+        contiguous storage, but is also exposed as raw bytes so the peer
+        communication buffer has one representation for every component.
+        """
+        layer = self.moe_layers[layer_idx]
+        components: list[tuple[str, object, object, int]] = []
+        weight_specs = (
+            ("w13", self._prefill_w13, self.w13_expert_size_bytes),
+            ("w2", self._prefill_w2, self.w2_expert_size_bytes),
+        )
+        for name, prefill_buffers, nbytes in weight_specs:
+            destination_start = destination_slot * nbytes
+            components.append((
+                name,
+                self._expert_device_storage(layer, source_slot, name),
+                prefill_buffers[pool_slot].untyped_storage()[
+                    destination_start:destination_start + nbytes],
+                nbytes,
+            ))
+
+        for name, source, destination in self._prefill_device_components(
+                layer_idx, pool_slot, source_slot, destination_slot,
+                include_weights=False):
+            source_storage, source_nbytes = (
+                self._prefill_tensor_byte_storage(source, name))
+            destination_storage, destination_nbytes = (
+                self._prefill_tensor_byte_storage(destination, name))
+            if source_nbytes != destination_nbytes:
+                raise RuntimeError(
+                    "Cross-rank prefill metadata byte sizes must match: "
+                    f"layer={layer_idx}, name={name}, "
+                    f"source_bytes={source_nbytes}, "
+                    f"destination_bytes={destination_nbytes}")
+            components.append((name, source_storage, destination_storage,
+                               source_nbytes))
+        return components
+
+    def _get_exclusive_prefill_comm_buffer(
+        self,
+        direction: str,
+        peer_rank: int,
+        required_bytes: int,
+        device,
+    ) -> torch.Tensor:
+        """Return a zero-offset contiguous uint8 NPU buffer for one peer."""
+        if required_bytes <= 0:
+            raise ValueError(
+                "Prefill communication buffer size must be positive; "
+                f"got {required_bytes}")
+        buffers = getattr(self, "_exclusive_prefill_comm_buffers", None)
+        if buffers is None:
+            buffers = {}
+            self._exclusive_prefill_comm_buffers = buffers
+        key = (direction, peer_rank)
+        buffer = buffers.get(key)
+        if (buffer is None or buffer.numel() < required_bytes
+                or buffer.device != device):
+            buffer = torch.empty(
+                required_bytes, dtype=torch.uint8, device=device)
+            buffers[key] = buffer
+        communication_view = buffer[:required_bytes]
+        if (communication_view.dtype != torch.uint8
+                or not communication_view.is_contiguous()
+                or communication_view.storage_offset() != 0):
+            raise RuntimeError(
+                "Invalid cross-rank prefill communication buffer: "
+                f"direction={direction}, peer={peer_rank}, "
+                f"dtype={communication_view.dtype}, "
+                f"contiguous={communication_view.is_contiguous()}, "
+                f"storage_offset={communication_view.storage_offset()}")
+        return communication_view
 
     def _prefill_load_layer_shard_exclusive_shared(
         self,
         layer_idx: int,
         pool_slot: int,
     ) -> None:
-        """Load one static EP shard using CPU H2D and direct HCCL NPU P2P.
+        """Load one static EP shard using CPU H2D and buffered HCCL NPU P2P.
 
         CPU-owned experts read the compact shared mmap. Same-rank NPU weights
-        use the single-card raw-storage D2D representation; cross-rank NPU
-        weights use typed tensors required by HCCL P2P. This is a read-only
-        snapshot into the prefill pool; canonical ownership and decode
-        log2phy are not changed.
+        use the single-card raw-storage D2D representation. Cross-rank NPU
+        weights are packed into base-format, zero-offset uint8 NPU buffers,
+        transferred through HCCL, then unpacked directly into the destination
+        prefill storage. This read-only snapshot does not change canonical
+        ownership or the decode log2phy mapping.
         """
         from torch import distributed as dist
         from vllm.distributed.parallel_state import get_ep_group
@@ -2001,84 +2103,168 @@ class ExpertOffloadManager:
             raise RuntimeError(
                 "Multi-card exclusive prefill requires direct HCCL P2P "
                 "support on the EP device group; CPU fallback is disabled")
-        self._warm_up_exclusive_prefill_p2p(
-            dist, ep_group, pool_slot)
+        comm_lock = getattr(self, "_exclusive_prefill_comm_lock", None)
+        if comm_lock is None:
+            comm_lock = threading.Lock()
+            self._exclusive_prefill_comm_lock = comm_lock
+        layer_lock = self._exclusive_layer_locks[layer_idx]
+        with comm_lock, layer_lock:
+            self._warm_up_exclusive_prefill_p2p(
+                dist, ep_group, pool_slot)
 
-        shard = self.mc_shard_size
-        per_rank_slots = self.offload_config.num_device_experts_for_rank(
-            layer_idx, self.ep_size)
-        local_tasks: list[H2DCopyTask] = []
-        p2p_ops = []
-        remote_experts = 0
-        for eid in range(self.num_total_experts):
-            destination_rank = eid // shard
-            destination_slot = eid % shard
-            physical_slot = self._eid_to_npu_slot[layer_idx][eid]
-            if physical_slot < 0:
-                # CPU-owned: shared mmap -> pinned staging -> raw NPU storage.
-                if destination_rank == self.ep_rank:
-                    local_tasks.extend(self._build_prefill_h2d_tasks(
-                        layer_idx, pool_slot, eid, destination_slot))
-                continue
+            shard = self.mc_shard_size
+            per_rank_slots = (
+                self.offload_config.num_device_experts_for_rank(
+                    layer_idx, self.ep_size))
+            local_tasks: list[H2DCopyTask] = []
+            send_components: dict[
+                int, list[tuple[int, str, object, object, int]]] = {}
+            recv_components: dict[
+                int, list[tuple[int, str, object, object, int]]] = {}
+            remote_experts = 0
+            for eid in range(self.num_total_experts):
+                destination_rank = eid // shard
+                destination_slot = eid % shard
+                physical_slot = self._eid_to_npu_slot[layer_idx][eid]
+                if physical_slot < 0:
+                    # CPU-owned: shared mmap -> pinned staging -> raw NPU
+                    # storage.
+                    if destination_rank == self.ep_rank:
+                        local_tasks.extend(self._build_prefill_h2d_tasks(
+                            layer_idx, pool_slot, eid, destination_slot))
+                    continue
 
-            source_rank = physical_slot // per_rank_slots
-            source_slot = physical_slot % per_rank_slots
-            if source_rank == destination_rank:
-                # Same-rank NPU-owned: preserve the single-card raw D2D path.
-                if source_rank == self.ep_rank:
-                    local_tasks.extend(
-                        self._build_prefill_local_d2d_tasks(
+                source_rank = physical_slot // per_rank_slots
+                source_slot = physical_slot % per_rank_slots
+                if source_rank == destination_rank:
+                    # Same-rank NPU-owned: preserve the single-card raw D2D
+                    # path.
+                    if source_rank == self.ep_rank:
+                        local_tasks.extend(
+                            self._build_prefill_local_d2d_tasks(
+                                layer_idx, pool_slot, source_slot,
+                                destination_slot, eid))
+                    continue
+
+                remote_experts += 1
+                if self.ep_rank not in (source_rank, destination_rank):
+                    continue
+                peer_rank = (destination_rank
+                             if self.ep_rank == source_rank else source_rank)
+                peer_components = (
+                    send_components if self.ep_rank == source_rank
+                    else recv_components)
+                entries = peer_components.setdefault(peer_rank, [])
+                for name, source, destination, nbytes in (
+                        self._prefill_raw_device_components(
                             layer_idx, pool_slot, source_slot,
-                            destination_slot, eid))
-                continue
+                            destination_slot)):
+                    entries.append((eid, name, source, destination, nbytes))
 
-            remote_experts += 1
-            if self.ep_rank not in (source_rank, destination_rank):
-                continue
-            # Cross-rank NPU-owned: torch.distributed/HCCL requires tensors.
-            peer_rank = (destination_rank
-                         if self.ep_rank == source_rank else source_rank)
-            for _, source, destination in self._prefill_device_components(
-                    layer_idx, pool_slot, source_slot, destination_slot):
-                tensor = source if self.ep_rank == source_rank else destination
-                op = dist.isend if self.ep_rank == source_rank else dist.irecv
-                p2p_ops.append(dist.P2POp(
-                    op, tensor, group_ranks[peer_rank], group=device_group))
+            pack_tasks: list[H2DCopyTask] = []
+            unpack_tasks: list[H2DCopyTask] = []
+            send_buffers: dict[int, torch.Tensor] = {}
+            recv_buffers: dict[int, torch.Tensor] = {}
+            device = self._prefill_w13[pool_slot].device
+            for peer_rank, entries in sorted(send_components.items()):
+                total_bytes = sum(entry[4] for entry in entries)
+                buffer = self._get_exclusive_prefill_comm_buffer(
+                    "send", peer_rank, total_bytes, device)
+                send_buffers[peer_rank] = buffer
+                offset = 0
+                for eid, name, source, _, nbytes in entries:
+                    pack_tasks.append(H2DCopyTask(
+                        source=source,
+                        destination=buffer.untyped_storage()[
+                            offset:offset + nbytes],
+                        nbytes=nbytes,
+                        name=(f"prefill-p2p-pack-{name}[L{layer_idx},"
+                              f"E{eid},R{self.ep_rank}->R{peer_rank}]"),
+                        direction=CopyDirection.D2D,
+                    ))
+                    offset += nbytes
+            for peer_rank, entries in sorted(recv_components.items()):
+                total_bytes = sum(entry[4] for entry in entries)
+                buffer = self._get_exclusive_prefill_comm_buffer(
+                    "recv", peer_rank, total_bytes, device)
+                recv_buffers[peer_rank] = buffer
+                offset = 0
+                for eid, name, _, destination, nbytes in entries:
+                    unpack_tasks.append(H2DCopyTask(
+                        source=buffer.untyped_storage()[
+                            offset:offset + nbytes],
+                        destination=destination,
+                        nbytes=nbytes,
+                        name=(f"prefill-p2p-unpack-{name}[L{layer_idx},"
+                              f"E{eid},R{peer_rank}->R{self.ep_rank}]"),
+                        direction=CopyDirection.D2D,
+                    ))
+                    offset += nbytes
 
-        if self._debug:
-            local_h2d_tasks = sum(
-                task.direction == CopyDirection.H2D for task in local_tasks)
-            local_d2d_tasks = sum(
-                task.direction == CopyDirection.D2D for task in local_tasks)
-            raw_storage_d2d_tasks = sum(
-                task.direction == CopyDirection.D2D
-                and not isinstance(task.source, torch.Tensor)
-                and not isinstance(task.destination, torch.Tensor)
-                for task in local_tasks)
-            logger.info(
-                "[PREFILL-D2D-PLAN] layer=%d rank=%d h2d_tasks=%d "
-                "local_d2d_tasks=%d raw_storage_d2d_tasks=%d p2p_ops=%d "
-                "global_remote_experts=%d",
-                layer_idx, self.ep_rank, local_h2d_tasks, local_d2d_tasks,
-                raw_storage_d2d_tasks, len(p2p_ops), remote_experts)
+            p2p_ops = [
+                dist.P2POp(
+                    dist.isend, buffer, group_ranks[peer_rank],
+                    group=device_group)
+                for peer_rank, buffer in sorted(send_buffers.items())
+            ]
+            p2p_ops.extend(
+                dist.P2POp(
+                    dist.irecv, buffer, group_ranks[peer_rank],
+                    group=device_group)
+                for peer_rank, buffer in sorted(recv_buffers.items())
+            )
 
-        lock = self._exclusive_layer_locks[layer_idx]
-        with lock:
+            if self._debug:
+                local_h2d_tasks = sum(
+                    task.direction == CopyDirection.H2D
+                    for task in local_tasks)
+                local_d2d_tasks = sum(
+                    task.direction == CopyDirection.D2D
+                    for task in local_tasks)
+                raw_storage_d2d_tasks = sum(
+                    task.direction == CopyDirection.D2D
+                    and not isinstance(task.source, torch.Tensor)
+                    and not isinstance(task.destination, torch.Tensor)
+                    for task in local_tasks)
+                send_bytes = ",".join(
+                    f"{peer}:{buffer.numel()}"
+                    for peer, buffer in sorted(send_buffers.items())) or "-"
+                recv_bytes = ",".join(
+                    f"{peer}:{buffer.numel()}"
+                    for peer, buffer in sorted(recv_buffers.items())) or "-"
+                logger.info(
+                    "[PREFILL-D2D-PLAN] layer=%d rank=%d h2d_tasks=%d "
+                    "local_d2d_tasks=%d raw_storage_d2d_tasks=%d "
+                    "pack_tasks=%d unpack_tasks=%d p2p_ops=%d "
+                    "send_bytes_by_peer=%s recv_bytes_by_peer=%s "
+                    "global_remote_experts=%d",
+                    layer_idx, self.ep_rank, local_h2d_tasks,
+                    local_d2d_tasks, raw_storage_d2d_tasks,
+                    len(pack_tasks), len(unpack_tasks), len(p2p_ops),
+                    send_bytes, recv_bytes, remote_experts)
+
             with torch_npu.npu.stream(self.load_stream):
-                self._get_h2d_transport().copy_batch(local_tasks)
-                if p2p_ops:
-                    requests = dist.batch_isend_irecv(p2p_ops)
-                    for request in requests:
-                        request.wait()
-                self._refresh_prefill_fp32_scale(pool_slot, shard)
+                self._get_h2d_transport().copy_batch(
+                    local_tasks + pack_tasks)
+            if p2p_ops:
+                # HCCL must not observe a partially packed send buffer.
                 self._synchronize_h2d()
-        dist.barrier(group=ep_group.cpu_group)
-        if self._debug:
-            logger.info(
-                "[PREFILL-D2D] layer=%d rank=%d local_tasks=%d "
-                "p2p_ops=%d global_remote_experts=%d",
-                layer_idx, self.ep_rank, len(local_tasks), len(p2p_ops),
-                remote_experts)
+                requests = dist.batch_isend_irecv(p2p_ops)
+                for request in requests:
+                    request.wait()
+            with torch_npu.npu.stream(self.load_stream):
+                self._get_h2d_transport().copy_batch(unpack_tasks)
+                self._refresh_prefill_fp32_scale(pool_slot, shard)
+            self._synchronize_h2d()
+            dist.barrier(group=ep_group.cpu_group)
+            if self._debug:
+                logger.info(
+                    "[PREFILL-D2D] layer=%d rank=%d local_tasks=%d "
+                    "pack_tasks=%d unpack_tasks=%d p2p_ops=%d "
+                    "global_remote_experts=%d",
+                    layer_idx, self.ep_rank, len(local_tasks),
+                    len(pack_tasks), len(unpack_tasks), len(p2p_ops),
+                    remote_experts)
 
     def _warm_up_exclusive_prefill_p2p(
         self,
@@ -3450,6 +3636,10 @@ class ExpertOffloadManager:
         shared_pool = getattr(self, '_torch_shared_cpu_pool', None)
         if shared_pool is not None:
             shared_pool.close()
+        comm_buffers = getattr(
+            self, '_exclusive_prefill_comm_buffers', None)
+        if comm_buffers is not None:
+            comm_buffers.clear()
 
     def _build_expert_h2d_tasks(self, layer, layer_idx, eid,
                                 slot) -> list[H2DCopyTask]:
