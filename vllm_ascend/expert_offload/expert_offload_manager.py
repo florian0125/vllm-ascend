@@ -1875,21 +1875,76 @@ class ExpertOffloadManager:
                 self._prefill_w13_scale[pool_slot][eid].to(torch.float32),
                 non_blocking=True)
 
+    def _build_prefill_local_d2d_tasks(
+        self,
+        layer_idx: int,
+        pool_slot: int,
+        source_slot: int,
+        destination_slot: int,
+        expert_id: int,
+    ) -> list[H2DCopyTask]:
+        """Build same-rank prefill copies without typed weight ``copy_``.
+
+        The 950DT aclnn-only runtime rejects ``Tensor.copy_`` when the weight
+        tensor carries an internal format.  The existing single-card path
+        avoids that dispatch by copying the raw weight storages.  Keep the
+        same representation for same-rank multi-card D2D; quantization
+        metadata remains ordinary-format typed tensors.
+        """
+        layer = self.moe_layers[layer_idx]
+        tasks = []
+        weight_specs = (
+            ("w13", self._prefill_w13, self.w13_expert_size_bytes),
+            ("w2", self._prefill_w2, self.w2_expert_size_bytes),
+        )
+        for name, prefill_buffers, nbytes in weight_specs:
+            start = destination_slot * nbytes
+            source = self._expert_device_storage(layer, source_slot, name)
+            destination = prefill_buffers[pool_slot].untyped_storage()[
+                start:start + nbytes]
+            tasks.append(H2DCopyTask(
+                source=source,
+                destination=destination,
+                nbytes=nbytes,
+                name=(f"prefill-local-d2d-{name}[L{layer_idx},"
+                      f"E{expert_id},S{source_slot}->P{pool_slot}:"
+                      f"E{destination_slot}]"),
+                direction=CopyDirection.D2D,
+            ))
+
+        for name, source, destination in self._prefill_device_components(
+                layer_idx, pool_slot, source_slot, destination_slot,
+                include_weights=False):
+            tasks.append(H2DCopyTask(
+                source=source,
+                destination=destination,
+                nbytes=source.numel() * source.element_size(),
+                name=(f"prefill-local-d2d-{name}[L{layer_idx},"
+                      f"E{expert_id},S{source_slot}->P{pool_slot}:"
+                      f"E{destination_slot}]"),
+                direction=CopyDirection.D2D,
+            ))
+        return tasks
+
     def _prefill_device_components(
         self,
         layer_idx: int,
         pool_slot: int,
         source_slot: int,
         destination_slot: int,
+        *,
+        include_weights: bool = True,
     ) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
-        """Return deterministic typed NPU tensors for one prefill D2D copy."""
+        """Return typed tensors required by prefill communication."""
         layer = self.moe_layers[layer_idx]
-        components = [
-            ("w13", _expert_weight(layer, "w13_weight").data[source_slot],
-             self._prefill_w13[pool_slot][destination_slot]),
-            ("w2", _expert_weight(layer, "w2_weight").data[source_slot],
-             self._prefill_w2[pool_slot][destination_slot]),
-        ]
+        components = []
+        if include_weights:
+            components.extend([
+                ("w13", _expert_weight(layer, "w13_weight").data[source_slot],
+                 self._prefill_w13[pool_slot][destination_slot]),
+                ("w2", _expert_weight(layer, "w2_weight").data[source_slot],
+                 self._prefill_w2[pool_slot][destination_slot]),
+            ])
         quant_specs = (
             ("w13_weight_scale", self._prefill_w13_scale),
             ("w2_weight_scale", self._prefill_w2_scale),
@@ -1923,11 +1978,11 @@ class ExpertOffloadManager:
     ) -> None:
         """Load one static EP shard using CPU H2D and direct HCCL NPU P2P.
 
-        CPU-owned experts read the compact shared mmap. NPU-owned experts use
-        local D2D when source and destination ranks match, otherwise the source
-        decode slot is sent directly to the destination prefill slot. This is
-        a read-only snapshot into the prefill pool; canonical ownership and
-        decode log2phy are not changed.
+        CPU-owned experts read the compact shared mmap. Same-rank NPU weights
+        use the single-card raw-storage D2D representation; cross-rank NPU
+        weights use typed tensors required by HCCL P2P. This is a read-only
+        snapshot into the prefill pool; canonical ownership and decode
+        log2phy are not changed.
         """
         from torch import distributed as dist
         from vllm.distributed.parallel_state import get_ep_group
@@ -1960,6 +2015,7 @@ class ExpertOffloadManager:
             destination_slot = eid % shard
             physical_slot = self._eid_to_npu_slot[layer_idx][eid]
             if physical_slot < 0:
+                # CPU-owned: shared mmap -> pinned staging -> raw NPU storage.
                 if destination_rank == self.ep_rank:
                     local_tasks.extend(self._build_prefill_h2d_tasks(
                         layer_idx, pool_slot, eid, destination_slot))
@@ -1968,25 +2024,18 @@ class ExpertOffloadManager:
             source_rank = physical_slot // per_rank_slots
             source_slot = physical_slot % per_rank_slots
             if source_rank == destination_rank:
+                # Same-rank NPU-owned: preserve the single-card raw D2D path.
                 if source_rank == self.ep_rank:
-                    for name, source, destination in (
-                            self._prefill_device_components(
-                                layer_idx, pool_slot, source_slot,
-                                destination_slot)):
-                        local_tasks.append(H2DCopyTask(
-                            source=source,
-                            destination=destination,
-                            nbytes=source.numel() * source.element_size(),
-                            name=(f"prefill-local-d2d-{name}[L{layer_idx},"
-                                  f"E{eid},S{source_slot}->P{pool_slot}:"
-                                  f"E{destination_slot}]"),
-                            direction=CopyDirection.D2D,
-                        ))
+                    local_tasks.extend(
+                        self._build_prefill_local_d2d_tasks(
+                            layer_idx, pool_slot, source_slot,
+                            destination_slot, eid))
                 continue
 
             remote_experts += 1
             if self.ep_rank not in (source_rank, destination_rank):
                 continue
+            # Cross-rank NPU-owned: torch.distributed/HCCL requires tensors.
             peer_rank = (destination_rank
                          if self.ep_rank == source_rank else source_rank)
             for _, source, destination in self._prefill_device_components(
@@ -1995,6 +2044,23 @@ class ExpertOffloadManager:
                 op = dist.isend if self.ep_rank == source_rank else dist.irecv
                 p2p_ops.append(dist.P2POp(
                     op, tensor, group_ranks[peer_rank], group=device_group))
+
+        if self._debug:
+            local_h2d_tasks = sum(
+                task.direction == CopyDirection.H2D for task in local_tasks)
+            local_d2d_tasks = sum(
+                task.direction == CopyDirection.D2D for task in local_tasks)
+            raw_storage_d2d_tasks = sum(
+                task.direction == CopyDirection.D2D
+                and not isinstance(task.source, torch.Tensor)
+                and not isinstance(task.destination, torch.Tensor)
+                for task in local_tasks)
+            logger.info(
+                "[PREFILL-D2D-PLAN] layer=%d rank=%d h2d_tasks=%d "
+                "local_d2d_tasks=%d raw_storage_d2d_tasks=%d p2p_ops=%d "
+                "global_remote_experts=%d",
+                layer_idx, self.ep_rank, local_h2d_tasks, local_d2d_tasks,
+                raw_storage_d2d_tasks, len(p2p_ops), remote_experts)
 
         lock = self._exclusive_layer_locks[layer_idx]
         with lock:

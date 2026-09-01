@@ -1570,12 +1570,123 @@ def test_exclusive_shared_prefill_uses_direct_hccl_p2p_for_remote_npu():
     assert all(request.wait.call_count == 1 for request in requests)
     assert all(call_args.args[2] == 11
                for call_args in p2p_op.call_args_list)
+    assert all(isinstance(call_args.args[1], torch.Tensor)
+               for call_args in p2p_op.call_args_list)
     barrier.assert_called_once_with(group=ep_group.cpu_group)
     # Static-shard expert 0 is CPU-owned and was loaded through shared H2D.
     assert torch.equal(
         manager._prefill_w13[0][0],
         manager._torch_shared_cpu_buffers[(0, "w13")][0],
     )
+
+
+def test_exclusive_shared_prefill_uses_raw_storage_for_local_npu():
+    manager = _exclusive_shared_runtime_manager()
+    manager._npu_slot_to_eid[0] = [0, 2]
+    manager._eid_to_npu_slot[0] = [0, -1, 1, -1]
+    manager._cpu_slot_to_eid[0] = [1, 3]
+    manager._eid_to_cpu_slot[0] = [-1, 0, -1, 1]
+    layer = SimpleNamespace(
+        w13_weight=torch.stack([
+            torch.full((4,), 22, dtype=torch.uint8),
+        ]),
+        w2_weight=torch.stack([
+            torch.full((2,), 32, dtype=torch.uint8),
+        ]),
+        w13_weight_scale=torch.tensor([[1.25]]),
+    )
+    manager.moe_layers = [layer]
+    manager._prefill_w13 = [torch.zeros((2, 4), dtype=torch.uint8)]
+    manager._prefill_w2 = [torch.zeros((2, 2), dtype=torch.uint8)]
+    manager._prefill_w13_scale = [torch.zeros((2, 1))]
+    manager._prefill_w13_scale_fp32 = []
+    manager._prefill_w2_scale = []
+    manager._prefill_w13_offset = []
+    manager._prefill_w2_offset = []
+    manager._prefill_w13_scale_bias = []
+    manager._prefill_w2_scale_bias = []
+    manager.scale_cpu_buffers = {
+        "w13_weight_scale": [[torch.tensor([2.5])]],
+    }
+    manager._torch_shared_cpu_buffers[(
+        0, "w13_weight_scale")] = torch.tensor([[2.5], [3.5]])
+    manager.num_device_layers = 1
+    manager._exclusive_layer_locks = [threading.RLock()]
+    manager._exclusive_prefill_p2p_warmed = True
+    ep_group = SimpleNamespace(
+        cpu_group=object(), device_group=object(), ranks=[10, 11])
+
+    with (
+        patch("vllm.distributed.parallel_state.get_ep_group",
+              return_value=ep_group),
+        patch("torch.distributed.P2POp") as p2p_op,
+        patch("torch.distributed.batch_isend_irecv") as batch,
+        patch("torch.distributed.barrier") as barrier,
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager."
+            "torch_npu.npu.stream",
+            return_value=nullcontext(),
+        ),
+    ):
+        manager._prefill_load_layer_shard_exclusive_shared(0, 0)
+
+    tasks = manager.h2d_transport.batches[0]
+    local_d2d = [
+        task for task in tasks if task.direction == CopyDirection.D2D]
+    cpu_h2d = [
+        task for task in tasks if task.direction == CopyDirection.H2D]
+    local_weight_d2d = [
+        task for task in local_d2d
+        if task.name.split("[")[0] in {
+            "prefill-local-d2d-w13",
+            "prefill-local-d2d-w2",
+        }
+    ]
+    local_metadata_d2d = [
+        task for task in local_d2d
+        if task.name.split("[")[0] not in {
+            "prefill-local-d2d-w13",
+            "prefill-local-d2d-w2",
+        }
+    ]
+    cpu_weight_h2d = [
+        task for task in cpu_h2d
+        if task.name.split("[")[0] in {"prefill-w13", "prefill-w2"}
+    ]
+    cpu_metadata_h2d = [
+        task for task in cpu_h2d
+        if task.name.split("[")[0] not in {"prefill-w13", "prefill-w2"}
+    ]
+    assert len(local_weight_d2d) == 2
+    assert len(local_metadata_d2d) == 1
+    assert len(cpu_weight_h2d) == 2
+    assert len(cpu_metadata_h2d) == 1
+    assert all(not isinstance(task.source, torch.Tensor)
+               for task in local_weight_d2d + cpu_weight_h2d)
+    assert all(not isinstance(task.destination, torch.Tensor)
+               for task in local_weight_d2d + cpu_weight_h2d)
+    assert all(isinstance(task.source, torch.Tensor)
+               for task in local_metadata_d2d + cpu_metadata_h2d)
+    assert all(isinstance(task.destination, torch.Tensor)
+               for task in local_metadata_d2d + cpu_metadata_h2d)
+    assert {task.name.split("[")[0] for task in local_weight_d2d} == {
+        "prefill-local-d2d-w13",
+        "prefill-local-d2d-w2",
+    }
+    p2p_op.assert_not_called()
+    batch.assert_not_called()
+    barrier.assert_called_once_with(group=ep_group.cpu_group)
+    assert torch.equal(manager._prefill_w13[0][0], layer.w13_weight[0])
+    assert torch.equal(manager._prefill_w2[0][0], layer.w2_weight[0])
+    assert torch.equal(
+        manager._prefill_w13[0][1],
+        manager._torch_shared_cpu_buffers[(0, "w13")][0],
+    )
+    assert torch.equal(
+        manager._prefill_w2[0][1],
+        manager._torch_shared_cpu_buffers[(0, "w2")][0],
+    )
+    assert manager._prefill_w13_scale[0][:, 0].tolist() == [1.25, 2.5]
 
 
 def test_hot_preload_with_exclusive_dynamic_and_layer_capacities(tmp_path):
