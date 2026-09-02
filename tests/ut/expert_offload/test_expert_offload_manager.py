@@ -1779,6 +1779,22 @@ def test_exclusive_sharded_numeric_log_reports_first_ok_and_each_failure():
     assert mock_logger.warning.call_args.args[-1] == 1
 
 
+def test_exclusive_sharded_numeric_log_skips_non_tensor_input():
+    manager = _exclusive_sharded_runtime_manager()
+    manager._debug = True
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger",
+    ) as mock_logger:
+        manager.log_exclusive_sharded_numeric(
+            manager.moe_layers[0], SimpleNamespace(routed_out=torch.ones(2)),
+            "moe_output")
+
+    mock_logger.warning.assert_called_once()
+    assert "reason=not_tensor" in mock_logger.warning.call_args.args[0]
+    assert mock_logger.warning.call_args.args[-1] == "SimpleNamespace"
+
+
 def test_exclusive_sharded_prefill_uses_only_local_h2d_and_d2d():
     manager = _exclusive_sharded_runtime_manager()
 

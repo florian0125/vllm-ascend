@@ -391,7 +391,7 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
 
         if enable_expert_offload:
             mgr.log_exclusive_sharded_numeric(
-                layer, final_hidden_states, "moe_output")
+                layer, final_hidden_states.routed_out, "moe_output")
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):

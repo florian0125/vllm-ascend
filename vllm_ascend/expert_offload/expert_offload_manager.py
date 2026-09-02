@@ -3193,20 +3193,28 @@ class ExpertOffloadManager:
             details_text,
         )
 
-    def log_exclusive_sharded_numeric(self, layer, tensor: torch.Tensor,
+    def log_exclusive_sharded_numeric(self, layer, tensor: object,
                                       stage: str) -> None:
         """Report the first finite result and every non-finite local result.
 
         This diagnostic is deliberately limited to the correctness-gated
         rank-local exclusive mode.  ``item()`` synchronizes the NPU, which is
         acceptable under ``moe_offload_debug`` while validating this path but
-        must not leak into the normal performance path.
+        must not leak into the normal performance path.  Diagnostics must not
+        abort model startup if a caller accidentally passes a result wrapper.
         """
         if not self._debug or not self.exclusive_sharded_cpu_enabled:
             return
         try:
             layer_idx = self.moe_layers.index(layer)
         except ValueError:
+            return
+        if not isinstance(tensor, torch.Tensor):
+            logger.warning(
+                "[EXCLUSIVE-SHARDED-NUMERIC] rank=%d/%d layer=%d stage=%s "
+                "input_type=%s status=skip reason=not_tensor",
+                self.ep_rank, self.ep_size, layer_idx, stage,
+                type(tensor).__name__)
             return
         nonfinite = int((~torch.isfinite(tensor)).sum().item())
         comm_type = getattr(_EXTRA_CTX.moe_comm_type, "name",

@@ -1,10 +1,11 @@
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
 
 from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.ops.fused_moe.moe_comm_method import FusedExpertsResult
 from vllm_ascend.quantization.methods.w4a8_mxfp4 import AscendW4A8MXFPDynamicFusedMoEMethod
 
 
@@ -67,7 +68,8 @@ def _run_apply(
     topk_ids = torch.randint(0, NUM_EXPERTS, (num_tokens, TOP_K))
     log2phy = torch.arange(NUM_EXPERTS, dtype=torch.int32)
     fused_input = object()
-    expected_output = torch.randn(num_tokens, HIDDEN_SIZE)
+    routed_out = torch.randn(num_tokens, HIDDEN_SIZE)
+    expected_output = FusedExpertsResult(routed_out=routed_out)
     comm_method.fused_experts.return_value = expected_output
 
     with (
@@ -113,6 +115,7 @@ def _run_apply(
         topk_weights=topk_weights,
         log2phy=log2phy,
         fused_input=fused_input,
+        routed_out=routed_out,
         build_input=build_input,
     )
 
@@ -185,6 +188,28 @@ def test_multi_card_decode_uses_multi_card_weight_update():
     assert update_call.kwargs["is_hash_routed"] is False
     manager.trigger_next_layer_prefetch.assert_called_once_with(layer, result.x)
     assert result.build_input.call_args.kwargs["log2phy"] is result.log2phy
+
+
+def test_numeric_diagnostic_uses_routed_out_tensor():
+    method = _make_method()
+    layer = _make_layer(multi_card=True)
+    manager = _make_manager(layer)
+    dispatcher = SimpleNamespace(num_experts_local=4)
+    comm_method = Mock(token_dispatcher=dispatcher)
+
+    result = _run_apply(
+        method,
+        layer,
+        manager,
+        comm_method,
+        MoECommType.ALLTOALL,
+        num_tokens=2,
+    )
+
+    assert manager.log_exclusive_sharded_numeric.call_args_list == [
+        call(layer, result.x, "moe_input"),
+        call(layer, result.routed_out, "moe_output"),
+    ]
 
 
 def test_multi_card_hash_routed_layer_disables_substitution():
