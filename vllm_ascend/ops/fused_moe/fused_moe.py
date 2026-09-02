@@ -772,7 +772,20 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         ndev = mgr.offload_config.num_device_experts_for_rank(
             layer_moe_idx, mgr.ep_size if self.enable_multi_card else 1)
         if (self.enable_multi_card
-                and mgr.exclusive_shared_cpu_enabled):
+                and mgr.exclusive_sharded_cpu_enabled):
+            initial_local = (
+                mgr.offload_config.initial_device_experts_for_rank(
+                    layer_moe_idx,
+                    self.routed_experts.global_num_experts,
+                    mgr.ep_size,
+                    mgr.ep_rank,
+                ))
+            initial_device_slots = {
+                int(eid): local_slot
+                for local_slot, eid in enumerate(initial_local)
+            }
+        elif (self.enable_multi_card
+              and mgr.exclusive_shared_cpu_enabled):
             global_initial = (
                 mgr.offload_config.initial_device_experts_for_layer(
                     layer_moe_idx, self.routed_experts.global_num_experts))

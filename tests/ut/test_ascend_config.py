@@ -566,10 +566,11 @@ class TestExpertOffloadConfig(TestBase):
     def test_exclusive_dynamic_storage_validation(self):
         with self.assertRaisesRegex(ValueError, "storage_partition_mode"):
             ExpertOffloadConfig({"storage_partition_mode": "static"})
-        with self.assertRaisesRegex(ValueError, "shared_cpu_weights=True"):
+        with self.assertRaisesRegex(ValueError, "shard_per_rank=True"):
             ExpertOffloadConfig({
                 "storage_partition_mode": "exclusive_dynamic",
                 "enable_multi_card": True,
+                "shard_per_rank": False,
             })
         with self.assertRaisesRegex(ValueError, "requires.*torch"):
             ExpertOffloadConfig({
@@ -582,6 +583,24 @@ class TestExpertOffloadConfig(TestBase):
                 "storage_partition_mode": "exclusive_dynamic",
                 "num_device_experts": 0,
             })
+
+    def test_exclusive_dynamic_accepts_private_rank_local_cpu_shards(self):
+        config = ExpertOffloadConfig({
+            "storage_partition_mode": "exclusive_dynamic",
+            "enable_multi_card": True,
+            "shard_per_rank": True,
+            "shared_cpu_weights": False,
+            "shared_cpu_weights_dir": "",
+            "num_device_experts": 4,
+        })
+
+        self.assertFalse(config.shared_cpu_weights)
+        self.assertEqual(config.shared_cpu_weights_dir, "")
+        self.assertEqual(config.num_device_experts_for_rank(0, 2), 2)
+        self.assertEqual(
+            config.initial_device_experts_for_rank(0, 8, 2, 0), [0, 1])
+        self.assertEqual(
+            config.initial_device_experts_for_rank(0, 8, 2, 1), [4, 5])
 
     def test_memfabric_h2d_accepts_local_and_shared_configs(self):
         local = ExpertOffloadConfig({

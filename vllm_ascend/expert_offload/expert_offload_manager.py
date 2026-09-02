@@ -230,10 +230,11 @@ class ExpertOffloadManager:
 
         # Dynamic exclusive ownership. Every expert has exactly one canonical
         # location per layer: a compact CPU slot or an NPU physical slot.
-        # Single-card uses private pinned CPU tensors. Multi-card uses one
-        # same-node mmap plus a global physical-slot namespace spanning ranks.
-        # Runtime swaps update all four inverse maps only after D2H + H2D and
-        # the shared CPU commit have synchronized successfully.
+        # Single-card uses private pinned CPU tensors. Multi-card either uses
+        # one same-node mmap plus a global physical-slot namespace, or private
+        # rank-local CPU/NPU partitions whose union is that rank's EP shard.
+        # Runtime swaps update all four inverse maps only after D2H + H2D have
+        # synchronized successfully.
         self._cpu_slot_to_eid: list[list[int]] = []
         self._eid_to_cpu_slot: list[list[int]] = []
         self._npu_slot_to_eid: list[list[int]] = []
@@ -445,6 +446,15 @@ class ExpertOffloadManager:
                 and getattr(self, "enable_multi_card",
                             self.offload_config.enable_multi_card))
 
+    @property
+    def exclusive_sharded_cpu_enabled(self) -> bool:
+        """Whether exclusive ownership is private and EP-shard local."""
+        return (self.exclusive_dynamic_enabled
+                and self.offload_config.shard_per_rank
+                and not self.torch_shared_cpu_weights_enabled
+                and getattr(self, "enable_multi_card",
+                            self.offload_config.enable_multi_card))
+
     def _ensure_torch_shared_cpu_pool(self) -> TorchSharedCPUWeightPool:
         if self._torch_shared_cpu_pool is None:
             from vllm.distributed.parallel_state import get_ep_group
@@ -524,6 +534,7 @@ class ExpertOffloadManager:
         ntotal: int,
         ndev: int,
         npu_eids: list[int] | None = None,
+        owned_eids: list[int] | None = None,
     ) -> None:
         """Create inverse CPU/NPU ownership maps for one MoE layer."""
         if not 0 < ndev < ntotal:
@@ -541,9 +552,21 @@ class ExpertOffloadManager:
                 "Initial exclusive NPU experts must be unique, in range, and "
                 f"match device capacity; layer={layer_moe_idx}, "
                 f"ndev={ndev}, experts={npu_slot_to_eid}")
+        canonical_eids = (
+            list(range(ntotal)) if owned_eids is None else list(owned_eids))
+        if (len(set(canonical_eids)) != len(canonical_eids)
+                or any(eid < 0 or eid >= ntotal for eid in canonical_eids)):
+            raise ValueError(
+                "Exclusive canonical experts must be unique and in range: "
+                f"layer={layer_moe_idx}, experts={canonical_eids}")
         npu_set = set(npu_slot_to_eid)
+        if not npu_set.issubset(canonical_eids):
+            raise ValueError(
+                "Initial exclusive NPU experts must belong to this rank's "
+                f"canonical set: layer={layer_moe_idx}, npu={npu_slot_to_eid}, "
+                f"canonical={canonical_eids}")
         cpu_slot_to_eid = [
-            eid for eid in range(ntotal) if eid not in npu_set]
+            eid for eid in canonical_eids if eid not in npu_set]
         eid_to_npu_slot = [-1] * ntotal
         eid_to_cpu_slot = [-1] * ntotal
         for slot, eid in enumerate(npu_slot_to_eid):
@@ -568,9 +591,14 @@ class ExpertOffloadManager:
         cpu_eids = self._cpu_slot_to_eid[layer_idx]
         npu_eids = self._npu_slot_to_eid[layer_idx]
         ntotal = len(self._eid_to_cpu_slot[layer_idx])
-        if (len(cpu_eids) + len(npu_eids) != ntotal
+        if self.exclusive_sharded_cpu_enabled:
+            start = self._shard_base
+            expected_eids = set(range(start, start + self._shard_size))
+        else:
+            expected_eids = set(range(ntotal))
+        if (len(cpu_eids) + len(npu_eids) != len(expected_eids)
                 or set(cpu_eids).intersection(npu_eids)
-                or set(cpu_eids).union(npu_eids) != set(range(ntotal))):
+                or set(cpu_eids).union(npu_eids) != expected_eids):
             raise RuntimeError(
                 f"Invalid exclusive expert partition for layer {layer_idx}")
         for slot, eid in enumerate(cpu_eids):
@@ -591,6 +619,12 @@ class ExpertOffloadManager:
                 raise RuntimeError(
                     f"Expert {eid} is owned by both NPU and CPU in layer "
                     f"{layer_idx}")
+        for eid in set(range(ntotal)) - expected_eids:
+            if (self._eid_to_cpu_slot[layer_idx][eid] != -1
+                    or self._eid_to_npu_slot[layer_idx][eid] != -1):
+                raise RuntimeError(
+                    "Remote expert unexpectedly has local exclusive ownership: "
+                    f"layer={layer_idx}, expert={eid}")
 
     def init_layer_cpu_buffers(self, layer, layer_moe_idx: int):
         """Allocate CPU weight + scale/offset buffers for one MoE layer.
@@ -612,10 +646,13 @@ class ExpertOffloadManager:
 
         ndev = self.num_device_experts_for_layer(layer_moe_idx)
         if self.exclusive_dynamic_enabled:
+            multi_card_exclusive = (
+                self.exclusive_shared_cpu_enabled
+                or self.exclusive_sharded_cpu_enabled)
             device_slots = (
                 self.offload_config.num_device_experts_for_rank(
                     layer_moe_idx, self.ep_size)
-                if self.exclusive_shared_cpu_enabled else ndev)
+                if multi_card_exclusive else ndev)
             if (_w13.shape[0] != device_slots
                     or _w2.shape[0] != device_slots):
                 raise ValueError(
@@ -625,12 +662,29 @@ class ExpertOffloadManager:
                     f"configured_per_rank={device_slots}, "
                     f"w13_slots={_w13.shape[0]}, "
                     f"w2_slots={_w2.shape[0]}")
-            initial_npu_eids = (
-                self.offload_config.initial_device_experts_for_layer(
-                    layer_moe_idx, ntotal))
-            self._init_exclusive_ownership(
-                layer_moe_idx, ntotal, ndev, initial_npu_eids)
-            cpu_experts = ntotal - ndev
+            if self.exclusive_sharded_cpu_enabled:
+                if ntotal % self.ep_size != 0:
+                    raise ValueError(
+                        "Rank-local exclusive CPU weights require "
+                        "global_num_experts divisible by EP size: "
+                        f"experts={ntotal}, ep_size={self.ep_size}")
+                self._shard_size = ntotal // self.ep_size
+                self._shard_base = self.ep_rank * self._shard_size
+                initial_npu_eids = (
+                    self.offload_config.initial_device_experts_for_rank(
+                        layer_moe_idx, ntotal, self.ep_size, self.ep_rank))
+                owned_eids = list(range(
+                    self._shard_base, self._shard_base + self._shard_size))
+                self._init_exclusive_ownership(
+                    layer_moe_idx, ntotal, device_slots, initial_npu_eids,
+                    owned_eids=owned_eids)
+            else:
+                initial_npu_eids = (
+                    self.offload_config.initial_device_experts_for_layer(
+                        layer_moe_idx, ntotal))
+                self._init_exclusive_ownership(
+                    layer_moe_idx, ntotal, ndev, initial_npu_eids)
+            cpu_experts = len(self._cpu_slot_to_eid[layer_moe_idx])
             if self.exclusive_shared_cpu_enabled:
                 if ntotal % self.ep_size != 0:
                     raise ValueError(
@@ -831,6 +885,8 @@ class ExpertOffloadManager:
         expert_bytes = weights_bytes + quant_bytes
         rss, hwm, available = self._host_memory_snapshot()
         cpu_mode = (
+            "exclusive_sharded" if self.exclusive_sharded_cpu_enabled else
+            "exclusive_shared" if self.exclusive_shared_cpu_enabled else
             "exclusive_dynamic" if self.exclusive_dynamic_enabled else
             "torch_shared" if self.torch_shared_cpu_weights_enabled else
             "sharded" if self.offload_config.shard_per_rank else
@@ -1081,6 +1137,8 @@ class ExpertOffloadManager:
         if self.exclusive_shared_cpu_enabled:
             self._initialize_exclusive_shared_runtime_state()
             self._log_exclusive_shared_canonical_memory()
+        elif self.exclusive_sharded_cpu_enabled:
+            self._initialize_exclusive_sharded_runtime_state()
         t4 = time.perf_counter()
 
         self.refresh_fp32_scales()
@@ -2610,6 +2668,12 @@ class ExpertOffloadManager:
             for slot in range(ndl):
                 self._prefill_load_layer_shard_exclusive_shared(0, slot)
             return
+        if self.exclusive_sharded_cpu_enabled:
+            with torch_npu.npu.stream(self.load_stream):
+                for slot in range(ndl):
+                    self._load_prefill_shard_from_local_ownership(0, slot)
+                self._synchronize_h2d()
+            return
         if self.exclusive_dynamic_enabled:
             source_eids = list(range(ntotal))
         else:
@@ -2712,6 +2776,14 @@ class ExpertOffloadManager:
                 layer_idx, pool_slot)
             return
 
+        if self.exclusive_sharded_cpu_enabled:
+            with self._exclusive_layer_locks[layer_idx]:
+                with torch_npu.npu.stream(self.load_stream):
+                    self._load_prefill_shard_from_local_ownership(
+                        layer_idx, pool_slot)
+                    self._synchronize_h2d()
+            return
+
         if (self.offload_config.h2d_backend == "memfabric"
                 or self.torch_shared_cpu_weights_enabled):
             with torch_npu.npu.stream(self.load_stream):
@@ -2758,6 +2830,27 @@ class ExpertOffloadManager:
             # the host-side block here guarantees the copies are done before the
             # next op is queued).
             self._synchronize_h2d()
+
+    def _load_prefill_shard_from_local_ownership(
+        self,
+        layer_idx: int,
+        pool_slot: int,
+    ) -> None:
+        """Fill this rank's prefill shard without any cross-rank weight read."""
+        shard = self.mc_shard_size
+        base = self.ep_rank * shard
+        tasks = []
+        for local_slot, eid in enumerate(range(base, base + shard)):
+            if (self._eid_to_cpu_slot[layer_idx][eid] < 0
+                    and self._eid_to_npu_slot[layer_idx][eid] < 0):
+                raise RuntimeError(
+                    "Rank-local exclusive prefill cannot read a remote or "
+                    "unowned expert: "
+                    f"rank={self.ep_rank}, layer={layer_idx}, expert={eid}")
+            tasks.extend(self._build_prefill_h2d_tasks(
+                layer_idx, pool_slot, eid, local_slot))
+        self._get_h2d_transport().copy_batch(tasks)
+        self._refresh_prefill_fp32_scale(pool_slot, shard)
 
     # ------------------------------------------------------------------ #
     #  Forward path: page in experts based on topk_ids                    #
@@ -3399,6 +3492,48 @@ class ExpertOffloadManager:
             [len(slots) for slots in self._cpu_slot_to_eid],
             self.ep_size)
 
+    def _initialize_exclusive_sharded_runtime_state(self) -> None:
+        """Publish deterministic rank-local ownership to decode state."""
+        for layer_idx, layer in enumerate(self.moe_layers):
+            per_rank_slots = self.offload_config.num_device_experts_for_rank(
+                layer_idx, self.ep_size)
+            placement = torch.full(
+                (self.num_total_experts,), -1, dtype=torch.int32)
+            for rank in range(self.ep_size):
+                rank_eids = (
+                    self.offload_config.initial_device_experts_for_rank(
+                        layer_idx, self.num_total_experts,
+                        self.ep_size, rank))
+                for local_slot, eid in enumerate(rank_eids):
+                    placement[eid] = rank * per_rank_slots + local_slot
+
+            expected_local = (
+                self.offload_config.initial_device_experts_for_rank(
+                    layer_idx, self.num_total_experts,
+                    self.ep_size, self.ep_rank))
+            if self._npu_slot_to_eid[layer_idx] != expected_local:
+                raise RuntimeError(
+                    "Rank-local exclusive NPU initialization mismatch: "
+                    f"rank={self.ep_rank}, layer={layer_idx}, "
+                    f"expected={expected_local}, "
+                    f"actual={self._npu_slot_to_eid[layer_idx]}")
+            self._mc_prev_log2phy[layer_idx] = placement.clone()
+            self._mc_resident[layer_idx] = {
+                slot: int(eid)
+                for slot, eid in enumerate(expected_local)
+            }
+            layer.log2phy.copy_(placement)
+            self._validate_exclusive_ownership(layer_idx)
+        logger.info(
+            "[EXCLUSIVE-SHARDED] initialized rank-local canonical ownership: "
+            "rank=%d/%d layers=%d shard=[%d,%d) "
+            "cpu_experts_per_layer=%s npu_experts_per_layer=%s "
+            "cross_rank_weight_transfer=False",
+            self.ep_rank, self.ep_size, len(self.moe_layers),
+            self._shard_base, self._shard_base + self._shard_size,
+            [len(slots) for slots in self._cpu_slot_to_eid],
+            [len(slots) for slots in self._npu_slot_to_eid])
+
     def _log_exclusive_shared_canonical_memory(self) -> None:
         """Audit that compact CPU plus all decode NPU slots equal one model."""
         if not self._debug or not self.exclusive_shared_cpu_enabled:
@@ -3664,7 +3799,7 @@ class ExpertOffloadManager:
                                    prev_log2phy, hotness, force_shard=force_shard)
         placement_ms = ((time.perf_counter() - placement_start) * 1000.0
                         if placement_start is not None else 0.0)
-        if cache_on and not self.exclusive_shared_cpu_enabled:
+        if cache_on and not self.exclusive_dynamic_enabled:
             self._mc_prev_log2phy[layer_idx] = placement.log2phy.clone()
         if self._debug:
             self._log_mc_decode_plan(
@@ -3711,6 +3846,13 @@ class ExpertOffloadManager:
             lock = self._exclusive_layer_locks[layer_idx]
             with lock:
                 self._swap_expert_weights_multi_card_shared(
+                    layer, layer_idx, placement, per_rank_slots,
+                    log2phy_h)
+            resident_map = self._mc_resident[layer_idx]
+        elif self.exclusive_sharded_cpu_enabled:
+            lock = self._exclusive_layer_locks[layer_idx]
+            with lock:
+                self._swap_expert_weights_multi_card_sharded(
                     layer, layer_idx, placement, per_rank_slots,
                     log2phy_h)
             resident_map = self._mc_resident[layer_idx]
@@ -3890,7 +4032,7 @@ class ExpertOffloadManager:
             local_counts, cpu_group, "count", debug_context)
         cache_on = self.offload_config.cache_policy_enabled
         if not cache_on:
-            retain_exclusive = self.exclusive_shared_cpu_enabled
+            retain_exclusive = self.exclusive_dynamic_enabled
             return (global_counts, retain_exclusive, None,
                     self._mc_prev_log2phy.get(layer_idx)
                     if retain_exclusive else None)
@@ -4115,6 +4257,7 @@ class ExpertOffloadManager:
         log2phy_np,
         swap,
         scratch: dict[str, torch.Tensor],
+        physical_slot_base: int = 0,
     ) -> None:
         """Commit one synchronized swap to CPU buffers and ownership maps."""
         slot, incoming_eid, victim_eid, cpu_slot = swap
@@ -4128,10 +4271,10 @@ class ExpertOffloadManager:
         self._eid_to_npu_slot[layer_idx][victim_eid] = -1
         self._eid_to_npu_slot[layer_idx][incoming_eid] = slot
         log2phy_np[victim_eid] = -1
-        log2phy_np[incoming_eid] = slot
+        log2phy_np[incoming_eid] = physical_slot_base + slot
 
     def _swap_expert_weights(self, layer, layer_idx: int, swaps,
-                             log2phy_np) -> None:
+                             log2phy_np, physical_slot_base: int = 0) -> None:
         """Execute a batch of exclusive CPU↔NPU swaps atomically.
 
         All victim D2H copies are queued before any incoming H2D copy.  The
@@ -4169,8 +4312,65 @@ class ExpertOffloadManager:
 
         for swap, scratch in zip(swaps, scratch_bundles):
             self._commit_exclusive_swap(
-                layer_idx, log2phy_np, swap, scratch)
+                layer_idx, log2phy_np, swap, scratch,
+                physical_slot_base=physical_slot_base)
         self._validate_exclusive_ownership(layer_idx)
+
+    def _swap_expert_weights_multi_card_sharded(
+        self,
+        layer,
+        layer_idx: int,
+        placement,
+        per_rank_slots: int,
+        log2phy_h,
+    ) -> None:
+        """Apply an owner-constrained placement using local swaps only."""
+        my_experts = list(placement.per_rank_experts[self.ep_rank])
+        if (len(my_experts) != per_rank_slots
+                or any(int(eid) < 0 for eid in my_experts)):
+            raise RuntimeError(
+                "Rank-local exclusive placement must keep every local NPU "
+                "slot populated: "
+                f"rank={self.ep_rank}, layer={layer_idx}, "
+                f"expected_slots={per_rank_slots}, experts={my_experts}")
+        local_start = self._shard_base
+        local_end = local_start + self._shard_size
+        swaps = []
+        for slot, incoming_eid in enumerate(my_experts):
+            incoming_eid = int(incoming_eid)
+            if not local_start <= incoming_eid < local_end:
+                raise RuntimeError(
+                    "Rank-local exclusive placement selected a remote expert: "
+                    f"rank={self.ep_rank}, layer={layer_idx}, "
+                    f"expert={incoming_eid}, shard=[{local_start},{local_end})")
+            victim_eid = self._npu_slot_to_eid[layer_idx][slot]
+            if incoming_eid == victim_eid:
+                continue
+            cpu_slot = self._eid_to_cpu_slot[layer_idx][incoming_eid]
+            if cpu_slot < 0:
+                raise RuntimeError(
+                    "Rank-local exclusive placement attempted a non-CPU "
+                    "incoming expert: "
+                    f"rank={self.ep_rank}, layer={layer_idx}, "
+                    f"expert={incoming_eid}")
+            swaps.append((slot, incoming_eid, int(victim_eid), cpu_slot))
+
+        physical_slot_base = self.ep_rank * per_rank_slots
+        with torch_npu.npu.stream(self.load_stream):
+            self._swap_expert_weights(
+                layer, layer_idx, swaps, log2phy_h.numpy(),
+                physical_slot_base=physical_slot_base)
+        log2phy_h.copy_(placement.log2phy)
+        self._mc_prev_log2phy[layer_idx] = placement.log2phy.clone()
+        self._mc_resident[layer_idx] = {
+            slot: int(eid)
+            for slot, eid in enumerate(self._npu_slot_to_eid[layer_idx])
+        }
+        if self._debug and swaps:
+            logger.info(
+                "[EXCLUSIVE-SHARDED-SWAP] layer=%d rank=%d swaps=%d "
+                "cross_rank_weight_transfer=False",
+                layer_idx, self.ep_rank, len(swaps))
 
     def _exclusive_shared_swaps_from_placement(
         self,
@@ -4822,6 +5022,40 @@ class ExpertOffloadManager:
                 self._validate_exclusive_ownership(layer_idx)
             logger.info(
                 "[HOT-PRELOAD] exclusive shared experts were loaded "
+                "directly during checkpoint initialization")
+            return
+        if self.exclusive_sharded_cpu_enabled:
+            if self.cache_policy is not None:
+                self._mc_lrc = self.cache_policy
+            for layer_idx in range(len(self.moe_layers)):
+                expected_local = (
+                    self.offload_config.initial_device_experts_for_rank(
+                        layer_idx, self.num_total_experts,
+                        self.ep_size, self.ep_rank))
+                if self._npu_slot_to_eid[layer_idx] != expected_local:
+                    raise RuntimeError(
+                        "Rank-local exclusive hot experts were not loaded "
+                        "directly into their initial NPU slots: "
+                        f"rank={self.ep_rank}, layer={layer_idx}, "
+                        f"expected={expected_local}, "
+                        f"actual={self._npu_slot_to_eid[layer_idx]}")
+                all_initial = []
+                for rank in range(self.ep_size):
+                    all_initial.extend(
+                        self.offload_config.initial_device_experts_for_rank(
+                            layer_idx, self.num_total_experts,
+                            self.ep_size, rank))
+                pairs = dict(
+                    self.offload_config.hot_expert_pairs_for_layer(
+                        layer_idx, self.num_total_experts))
+                weights = {
+                    eid: pairs[eid] for eid in all_initial if eid in pairs
+                }
+                if self.cache_policy is not None:
+                    self.cache_policy.seed_layer_hotness(layer_idx, weights)
+                self._validate_exclusive_ownership(layer_idx)
+            logger.info(
+                "[HOT-PRELOAD] rank-local exclusive experts were loaded "
                 "directly during checkpoint initialization")
             return
         if self.cache_policy is not None:

@@ -121,11 +121,45 @@ bash script/run_torch_shared_cpu_h2d_950dt.sh
 4. Prefill 仍使用静态 EP shard。CPU-owned 专家从共享 mmap H2D；本 rank NPU-owned 专家本地 D2D；其他 rank NPU-owned 专家通过 EP HCCL device group 直接 `isend/irecv` 到目标 prefill slot。
 5. Prefill 只是向 prefill pool 写快照，不改变 canonical 所有权或 decode `log2phy`。正式路径不创建 CPU snapshot，也不提供远端 NPU→CPU→NPU 的静默回退。
 
-配置校验会拒绝非 Torch backend、`enable_multi_card=false` 或 `shard_per_rank=false` 的共享 CPU 组合；多卡 `exclusive_dynamic` 若没有 `shared_cpu_weights=true` 也会被拒绝。共享目录、共享源、HCCL P2P 或分布式 swap 任一环节不可用时都会显式报错。
+配置校验会拒绝非 Torch backend、`enable_multi_card=false` 或 `shard_per_rank=false` 的共享 CPU 组合。全局共享模式中的共享目录、共享源、HCCL P2P 或分布式 swap 任一环节不可用时都会显式报错。
+
+如果机器不支持或暂时不希望启用跨卡专家权重传输，可以使用 rank-local exclusive 配置：
+
+```json
+{
+  "expert_offload_config": {
+    "expert_offload": true,
+    "enable_multi_card": true,
+    "storage_partition_mode": "exclusive_dynamic",
+    "num_device_experts": 32,
+    "h2d_backend": "torch",
+    "shard_per_rank": true,
+    "shared_cpu_weights": false,
+    "moe_offload_debug": true
+  }
+}
+```
+
+该组合不创建 `/dev/shm` mmap，也不读取 `shared_cpu_weights_dir`。全局专家先按 EP rank 静态切分；每个 rank 的分片再拆成互斥的私有 CPU 集合和本地 decode NPU 槽。因此每层满足：
+
+```text
+所有 rank 的 (private CPU experts + local decode NPU experts)
+    = 一份完整全局专家权重
+```
+
+Decode planner 使用 owner-shard 约束，miss 只在同一 rank 内执行 victim D2H 和 incoming H2D；prefill 的 CPU-owned 专家做本地 H2D，已在本地 decode NPU 的专家做本地 D2D。专家权重不会跨 rank 传输；MC2/ALLTOALL 仍可跨 rank 传递 token。配置中的 `num_device_experts` 仍是全局 NPU 槽数，例如 EP=8、值为 32 时每 rank 有 4 个 NPU 槽。
+
+初始化完成后应看到 `cpu_mode=exclusive_sharded`、`expected_full_weight_copies_across_ep=1`，以及：
+
+```text
+[EXCLUSIVE-SHARDED] ... cpu_experts_per_layer=... npu_experts_per_layer=... cross_rank_weight_transfer=False
+```
+
+多卡 `exclusive_dynamic` 的配置边界为：`shared_cpu_weights=true` 使用全局 ownership 和跨卡权重 P2P；`shared_cpu_weights=false` 必须同时设置 `shard_per_rank=true`，使用上述 rank-local ownership。后一种配置不能做跨 rank 的专家负载均衡，只能在每个专家的静态 owner rank 内换入换出。
 
 ## 先验证 prefill 跨卡原语
 
-完整模型初始化前，先用两张卡运行针对本次通信路径的轻量测试：
+本节只面向 `shared_cpu_weights=true` 的全局 ownership 路径；rank-local exclusive 配置不使用该 P2P 原语。完整模型初始化前，先用两张卡运行针对共享模式通信路径的轻量测试：
 
 ```bash
 export NPROC_PER_NODE=2
@@ -314,7 +348,8 @@ bash script/run_torch_shared_cpu_h2d_950dt.sh
 3. 检查 `/dev/shm` 容量、进程 PSS、NUMA 位置以及 pinned staging 峰值。
 4. 验证初始化 barrier、异常退出、target/draft 生命周期和重复启动清理。
 5. 测量 decode miss 的 H2D p50/p99、吞吐和计算重叠。
-6. 对 `exclusive_dynamic` 验证 MC2 decode 的全局 ownership、原子 swap、`log2phy` 一致性，以及 ALLTOALL prefill 的 HCCL P2P；同时确认没有 NPU→CPU→NPU 的远端回退。
+6. 对 `exclusive_dynamic + shared_cpu_weights=true` 验证 MC2 decode 的全局 ownership、原子 swap、`log2phy` 一致性，以及 ALLTOALL prefill 的 HCCL P2P；同时确认没有 NPU→CPU→NPU 的远端回退。
+7. 对 `exclusive_dynamic + shared_cpu_weights=false` 验证每个 rank 的 CPU/NPU ownership 并集恰好等于本 rank EP shard、不同 rank 互不重叠，且日志始终显示 `cross_rank_weight_transfer=False`。
 
 ## 官方参考
 

@@ -968,9 +968,12 @@ class ExpertOffloadConfig:
         # - replicated: CPU retains every expert (legacy behavior).
         # - exclusive_dynamic: CPU and NPU hold disjoint canonical expert
         #   sets; a miss swaps the incoming CPU expert with an NPU victim.
-        #   Multi-card requires same-node Torch shared CPU weights. The NPU
-        #   ownership is global across EP ranks and prefill reads remote NPU
-        #   residents through direct device P2P.
+        #   Multi-card supports two ownership scopes:
+        #   * shared_cpu_weights=True: one same-node compact CPU pool plus a
+        #     global NPU pool; prefill may read remote NPU residents by P2P.
+        #   * shared_cpu_weights=False + shard_per_rank=True: every rank owns a
+        #     disjoint EP shard split between its private CPU and local NPU;
+        #     expert weights never move across ranks.
         "storage_partition_mode": "replicated",
         "hot_expert_preload": False,
         "hot_experts_file": "",
@@ -1133,6 +1136,50 @@ class ExpertOffloadConfig:
                 selected.add(eid)
         return initial
 
+    def initial_device_experts_for_rank(
+        self,
+        layer_idx: int,
+        num_experts: int,
+        ep_size: int,
+        ep_rank: int,
+    ) -> list[int]:
+        """Resolve initial NPU experts inside one rank's static EP shard.
+
+        This is used by multi-card ``exclusive_dynamic`` with private sharded
+        CPU weights.  The returned experts are always inside
+        ``[ep_rank * shard, (ep_rank + 1) * shard)`` so checkpoint loading,
+        decode swaps and prefill can remain rank-local.
+        """
+        if ep_size < 1 or not 0 <= ep_rank < ep_size:
+            raise ValueError(
+                f"invalid EP topology: ep_size={ep_size}, ep_rank={ep_rank}")
+        if num_experts % ep_size != 0:
+            raise ValueError(
+                "rank-local exclusive expert ownership requires num_experts "
+                f"divisible by EP size: experts={num_experts}, ep_size={ep_size}")
+        capacity = self.num_device_experts_for_rank(layer_idx, ep_size)
+        shard = num_experts // ep_size
+        if not 0 < capacity < shard:
+            raise ValueError(
+                "rank-local exclusive expert ownership requires "
+                "0 < per-rank device experts < EP shard size: "
+                f"layer={layer_idx}, capacity={capacity}, shard={shard}")
+        start = ep_rank * shard
+        end = start + shard
+        if not self.hot_expert_preload:
+            return list(range(start, start + capacity))
+
+        ranked = self.hot_expert_pairs_for_layer(layer_idx, num_experts)
+        initial = [eid for eid, _ in ranked if start <= eid < end][:capacity]
+        selected = set(initial)
+        for eid in range(start, end):
+            if len(initial) == capacity:
+                break
+            if eid not in selected:
+                initial.append(eid)
+                selected.add(eid)
+        return initial
+
     def validate_num_moe_layers(self, num_moe_layers: int) -> None:
         """Validate current target layers while allowing later MTP layers."""
         nde_list = self.num_device_experts_list
@@ -1281,10 +1328,12 @@ class ExpertOffloadConfig:
                     "shared_cpu_weights=True requires shard_per_rank=True")
         if storage_mode == "exclusive_dynamic":
             if (self.config["enable_multi_card"]
-                    and not self.config["shared_cpu_weights"]):
+                    and not self.config["shared_cpu_weights"]
+                    and not self.config["shard_per_rank"]):
                 raise ValueError(
                     "multi-card storage_partition_mode='exclusive_dynamic' "
-                    "requires shared_cpu_weights=True")
+                    "with shared_cpu_weights=False requires "
+                    "shard_per_rank=True")
             if self.config["h2d_backend"] != "torch":
                 raise ValueError(
                     "storage_partition_mode='exclusive_dynamic' requires "
