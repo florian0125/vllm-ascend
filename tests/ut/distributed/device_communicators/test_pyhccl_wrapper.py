@@ -1,3 +1,4 @@
+import ctypes
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -15,6 +16,8 @@ from vllm_ascend.distributed.device_communicators.pyhccl_wrapper import (
     hcclRedOp_t,
     hcclRedOpTypeEnum,
     hcclResult_t,
+    hcclSendRecvItem,
+    hcclSendRecvTypeEnum,
     hcclUniqueId,
 )
 
@@ -47,6 +50,32 @@ class TestHcclDataTypeEnum(TestBase):
     def test_unsupported_dtype_raises(self):
         with self.assertRaises(ValueError):
             hcclDataTypeEnum.from_torch(torch.complex64)
+
+
+class TestHcclSendRecvItem(TestBase):
+    def test_abi_layout(self):
+        self.assertEqual(ctypes.sizeof(hcclSendRecvItem), 32)
+        self.assertEqual(hcclSendRecvItem.sendRecvType.offset, 0)
+        self.assertEqual(hcclSendRecvItem.buf.offset, 8)
+        self.assertEqual(hcclSendRecvItem.count.offset, 16)
+        self.assertEqual(hcclSendRecvItem.dataType.offset, 24)
+        self.assertEqual(hcclSendRecvItem.remoteRank.offset, 28)
+
+    def test_construct(self):
+        item = hcclSendRecvItem(
+            sendRecvType=hcclSendRecvTypeEnum.hcclRecv,
+            buf=buffer_type(1234),
+            count=4096,
+            dataType=hcclDataTypeEnum.hcclUint8,
+            remoteRank=3,
+        )
+
+        self.assertEqual(
+            item.sendRecvType, hcclSendRecvTypeEnum.hcclRecv)
+        self.assertEqual(item.buf, 1234)
+        self.assertEqual(item.count, 4096)
+        self.assertEqual(item.dataType, hcclDataTypeEnum.hcclUint8)
+        self.assertEqual(item.remoteRank, 3)
 
 
 class TestHcclRedOpTypeEnum(TestBase):
@@ -159,6 +188,51 @@ class TestHCLLLibrary(TestBase):
 
         lib._funcs["HcclBroadcast"].assert_called_once_with(buff, count, datatype, root, comm, stream)
         mock_hccl_check.assert_called_once_with(0)
+
+    @patch.object(HCCLLibrary, "HCCL_CHECK")
+    def test_hccl_batch_send_recv(self, mock_hccl_check):
+        lib = HCCLLibrary.__new__(HCCLLibrary)
+        batch = MagicMock(return_value=0)
+        lib._funcs = {"HcclBatchSendRecv": batch}
+        items = [
+            hcclSendRecvItem(
+                sendRecvType=hcclSendRecvTypeEnum.hcclSend,
+                buf=buffer_type(1234),
+                count=16,
+                dataType=hcclDataTypeEnum.hcclUint8,
+                remoteRank=1,
+            ),
+            hcclSendRecvItem(
+                sendRecvType=hcclSendRecvTypeEnum.hcclRecv,
+                buf=buffer_type(5678),
+                count=32,
+                dataType=hcclDataTypeEnum.hcclUint8,
+                remoteRank=1,
+            ),
+        ]
+        comm = hcclComm_t(99)
+        stream = aclrtStream_t(77)
+
+        lib.hcclBatchSendRecv(items, comm, stream)
+
+        item_array, item_count, actual_comm, actual_stream = (
+            batch.call_args.args)
+        self.assertEqual(item_count, 2)
+        self.assertEqual(item_array[0].buf, 1234)
+        self.assertEqual(item_array[1].buf, 5678)
+        self.assertEqual(actual_comm, comm)
+        self.assertEqual(actual_stream, stream)
+        mock_hccl_check.assert_called_once_with(0)
+
+    def test_hccl_batch_send_recv_requires_exported_symbol(self):
+        lib = HCCLLibrary.__new__(HCCLLibrary)
+        lib._funcs = {}
+        self.assertFalse(lib.supports_batch_send_recv)
+
+        with self.assertRaisesRegex(
+                RuntimeError, "does not export HcclBatchSendRecv"):
+            lib.hcclBatchSendRecv(
+                [hcclSendRecvItem()], hcclComm_t(), aclrtStream_t())
 
     @patch.object(HCCLLibrary, "HCCL_CHECK")
     def test_hcclCommDestroy_success(self, mock_hccl_check):

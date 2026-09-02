@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Smoke-test the Torch/HCCL prefill byte-buffer path on Ascend 950DT.
+"""Smoke-test the Torch/PyHCCL prefill byte-buffer path on Ascend 950DT.
 
 This is a focused prerequisite test, not a full model accuracy test. It checks
 the exact primitives used by exclusive_dynamic prefill:
 
 * internal-format-style weights are packed and unpacked through raw Storage;
 * an MXFP4-shaped non-contiguous uint8 scale uses stride-aware typed copy_;
-* HCCL sees only contiguous, storage_offset=0 uint8 communication tensors;
+* HcclBatchSendRecv sees raw pointers from zero-offset uint8 buffers;
+* pack, P2P, and unpack execute in order on one explicit NPU stream;
 * bounded communication buffers are reused across sequential chunks.
 """
 
@@ -143,19 +144,46 @@ def main() -> int:
 
     torch.npu.set_device(local_rank)
     dist.init_process_group(backend="hccl")
+    cpu_group = dist.new_group(backend="gloo")
     device = torch.device(f"npu:{local_rank}")
     send_peer = (rank + 1) % world_size
     recv_peer = (rank - 1 + world_size) % world_size
+    pyhccl = None
 
     try:
-        send_dummy = torch.empty(1, dtype=torch.uint8, device=device)
-        recv_dummy = torch.empty(1, dtype=torch.uint8, device=device)
-        requests = dist.batch_isend_irecv([
-            dist.P2POp(dist.isend, send_dummy, send_peer),
-            dist.P2POp(dist.irecv, recv_dummy, recv_peer),
-        ])
-        for request in requests:
-            request.wait()
+        from vllm_ascend.distributed.device_communicators.pyhccl import (
+            PyHcclCommunicator,
+        )
+        from vllm_ascend.distributed.device_communicators.pyhccl_wrapper import (  # noqa: E501
+            HCCLLibrary,
+        )
+
+        local_error = None
+        try:
+            library = HCCLLibrary()
+            if not library.supports_batch_send_recv:
+                local_error = "HcclBatchSendRecv symbol is missing"
+        except BaseException as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
+        availability = [None] * world_size
+        dist.all_gather_object(
+            availability, local_error, group=cpu_group)
+        failures = [
+            f"rank={peer_rank} {error}"
+            for peer_rank, error in enumerate(availability)
+            if error is not None
+        ]
+        if failures:
+            raise RuntimeError(
+                "raw-pointer prefill P2P is unavailable: "
+                + "; ".join(failures))
+        pyhccl = PyHcclCommunicator(cpu_group, device=device)
+        if (not pyhccl.available or pyhccl.disabled
+                or not pyhccl.hccl.supports_batch_send_recv):
+            raise RuntimeError(
+                "the installed HCCL library does not expose "
+                "HcclBatchSendRecv")
+        transfer_stream = torch.npu.Stream(device=device)
 
         w13_value = (rank * 31 + 11) % 251
         w2_value = (rank * 31 + 19) % 251
@@ -210,19 +238,20 @@ def main() -> int:
                 recv_buffer = recv_storage[:chunk_bytes]
                 assert_communication_tensor(send_buffer)
                 assert_communication_tensor(recv_buffer)
-                for component, offset in chunk_layout:
-                    component_buffer_view(
-                        send_buffer, offset, component).copy_(component.source)
-                requests = dist.batch_isend_irecv([
-                    dist.P2POp(dist.isend, send_buffer, send_peer),
-                    dist.P2POp(dist.irecv, recv_buffer, recv_peer),
-                ])
-                for request in requests:
-                    request.wait()
-                for component, offset in chunk_layout:
-                    component.destination.copy_(component_buffer_view(
-                        recv_buffer, offset, component))
-                torch.npu.synchronize()
+                with torch.npu.stream(transfer_stream):
+                    for component, offset in chunk_layout:
+                        component_buffer_view(
+                            send_buffer, offset,
+                            component).copy_(component.source)
+                    pyhccl.batch_send_recv(
+                        {send_peer: send_buffer},
+                        {recv_peer: recv_buffer},
+                        stream=transfer_stream,
+                    )
+                    for component, offset in chunk_layout:
+                        component.destination.copy_(component_buffer_view(
+                            recv_buffer, offset, component))
+                transfer_stream.synchronize()
 
         expected_w13 = (recv_peer * 31 + 11) % 251
         expected_w2 = (recv_peer * 31 + 19) % 251
@@ -238,6 +267,7 @@ def main() -> int:
         print(
             f"[TORCH_PREFILL_P2P][rank={rank}][PASS] "
             f"send_peer={send_peer} recv_peer={recv_peer} "
+            "backend=HcclBatchSendRecv "
             f"scale_shape={tuple(source_scale.shape)} "
             f"scale_stride={tuple(source_scale.stride())} "
             f"chunks={len(chunks)} peak_chunk_bytes={peak_chunk}",
@@ -248,6 +278,8 @@ def main() -> int:
             print("TORCH_PREFILL_P2P_RESULT PASS_ALL_RANKS", flush=True)
         return 0
     finally:
+        if pyhccl is not None:
+            pyhccl.close()
         if dist.is_initialized():
             dist.destroy_process_group()
 

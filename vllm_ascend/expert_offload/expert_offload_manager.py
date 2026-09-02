@@ -245,14 +245,15 @@ class ExpertOffloadManager:
         # canonical CPU expert is initialized exactly once.
         self._exclusive_shared_local_cpu_slots: list[list[int]] = []
         self._exclusive_shared_cpu_slot_to_local: list[dict[int, int]] = []
-        self._exclusive_prefill_p2p_warmed = False
         # Cross-rank prefill transfers cannot pass internal-format expert
-        # slices directly to torch.distributed because those views commonly
-        # have a non-zero storage_offset. Serialize buffer reuse and keep one
-        # base-format uint8 send/receive allocation per EP peer.
+        # slices through torch.distributed because those views commonly have
+        # a non-zero storage_offset and ProcessGroupHCCL owns a separate
+        # communication stream. Serialize buffer reuse and use a dedicated
+        # raw-pointer PyHCCL communicator on the manager's load stream.
         self._exclusive_prefill_comm_lock = threading.Lock()
         self._exclusive_prefill_comm_buffers: dict[
             tuple[str, int], torch.Tensor] = {}
+        self._exclusive_prefill_pyhccl = None
 
         # Temporary per-expert storage for w13 scale/offset shard assembly.
         # Key: (layer_moe_idx, expert_id, attr_name), value: first shard.
@@ -2360,20 +2361,77 @@ class ExpertOffloadManager:
                 f"storage_offset={communication_view.storage_offset()}")
         return communication_view
 
+    def _get_exclusive_prefill_pyhccl(self, ep_group, device):
+        """Collectively create the raw-pointer EP P2P communicator."""
+        communicator = getattr(self, "_exclusive_prefill_pyhccl", None)
+        if communicator is not None:
+            if (not communicator.available or communicator.disabled):
+                raise RuntimeError(
+                    "Exclusive prefill PyHCCL communicator is closed")
+            if communicator.device != device:
+                raise RuntimeError(
+                    "Exclusive prefill PyHCCL communicator device changed: "
+                    f"expected={communicator.device}, actual={device}")
+            return communicator
+
+        from torch import distributed as dist
+        from vllm_ascend.distributed.device_communicators.pyhccl import (
+            PyHcclCommunicator,
+        )
+        from vllm_ascend.distributed.device_communicators.pyhccl_wrapper import (  # noqa: E501
+            HCCLLibrary,
+        )
+
+        local_error = None
+        try:
+            library = HCCLLibrary()
+            if not library.supports_batch_send_recv:
+                local_error = "HcclBatchSendRecv symbol is missing"
+        except BaseException as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
+        availability = [None] * self.ep_size
+        dist.all_gather_object(
+            availability, local_error, group=ep_group.cpu_group)
+        failures = [
+            f"rank={rank} {error}"
+            for rank, error in enumerate(availability)
+            if error is not None
+        ]
+        if failures:
+            raise RuntimeError(
+                "Raw-pointer prefill P2P is unavailable: "
+                + "; ".join(failures))
+
+        communicator = PyHcclCommunicator(
+            ep_group.cpu_group, device=device)
+        if (not communicator.available or communicator.disabled
+                or not communicator.hccl.supports_batch_send_recv):
+            communicator.close()
+            raise RuntimeError(
+                "Multi-card exclusive prefill requires the raw-pointer "
+                "HcclBatchSendRecv API on every EP rank")
+        self._exclusive_prefill_pyhccl = communicator
+        logger.info(
+            "[PREFILL-D2D] initialized raw-pointer PyHCCL communicator "
+            "on %s across %d EP ranks",
+            device, self.ep_size)
+        return communicator
+
     def _prefill_load_layer_shard_exclusive_shared(
         self,
         layer_idx: int,
         pool_slot: int,
     ) -> None:
-        """Load one static EP shard using CPU H2D and buffered HCCL NPU P2P.
+        """Load one static EP shard using CPU H2D and raw-pointer HCCL P2P.
 
         CPU-owned experts read the compact shared mmap. Same-rank NPU weights
         use the single-card raw-storage D2D representation. Cross-rank NPU
         components are packed into base-format, zero-offset uint8 NPU buffers,
-        transferred through HCCL, then unpacked into the destination prefill
-        pool. Weights use raw storage; metadata uses typed local views to
-        preserve non-contiguous layouts. This read-only snapshot does not
-        change canonical ownership or the decode log2phy mapping.
+        transferred through ``HcclBatchSendRecv`` on the same load stream,
+        then unpacked into the destination prefill pool. Weights use raw
+        storage; metadata uses typed local views to preserve non-contiguous
+        layouts. This read-only snapshot does not change canonical ownership
+        or the decode log2phy mapping.
         """
         from torch import distributed as dist
         from vllm.distributed.parallel_state import get_ep_group
@@ -2383,23 +2441,22 @@ class ExpertOffloadManager:
                 "Exclusive shared prefill cannot run before the compact "
                 f"shared CPU layer is finalized: layer={layer_idx}")
         ep_group = get_ep_group()
-        device_group = getattr(ep_group, "device_group", None)
         group_ranks = getattr(ep_group, "ranks", None)
-        if (device_group is None or group_ranks is None
-                or len(group_ranks) != self.ep_size
-                or not hasattr(dist, "P2POp")
-                or not hasattr(dist, "batch_isend_irecv")):
+        if (getattr(ep_group, "cpu_group", None) is None
+                or group_ranks is None
+                or len(group_ranks) != self.ep_size):
             raise RuntimeError(
-                "Multi-card exclusive prefill requires direct HCCL P2P "
-                "support on the EP device group; CPU fallback is disabled")
+                "Multi-card exclusive prefill requires a complete EP CPU "
+                "group; CPU weight fallback is disabled")
         comm_lock = getattr(self, "_exclusive_prefill_comm_lock", None)
         if comm_lock is None:
             comm_lock = threading.Lock()
             self._exclusive_prefill_comm_lock = comm_lock
         layer_lock = self._exclusive_layer_locks[layer_idx]
         with comm_lock, layer_lock:
-            self._warm_up_exclusive_prefill_p2p(
-                dist, ep_group, pool_slot)
+            device = self._prefill_w13[pool_slot].device
+            pyhccl = self._get_exclusive_prefill_pyhccl(
+                ep_group, device)
 
             shard = self.mc_shard_size
             per_rank_slots = (
@@ -2479,8 +2536,6 @@ class ExpertOffloadManager:
                 for layout, _ in chunks)
             total_p2p_ops = sum(map(len, send_chunks.values()))
             total_p2p_ops += sum(map(len, recv_chunks.values()))
-            device = self._prefill_w13[pool_slot].device
-
             if self._debug:
                 local_h2d_tasks = sum(
                     task.direction == CopyDirection.H2D
@@ -2571,37 +2626,22 @@ class ExpertOffloadManager:
                             direction=CopyDirection.D2D,
                         ))
 
-                p2p_ops = [
-                    dist.P2POp(
-                        dist.isend, buffer, group_ranks[peer_rank],
-                        group=device_group)
-                    for peer_rank, buffer in send_buffers.items()
-                ]
-                p2p_ops.extend(
-                    dist.P2POp(
-                        dist.irecv, buffer, group_ranks[peer_rank],
-                        group=device_group)
-                    for peer_rank, buffer in recv_buffers.items()
-                )
-
                 with torch_npu.npu.stream(self.load_stream):
                     round_local_tasks = (
                         local_tasks if round_idx == 0 else [])
                     self._get_h2d_transport().copy_batch(
                         round_local_tasks + pack_tasks)
-                if p2p_ops:
-                    # HCCL must not observe a partially packed send buffer.
-                    self._synchronize_h2d()
-                    requests = dist.batch_isend_irecv(p2p_ops)
-                    for request in requests:
-                        request.wait()
-                with torch_npu.npu.stream(self.load_stream):
+                    if send_buffers or recv_buffers:
+                        # pack -> HCCL -> unpack use one stream. This avoids
+                        # treating ProcessGroup Work.wait() as a cross-stream
+                        # dependency for the receive buffer.
+                        pyhccl.batch_send_recv(
+                            send_buffers, recv_buffers,
+                            stream=self.load_stream)
                     self._get_h2d_transport().copy_batch(unpack_tasks)
-                # The next round reuses the same bounded buffers.
-                self._synchronize_h2d()
-                if p2p_ops:
-                    del requests
-                del p2p_ops, pack_tasks, unpack_tasks
+                    # The next round reuses the same bounded buffers.
+                    self._synchronize_h2d()
+                del pack_tasks, unpack_tasks
                 if send_buffers or recv_buffers:
                     del buffer
                 del send_buffers, recv_buffers
@@ -2618,43 +2658,6 @@ class ExpertOffloadManager:
                     layer_idx, self.ep_rank, len(local_tasks),
                     total_pack_tasks, total_unpack_tasks, total_p2p_ops,
                     num_rounds, remote_experts)
-
-    def _warm_up_exclusive_prefill_p2p(
-        self,
-        dist,
-        ep_group,
-        pool_slot: int,
-    ) -> None:
-        """Collectively initialize EP P2P before subset peer transfers."""
-        if getattr(self, "_exclusive_prefill_p2p_warmed", False):
-            return
-        device = self._prefill_w13[pool_slot].device
-        send_dummies = {
-            peer: torch.empty((1,), dtype=torch.uint8, device=device)
-            for peer in range(self.ep_size) if peer != self.ep_rank
-        }
-        recv_dummies = {
-            peer: torch.empty((1,), dtype=torch.uint8, device=device)
-            for peer in range(self.ep_size) if peer != self.ep_rank
-        }
-        ops = []
-        for peer in range(self.ep_size):
-            if peer != self.ep_rank:
-                ops.append(dist.P2POp(
-                    dist.isend, send_dummies[peer], ep_group.ranks[peer],
-                    group=ep_group.device_group))
-        for peer in range(self.ep_size):
-            if peer != self.ep_rank:
-                ops.append(dist.P2POp(
-                    dist.irecv, recv_dummies[peer], ep_group.ranks[peer],
-                    group=ep_group.device_group))
-        requests = dist.batch_isend_irecv(ops)
-        for request in requests:
-            request.wait()
-        self._exclusive_prefill_p2p_warmed = True
-        logger.info(
-            "[PREFILL-D2D] warmed EP HCCL P2P group across %d ranks",
-            self.ep_size)
 
     def _init_prefill_pool_data(self, dev, ntotal: int, ndl: int):
         """Load layer 0 weights into all prefill pool slots.
@@ -4126,6 +4129,11 @@ class ExpertOffloadManager:
         shared_pool = getattr(self, '_torch_shared_cpu_pool', None)
         if shared_pool is not None:
             shared_pool.close()
+        prefill_pyhccl = getattr(
+            self, '_exclusive_prefill_pyhccl', None)
+        if prefill_pyhccl is not None:
+            prefill_pyhccl.close()
+            self._exclusive_prefill_pyhccl = None
         comm_buffers = getattr(
             self, '_exclusive_prefill_comm_buffers', None)
         if comm_buffers is not None:

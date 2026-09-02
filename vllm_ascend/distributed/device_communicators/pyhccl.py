@@ -29,6 +29,8 @@ from vllm_ascend.distributed.device_communicators.pyhccl_wrapper import (
     hcclComm_t,
     hcclDataTypeEnum,
     hcclRedOpTypeEnum,
+    hcclSendRecvItem,
+    hcclSendRecvTypeEnum,
     hcclUniqueId,
 )
 from vllm_ascend.utils import current_stream
@@ -169,3 +171,69 @@ class PyHcclCommunicator:
             self.comm,
             aclrtStream_t(stream.npu_stream),
         )
+
+    def batch_send_recv(
+        self,
+        send_tensors: dict[int, torch.Tensor],
+        recv_tensors: dict[int, torch.Tensor],
+        stream=None,
+    ) -> None:
+        """Enqueue one raw-pointer send and receive per peer on ``stream``.
+
+        HCCL's batch P2P API accepts device pointers directly, so callers do
+        not have to expose internal-format expert storage as distributed
+        Tensor slices. Each tensor must nevertheless be a zero-offset,
+        contiguous communication allocation because HCCL transfers exactly
+        ``numel * element_size`` bytes starting at ``data_ptr``.
+        """
+        if self.disabled:
+            raise RuntimeError("PyHCCL communicator is disabled")
+        if not self.hccl.supports_batch_send_recv:
+            raise RuntimeError(
+                "The loaded HCCL library does not support "
+                "HcclBatchSendRecv")
+        items = []
+        for operation, tensors in (
+            (hcclSendRecvTypeEnum.hcclSend, send_tensors),
+            (hcclSendRecvTypeEnum.hcclRecv, recv_tensors),
+        ):
+            for peer_rank, tensor in sorted(tensors.items()):
+                if (peer_rank == self.rank
+                        or not 0 <= peer_rank < self.world_size):
+                    raise ValueError(
+                        "Invalid PyHCCL P2P peer: "
+                        f"rank={self.rank}, peer={peer_rank}, "
+                        f"world_size={self.world_size}")
+                if tensor.device != self.device:
+                    raise ValueError(
+                        "PyHCCL P2P tensor is on the wrong device: "
+                        f"expected={self.device}, actual={tensor.device}")
+                if (not tensor.is_contiguous()
+                        or tensor.storage_offset() != 0):
+                    raise ValueError(
+                        "PyHCCL P2P requires a contiguous zero-offset tensor: "
+                        f"peer={peer_rank}, contiguous={tensor.is_contiguous()}, "
+                        f"storage_offset={tensor.storage_offset()}")
+                if tensor.numel() <= 0:
+                    raise ValueError(
+                        f"PyHCCL P2P tensor for peer {peer_rank} is empty")
+                items.append(hcclSendRecvItem(
+                    sendRecvType=operation,
+                    buf=buffer_type(tensor.data_ptr()),
+                    count=tensor.numel(),
+                    dataType=hcclDataTypeEnum.from_torch(tensor.dtype),
+                    remoteRank=peer_rank,
+                ))
+        if not items:
+            return
+        if stream is None:
+            stream = current_stream()
+        self.hccl.hcclBatchSendRecv(
+            items, self.comm, aclrtStream_t(stream.npu_stream))
+
+    def close(self) -> None:
+        """Destroy the owned HCCL communicator; safe to call repeatedly."""
+        if self.disabled:
+            return
+        self.hccl.hcclCommDestroy(self.comm)
+        self.disabled = True

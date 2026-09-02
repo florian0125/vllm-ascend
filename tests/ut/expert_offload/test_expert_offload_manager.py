@@ -1878,7 +1878,6 @@ def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
         0, "w13_weight_scale")] = cpu_scales
     manager.num_device_layers = 1
     manager._exclusive_layer_locks = [threading.RLock()]
-    manager._exclusive_prefill_p2p_warmed = True
     ep_group = SimpleNamespace(
         cpu_group=object(), device_group=object(), ranks=[10, 11])
 
@@ -1897,7 +1896,7 @@ def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
         ),
         as_bytes(remote_scale),
     ]
-    requests = []
+    exchanges = []
     exchange_round = 0
 
     def gather_plans(output, local_plan, group):
@@ -1908,25 +1907,28 @@ def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
         }
         output[:] = [local_plan, remote_plan]
 
-    def exchange(ops):
+    def exchange(send_buffers, recv_buffers, stream):
         nonlocal exchange_round
         payload = remote_payloads[exchange_round]
         exchange_round += 1
-        for args, _ in ops:
-            if args[0] is torch.distributed.irecv:
-                args[1].copy_(payload)
-        round_requests = [
-            SimpleNamespace(wait=MagicMock()) for _ in ops]
-        requests.extend(round_requests)
-        return round_requests
+        assert set(send_buffers) == {1}
+        assert set(recv_buffers) == {1}
+        exchanges.append({
+            "send": send_buffers[1].clone(),
+            "recv": recv_buffers[1],
+            "stream": stream,
+        })
+        recv_buffers[1].copy_(payload)
+
+    pyhccl = SimpleNamespace(
+        batch_send_recv=MagicMock(side_effect=exchange))
 
     with (
         patch("vllm.distributed.parallel_state.get_ep_group",
               return_value=ep_group),
-        patch("torch.distributed.P2POp", side_effect=lambda *args, **kwargs:
-              (args, kwargs)) as p2p_op,
-        patch("torch.distributed.batch_isend_irecv",
-              side_effect=exchange) as batch,
+        patch.object(
+            manager, "_get_exclusive_prefill_pyhccl",
+            return_value=pyhccl) as get_pyhccl,
         patch("torch.distributed.all_gather_object",
               side_effect=gather_plans) as gather,
         patch(
@@ -1943,14 +1945,14 @@ def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
     ):
         manager._prefill_load_layer_shard_exclusive_shared(0, 0)
 
-    assert p2p_op.call_count == 4
-    assert batch.call_count == 2
+    get_pyhccl.assert_called_once_with(ep_group, manager._prefill_w13[0].device)
+    assert pyhccl.batch_send_recv.call_count == 2
     assert gather.call_count == 1
-    assert all(request.wait.call_count == 1 for request in requests)
-    assert all(call_args.args[2] == 11
-               for call_args in p2p_op.call_args_list)
     communication_buffers = [
-        call_args.args[1] for call_args in p2p_op.call_args_list
+        buffer
+        for call_args in pyhccl.batch_send_recv.call_args_list
+        for buffers in call_args.args[:2]
+        for buffer in buffers.values()
     ]
     assert all(buffer.dtype == torch.uint8
                for buffer in communication_buffers)
@@ -1960,15 +1962,15 @@ def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
     assert sorted(buffer.numel() for buffer in communication_buffers) == [
         8, 8, 16, 16]
     send_payload = torch.cat([
-        call_args.args[1]
-        for call_args in p2p_op.call_args_list
-        if call_args.args[0] is torch.distributed.isend
+        exchange_state["send"] for exchange_state in exchanges
     ])
     assert torch.equal(send_payload, as_bytes(
         layer.w13_weight[0],
         layer.w2_weight[0],
         layer.w13_weight_scale[0],
     ))
+    assert all(exchange_state["stream"] is manager.load_stream
+               for exchange_state in exchanges)
     barrier.assert_called_once_with(group=ep_group.cpu_group)
     # Static-shard expert 0 is CPU-owned and was loaded through shared H2D.
     assert torch.equal(
@@ -2042,37 +2044,85 @@ def test_exclusive_prefill_comm_buffer_reuses_zero_offset_prefix():
     assert grown.numel() == 32
 
 
-def test_exclusive_prefill_p2p_warmup_uses_distinct_buffers():
+def test_exclusive_prefill_pyhccl_is_created_once_and_cached():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager._ep_size = 3
     manager._ep_rank = 1
     manager._ep_info_resolved = True
-    manager._exclusive_prefill_p2p_warmed = False
-    manager._prefill_w13 = [torch.empty(1, dtype=torch.uint8)]
-    isend = object()
-    irecv = object()
-    p2p_op = MagicMock(side_effect=lambda *args, **kwargs: (args, kwargs))
-    requests = [
-        SimpleNamespace(wait=MagicMock()) for _ in range(4)]
-    dist = SimpleNamespace(
-        isend=isend,
-        irecv=irecv,
-        P2POp=p2p_op,
-        batch_isend_irecv=MagicMock(return_value=requests),
+    manager._exclusive_prefill_pyhccl = None
+    device = torch.device("cpu")
+    communicator = SimpleNamespace(
+        available=True,
+        disabled=False,
+        device=device,
+        hccl=SimpleNamespace(supports_batch_send_recv=True),
+        close=MagicMock(),
     )
-    ep_group = SimpleNamespace(
-        ranks=[10, 11, 12], device_group=object())
+    ep_group = SimpleNamespace(cpu_group=object())
 
-    manager._warm_up_exclusive_prefill_p2p(
-        dist, ep_group, pool_slot=0)
+    def gather_availability(output, value, group):
+        assert group is ep_group.cpu_group
+        output[:] = [value] * manager._ep_size
 
-    assert manager._exclusive_prefill_p2p_warmed
-    assert p2p_op.call_count == 4
-    buffers = [call_args.args[1] for call_args in p2p_op.call_args_list]
-    assert len({buffer.data_ptr() for buffer in buffers}) == 4
-    assert all(buffer.dtype == torch.uint8 for buffer in buffers)
-    assert all(buffer.storage_offset() == 0 for buffer in buffers)
-    assert all(request.wait.call_count == 1 for request in requests)
+    with (
+        patch(
+            "vllm_ascend.distributed.device_communicators.pyhccl."
+            "PyHcclCommunicator",
+            return_value=communicator,
+        ) as communicator_cls,
+        patch(
+            "vllm_ascend.distributed.device_communicators.pyhccl_wrapper."
+            "HCCLLibrary",
+            return_value=SimpleNamespace(supports_batch_send_recv=True),
+        ),
+        patch("torch.distributed.all_gather_object",
+              side_effect=gather_availability),
+    ):
+        first = manager._get_exclusive_prefill_pyhccl(ep_group, device)
+        second = manager._get_exclusive_prefill_pyhccl(ep_group, device)
+
+    assert first is second is communicator
+    communicator_cls.assert_called_once_with(
+        ep_group.cpu_group, device=device)
+
+
+def test_exclusive_prefill_pyhccl_rejects_missing_batch_api():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager._ep_size = 2
+    manager._exclusive_prefill_pyhccl = None
+    communicator = SimpleNamespace(
+        available=True,
+        disabled=False,
+        device=torch.device("cpu"),
+        hccl=SimpleNamespace(supports_batch_send_recv=False),
+        close=MagicMock(),
+    )
+    cpu_group = object()
+
+    def gather_availability(output, value, group):
+        assert group is cpu_group
+        output[:] = [value] * manager._ep_size
+
+    with (
+        patch(
+            "vllm_ascend.distributed.device_communicators.pyhccl."
+            "PyHcclCommunicator",
+            return_value=communicator,
+        ) as communicator_cls,
+        patch(
+            "vllm_ascend.distributed.device_communicators.pyhccl_wrapper."
+            "HCCLLibrary",
+            return_value=SimpleNamespace(supports_batch_send_recv=False),
+        ),
+        patch("torch.distributed.all_gather_object",
+              side_effect=gather_availability),
+        pytest.raises(RuntimeError, match="Raw-pointer prefill P2P"),
+    ):
+        manager._get_exclusive_prefill_pyhccl(
+            SimpleNamespace(cpu_group=cpu_group), torch.device("cpu"))
+
+    communicator_cls.assert_not_called()
+    communicator.close.assert_not_called()
 
 
 def test_exclusive_prefill_comm_layout_aligns_typed_components():
@@ -2242,9 +2292,9 @@ def test_exclusive_shared_prefill_uses_raw_storage_for_local_npu():
         0, "w13_weight_scale")] = torch.tensor([[2.5], [3.5]])
     manager.num_device_layers = 1
     manager._exclusive_layer_locks = [threading.RLock()]
-    manager._exclusive_prefill_p2p_warmed = True
     ep_group = SimpleNamespace(
         cpu_group=object(), device_group=object(), ranks=[10, 11])
+    pyhccl = SimpleNamespace(batch_send_recv=MagicMock())
 
     def gather_plans(output, local_plan, group):
         assert group is ep_group.cpu_group
@@ -2253,8 +2303,9 @@ def test_exclusive_shared_prefill_uses_raw_storage_for_local_npu():
     with (
         patch("vllm.distributed.parallel_state.get_ep_group",
               return_value=ep_group),
-        patch("torch.distributed.P2POp") as p2p_op,
-        patch("torch.distributed.batch_isend_irecv") as batch,
+        patch.object(
+            manager, "_get_exclusive_prefill_pyhccl",
+            return_value=pyhccl),
         patch("torch.distributed.all_gather_object",
               side_effect=gather_plans),
         patch("torch.distributed.barrier") as barrier,
@@ -2309,8 +2360,7 @@ def test_exclusive_shared_prefill_uses_raw_storage_for_local_npu():
         "prefill-local-d2d-w13",
         "prefill-local-d2d-w2",
     }
-    p2p_op.assert_not_called()
-    batch.assert_not_called()
+    pyhccl.batch_send_recv.assert_not_called()
     barrier.assert_called_once_with(group=ep_group.cpu_group)
     assert torch.equal(manager._prefill_w13[0][0], layer.w13_weight[0])
     assert torch.equal(manager._prefill_w2[0][0], layer.w2_weight[0])

@@ -81,6 +81,26 @@ class hcclDataTypeEnum:
         raise ValueError(f"Unsupported dtype: {dtype}")
 
 
+hcclSendRecvType_t = ctypes.c_int
+
+
+class hcclSendRecvTypeEnum:
+    hcclSend = 0
+    hcclRecv = 1
+
+
+class hcclSendRecvItem(ctypes.Structure):
+    """ctypes mirror of the public ``HcclSendRecvItem`` C ABI."""
+
+    _fields_ = [
+        ("sendRecvType", hcclSendRecvType_t),
+        ("buf", buffer_type),
+        ("count", ctypes.c_uint64),
+        ("dataType", hcclDataType_t),
+        ("remoteRank", ctypes.c_uint32),
+    ]
+
+
 hcclRedOp_t = ctypes.c_int
 
 
@@ -165,6 +185,26 @@ class HCCLLibrary:
         # HcclResult HcclCommDestroy(HcclComm comm);
         Function("HcclCommDestroy", hcclResult_t, [hcclComm_t]),
     ]
+    optional_exported_functions = [
+        # HcclResult HcclBatchSendRecv(
+        #   HcclSendRecvItem *sendRecvInfo, uint32_t itemNum,
+        #   HcclComm comm, aclrtStream stream);
+        #
+        # Keep this symbol optional so older CANN installations can continue
+        # using PyHCCL all-reduce/broadcast. Callers that require raw-pointer
+        # P2P must check ``supports_batch_send_recv`` before creating a
+        # communication plan.
+        Function(
+            "HcclBatchSendRecv",
+            hcclResult_t,
+            [
+                ctypes.POINTER(hcclSendRecvItem),
+                ctypes.c_uint32,
+                hcclComm_t,
+                aclrtStream_t,
+            ],
+        ),
+    ]
 
     # class attribute to store the mapping from the path to the library
     # to avoid loading the same library multiple times
@@ -204,8 +244,19 @@ class HCCLLibrary:
                 f.restype = func.restype
                 f.argtypes = func.argtypes
                 _funcs[func.name] = f
+            for func in HCCLLibrary.optional_exported_functions:
+                f = getattr(self.lib, func.name, None)
+                if f is None:
+                    continue
+                f.restype = func.restype
+                f.argtypes = func.argtypes
+                _funcs[func.name] = f
             HCCLLibrary.path_to_dict_mapping[so_file] = _funcs
         self._funcs = HCCLLibrary.path_to_dict_mapping[so_file]
+
+    @property
+    def supports_batch_send_recv(self) -> bool:
+        return "HcclBatchSendRecv" in self._funcs
 
     def hcclGetErrorString(self, result: hcclResult_t) -> str:
         return self._funcs["HcclGetErrorString"](result).decode("utf-8")
@@ -249,6 +300,23 @@ class HCCLLibrary:
     ) -> None:
         self.HCCL_CHECK(self._funcs["HcclBroadcast"](buf, count, datatype, root, comm, stream))
 
+    def hcclBatchSendRecv(
+        self,
+        items: list[hcclSendRecvItem],
+        comm: hcclComm_t,
+        stream: aclrtStream_t,
+    ) -> None:
+        if not items:
+            raise ValueError("HcclBatchSendRecv requires at least one item")
+        if not self.supports_batch_send_recv:
+            raise RuntimeError(
+                "The loaded HCCL library does not export "
+                "HcclBatchSendRecv")
+        item_array = (hcclSendRecvItem * len(items))(*items)
+        self.HCCL_CHECK(
+            self._funcs["HcclBatchSendRecv"](
+                item_array, len(items), comm, stream))
+
     def hcclCommDestroy(self, comm: hcclComm_t) -> None:
         self.HCCL_CHECK(self._funcs["HcclCommDestroy"](comm))
 
@@ -256,6 +324,8 @@ class HCCLLibrary:
 __all__ = [
     "HCCLLibrary",
     "hcclDataTypeEnum",
+    "hcclSendRecvTypeEnum",
+    "hcclSendRecvItem",
     "hcclRedOpTypeEnum",
     "hcclUniqueId",
     "hcclComm_t",

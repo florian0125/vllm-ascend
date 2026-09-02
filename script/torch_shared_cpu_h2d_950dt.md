@@ -12,7 +12,7 @@
 - NZ、FP4 等格式元数据及真实 GMM 精度；
 - ACL Graph host callback、预取流和计算重叠。
 
-仓库现已提供对应的生产调用链实现，包括 `exclusive_dynamic` 的跨 rank 原子 swap 和 prefill HCCL P2P。共享 CPU 脚本本身仍只是独立的前置条件验证，不能替代真实模型精度和性能测试；跨卡 D2D 另由 `validate_torch_prefill_p2p_950dt.py` 做轻量原语验证。
+仓库现已提供对应的生产调用链实现，包括 `exclusive_dynamic` 的跨 rank 原子 swap 和 prefill PyHCCL raw-pointer P2P。共享 CPU 脚本本身仍只是独立的前置条件验证，不能替代真实模型精度和性能测试；跨卡 D2D 另由 `validate_torch_prefill_p2p_950dt.py` 做轻量原语验证。
 
 950DT 文档中的“不支持内存共享（IPC）”是指 NPU Device Tensor IPC。本测试不共享 NPU Tensor，只使用 Linux `MAP_SHARED` CPU 文件映射，然后执行 CPU 到本地 NPU 的 `copy_`。
 
@@ -21,7 +21,7 @@
 - `validate_torch_shared_cpu_h2d_950dt.py`：多 rank 功能、并发、pinned staging、生产 pool/transport 切片和时延测试。
 - `inspect_torch_shared_cpu_pss.sh`：从 `/proc/<pid>/smaps` 汇总共享映射的 PSS。
 - `run_torch_shared_cpu_h2d_950dt.sh`：环境打印和 `torchrun` 启动入口。
-- `validate_torch_prefill_p2p_950dt.py`：验证 raw Storage 权重、非连续 MXFP4 scale、零偏移 `uint8` HCCL buffer 和分块复用。
+- `validate_torch_prefill_p2p_950dt.py`：验证 raw Storage 权重、非连续 MXFP4 scale、零偏移 `uint8` buffer、`HcclBatchSendRecv` 和同 stream 分块复用。
 - `run_torch_prefill_p2p_950dt.sh`：跨卡 prefill P2P 快速启动入口。
 
 ## 前置条件
@@ -29,7 +29,7 @@
 1. 已安装匹配版本的 PyTorch、TorchNPU、CANN、驱动和固件。
 2. 每个进程对应一张 NPU。
 3. `/dev/shm` 有足够空间。默认 8 rank、每 rank 4 个逻辑专家、每专家 12.75 MiB，共约 408 MiB。
-4. PyTorch 构建支持 Gloo；如果不支持，改用 HCCL 控制组。
+4. PyTorch 构建支持 Gloo。共享 mmap 的控制面以及 PyHCCL root info 交换都使用 CPU group，不能用 HCCL device group 代替。
 
 先记录环境：
 
@@ -118,8 +118,9 @@ bash script/run_torch_shared_cpu_h2d_950dt.sh
 1. 初始化时，全局初始 NPU 专家按 physical slot 切到各 rank，checkpoint 直接写入对应 rank 的 decode NPU 槽；剩余专家按紧凑 CPU slot 分配唯一 writer rank，写入所有 rank 共同映射的 mmap。
 2. Decode placement 保留未迁移专家的 rank 和 slot。miss 发生时，槽所在 rank 先把 victim D2H 到小型 pinned scratch，同时把 incoming 从共享 CPU H2D 到该槽；设备复制成功后才把 victim 写回 incoming 原来的紧凑 CPU slot。
 3. 全部 rank 通过 CPU group 汇总 device-copy 和 CPU-commit 状态；任一 rank 失败都会显式报错，所有权表和 `log2phy` 不会提交新版本。
-4. Prefill 仍使用静态 EP shard。CPU-owned 专家从共享 mmap H2D；本 rank NPU-owned 专家本地 D2D；其他 rank NPU-owned 专家通过 EP HCCL device group 直接 `isend/irecv` 到目标 prefill slot。
-5. Prefill 只是向 prefill pool 写快照，不改变 canonical 所有权或 decode `log2phy`。正式路径不创建 CPU snapshot，也不提供远端 NPU→CPU→NPU 的静默回退。
+4. Prefill 仍使用静态 EP shard。CPU-owned 专家从共享 mmap H2D；本 rank NPU-owned 专家本地 D2D；其他 rank NPU-owned 专家先 pack 到零偏移 `uint8` NPU buffer，再通过独立 PyHCCL communicator 的 raw-pointer `HcclBatchSendRecv` 直接传到目标 rank。
+5. 跨卡 pack、HCCL send/recv 和 unpack 都提交到同一个 `load_stream`，由 stream 顺序保证接收完成后才读取 recv buffer；不再依赖 `torch.distributed` Work 对另一个 stream 的隐式完成语义。
+6. Prefill 只是向 prefill pool 写快照，不改变 canonical 所有权或 decode `log2phy`。正式路径不创建 CPU snapshot，也不提供远端 NPU→CPU→NPU 的静默回退。
 
 配置校验会拒绝非 Torch backend、`enable_multi_card=false` 或 `shard_per_rank=false` 的共享 CPU 组合。全局共享模式中的共享目录、共享源、HCCL P2P 或分布式 swap 任一环节不可用时都会显式报错。
 
@@ -166,7 +167,7 @@ export NPROC_PER_NODE=2
 bash script/run_torch_prefill_p2p_950dt.sh
 ```
 
-该脚本使用与日志中相同的 MXFP4 scale 逻辑形状 `(64, 4096, 2)` 和 stride `(2, 128, 1)`，验证 raw Storage 权重、typed scale、HCCL `uint8` buffer 以及顺序分块。全部 rank 成功时会输出：
+该脚本使用与日志中相同的 MXFP4 scale 逻辑形状 `(64, 4096, 2)` 和 stride `(2, 128, 1)`，验证 raw Storage 权重、typed scale、PyHCCL `uint8` raw pointer、显式 `load_stream` 以及顺序分块。它会在启动时检查当前 `libhccl.so` 是否导出 `HcclBatchSendRecv`；全部 rank 成功时会输出：
 
 ```text
 TORCH_PREFILL_P2P_RESULT PASS_ALL_RANKS
@@ -174,12 +175,17 @@ TORCH_PREFILL_P2P_RESULT PASS_ALL_RANKS
 
 这是独立原语 smoke test，不会构造 `ExpertOffloadManager`、真实 internal-format 权重或运行 GMM；它通过后仍必须执行完整模型的初始化、prefill 精度和 decode 回归。
 
-如果 Gloo 初始化失败：
+如果只验证共享 CPU mmap，而 Gloo 初始化失败，可以让基础 H2D 脚本改用
+HCCL 控制组：
 
 ```bash
 export DIST_BACKEND=hccl
 bash script/run_torch_shared_cpu_h2d_950dt.sh
 ```
+
+这只能验证共享 CPU H2D 前置条件；PyHCCL root info 交换和完整模型的
+`exclusive_dynamic + shared_cpu_weights=true` 路径仍需要 Gloo，不能用该设置
+绕过。
 
 脚本使用独占创建。若 `SHARED_FILE` 已存在，会直接失败而不会覆盖。确认它只是上一次异常退出遗留的测试文件后，才能显式删除：
 

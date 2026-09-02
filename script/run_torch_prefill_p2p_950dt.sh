@@ -5,7 +5,7 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 nproc_per_node=${NPROC_PER_NODE:-2}
 
-echo "=== Torch/HCCL prefill P2P smoke test ==="
+echo "=== Torch/PyHCCL raw-pointer prefill P2P smoke test ==="
 echo "nproc_per_node=$nproc_per_node"
 
 python3 -c '
