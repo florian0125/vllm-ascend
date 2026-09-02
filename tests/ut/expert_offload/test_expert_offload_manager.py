@@ -5,11 +5,13 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import pytest
 import torch
 
 from vllm_ascend.ascend_config import ExpertOffloadConfig
 from vllm_ascend.expert_offload.expert_offload_manager import (
     ExpertOffloadManager,
+    _PrefillPeerComponent,
     _expert_weight,
     _stable_int_checksum,
 )
@@ -1526,33 +1528,45 @@ def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
     manager._eid_to_npu_slot[0] = [-1, 1, 0, -1]
     manager._cpu_slot_to_eid[0] = [0, 3]
     manager._eid_to_cpu_slot[0] = [0, -1, -1, 1]
+    manager.w2_expert_size_bytes = 4
+    global_w2 = torch.stack([
+        torch.full((4,), 12, dtype=torch.uint8),
+        torch.full((4,), 13, dtype=torch.uint8),
+    ])
+    manager._torch_shared_cpu_buffers[(0, "w2")] = global_w2
+    manager.w2_weights_cpu = [[global_w2[0]]]
+    source_scale = torch.arange(
+        16, dtype=torch.uint8).reshape(1, 4, 2, 2).transpose(-3, -2)
+    assert not source_scale[0].is_contiguous()
     layer = SimpleNamespace(
         w13_weight=torch.stack([
             torch.full((4,), 22, dtype=torch.uint8),
         ]),
         w2_weight=torch.stack([
-            torch.full((2,), 32, dtype=torch.uint8),
+            torch.full((4,), 32, dtype=torch.uint8),
         ]),
-        w13_weight_scale=torch.tensor([[1.25]]),
+        w13_weight_scale=source_scale,
     )
     manager.moe_layers = [layer]
     manager._prefill_w13 = [torch.zeros((2, 4), dtype=torch.uint8)]
-    manager._prefill_w2 = [torch.zeros((2, 2), dtype=torch.uint8)]
-    manager._prefill_w13_scale = [torch.zeros((2, 1))]
+    manager._prefill_w2 = [torch.zeros((2, 4), dtype=torch.uint8)]
+    manager._prefill_w13_scale = [torch.zeros(
+        (2, 2, 4, 2), dtype=torch.uint8)]
     manager._prefill_w13_scale_fp32 = []
     manager._prefill_w2_scale = []
     manager._prefill_w13_offset = []
     manager._prefill_w2_offset = []
     manager._prefill_w13_scale_bias = []
     manager._prefill_w2_scale_bias = []
+    cpu_scales = torch.stack([
+        torch.full((2, 4, 2), 25, dtype=torch.uint8),
+        torch.full((2, 4, 2), 35, dtype=torch.uint8),
+    ])
     manager.scale_cpu_buffers = {
-        "w13_weight_scale": [[
-            torch.tensor([2.5]),
-            torch.tensor([3.5]),
-        ]],
+        "w13_weight_scale": [[cpu_scales[0], cpu_scales[1]]],
     }
     manager._torch_shared_cpu_buffers[(
-        0, "w13_weight_scale")] = torch.tensor([[2.5], [3.5]])
+        0, "w13_weight_scale")] = cpu_scales
     manager.num_device_layers = 1
     manager._exclusive_layer_locks = [threading.RLock()]
     manager._exclusive_prefill_p2p_warmed = True
@@ -1565,20 +1579,37 @@ def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
             for tensor in tensors
         ])
 
-    remote_payload = as_bytes(
-        torch.full((4,), 41, dtype=torch.uint8),
-        torch.full((2,), 51, dtype=torch.uint8),
-        torch.tensor([6.25]),
-    )
+    remote_scale = torch.arange(
+        16, dtype=torch.uint8).reshape(2, 4, 2) + 100
+    remote_payloads = [
+        as_bytes(
+            torch.full((4,), 41, dtype=torch.uint8),
+            torch.full((4,), 51, dtype=torch.uint8),
+        ),
+        as_bytes(remote_scale),
+    ]
     requests = []
+    exchange_round = 0
+
+    def gather_plans(output, local_plan, group):
+        assert group is ep_group.cpu_group
+        remote_plan = {
+            "send": {0: local_plan["recv"][1]},
+            "recv": {0: local_plan["send"][1]},
+        }
+        output[:] = [local_plan, remote_plan]
 
     def exchange(ops):
+        nonlocal exchange_round
+        payload = remote_payloads[exchange_round]
+        exchange_round += 1
         for args, _ in ops:
             if args[0] is torch.distributed.irecv:
-                args[1].copy_(remote_payload)
-        requests.extend(
-            SimpleNamespace(wait=MagicMock()) for _ in ops)
-        return requests
+                args[1].copy_(payload)
+        round_requests = [
+            SimpleNamespace(wait=MagicMock()) for _ in ops]
+        requests.extend(round_requests)
+        return round_requests
 
     with (
         patch("vllm.distributed.parallel_state.get_ep_group",
@@ -1587,6 +1618,13 @@ def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
               (args, kwargs)) as p2p_op,
         patch("torch.distributed.batch_isend_irecv",
               side_effect=exchange) as batch,
+        patch("torch.distributed.all_gather_object",
+              side_effect=gather_plans) as gather,
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager."
+            "_EXCLUSIVE_PREFILL_P2P_CHUNK_BYTES",
+            16,
+        ),
         patch("torch.distributed.barrier") as barrier,
         patch(
             "vllm_ascend.expert_offload.expert_offload_manager."
@@ -1596,8 +1634,9 @@ def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
     ):
         manager._prefill_load_layer_shard_exclusive_shared(0, 0)
 
-    assert p2p_op.call_count == 2
-    assert batch.call_count == 1
+    assert p2p_op.call_count == 4
+    assert batch.call_count == 2
+    assert gather.call_count == 1
     assert all(request.wait.call_count == 1 for request in requests)
     assert all(call_args.args[2] == 11
                for call_args in p2p_op.call_args_list)
@@ -1609,11 +1648,14 @@ def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
     assert all(buffer.is_contiguous() for buffer in communication_buffers)
     assert all(buffer.storage_offset() == 0
                for buffer in communication_buffers)
-    assert all(buffer.numel() == 10 for buffer in communication_buffers)
-    send_buffer = next(
-        call_args.args[1] for call_args in p2p_op.call_args_list
-        if call_args.args[0] is torch.distributed.isend)
-    assert torch.equal(send_buffer, as_bytes(
+    assert sorted(buffer.numel() for buffer in communication_buffers) == [
+        8, 8, 16, 16]
+    send_payload = torch.cat([
+        call_args.args[1]
+        for call_args in p2p_op.call_args_list
+        if call_args.args[0] is torch.distributed.isend
+    ])
+    assert torch.equal(send_payload, as_bytes(
         layer.w13_weight[0],
         layer.w2_weight[0],
         layer.w13_weight_scale[0],
@@ -1630,17 +1672,26 @@ def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
     )
     assert torch.equal(
         manager._prefill_w2[0][1],
-        torch.full((2,), 51, dtype=torch.uint8),
+        torch.full((4,), 51, dtype=torch.uint8),
     )
-    assert manager._prefill_w13_scale[0][:, 0].tolist() == [2.5, 6.25]
-    pack_names = [
-        task.name.split("[")[0]
-        for task in manager.h2d_transport.batches[0]
+    assert torch.equal(manager._prefill_w13_scale[0][0], cpu_scales[0])
+    assert torch.equal(manager._prefill_w13_scale[0][1], remote_scale)
+    packed_tasks = [
+        task
+        for tasks in manager.h2d_transport.batches
+        for task in tasks
         if task.name.startswith("prefill-p2p-pack-")
+    ]
+    pack_names = [task.name.split("[")[0] for task in packed_tasks]
+    unpacked_tasks = [
+        task
+        for tasks in manager.h2d_transport.batches
+        for task in tasks
+        if task.name.startswith("prefill-p2p-unpack-")
     ]
     unpack_names = [
         task.name.split("[")[0]
-        for task in manager.h2d_transport.batches[1]
+        for task in unpacked_tasks
     ]
     assert pack_names == [
         "prefill-p2p-pack-w13",
@@ -1652,6 +1703,15 @@ def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
         "prefill-p2p-unpack-w2",
         "prefill-p2p-unpack-w13_weight_scale",
     ]
+    assert all(not isinstance(task.source, torch.Tensor)
+               and not isinstance(task.destination, torch.Tensor)
+               for task in packed_tasks[:2] + unpacked_tasks[:2])
+    assert isinstance(packed_tasks[2].source, torch.Tensor)
+    assert isinstance(packed_tasks[2].destination, torch.Tensor)
+    assert not packed_tasks[2].source.is_contiguous()
+    assert packed_tasks[2].destination.is_contiguous()
+    assert isinstance(unpacked_tasks[2].source, torch.Tensor)
+    assert isinstance(unpacked_tasks[2].destination, torch.Tensor)
 
 
 def test_exclusive_prefill_comm_buffer_reuses_zero_offset_prefix():
@@ -1671,6 +1731,174 @@ def test_exclusive_prefill_comm_buffer_reuses_zero_offset_prefix():
     assert grown.storage_offset() == 0
     assert initial.data_ptr() == smaller.data_ptr()
     assert grown.numel() == 32
+
+
+def test_exclusive_prefill_p2p_warmup_uses_distinct_buffers():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager._ep_size = 3
+    manager._ep_rank = 1
+    manager._ep_info_resolved = True
+    manager._exclusive_prefill_p2p_warmed = False
+    manager._prefill_w13 = [torch.empty(1, dtype=torch.uint8)]
+    isend = object()
+    irecv = object()
+    p2p_op = MagicMock(side_effect=lambda *args, **kwargs: (args, kwargs))
+    requests = [
+        SimpleNamespace(wait=MagicMock()) for _ in range(4)]
+    dist = SimpleNamespace(
+        isend=isend,
+        irecv=irecv,
+        P2POp=p2p_op,
+        batch_isend_irecv=MagicMock(return_value=requests),
+    )
+    ep_group = SimpleNamespace(
+        ranks=[10, 11, 12], device_group=object())
+
+    manager._warm_up_exclusive_prefill_p2p(
+        dist, ep_group, pool_slot=0)
+
+    assert manager._exclusive_prefill_p2p_warmed
+    assert p2p_op.call_count == 4
+    buffers = [call_args.args[1] for call_args in p2p_op.call_args_list]
+    assert len({buffer.data_ptr() for buffer in buffers}) == 4
+    assert all(buffer.dtype == torch.uint8 for buffer in buffers)
+    assert all(buffer.storage_offset() == 0 for buffer in buffers)
+    assert all(request.wait.call_count == 1 for request in requests)
+
+
+def test_exclusive_prefill_comm_layout_aligns_typed_components():
+    raw_component = _PrefillPeerComponent(
+        name="weight",
+        source=object(),
+        destination=object(),
+        nbytes=6,
+    )
+    typed_component = _PrefillPeerComponent(
+        name="scale",
+        source=object(),
+        destination=object(),
+        nbytes=4,
+        dtype=torch.float32,
+        shape=(1,),
+        element_size=4,
+    )
+
+    layout, total_bytes = (
+        ExpertOffloadManager._layout_prefill_peer_components([
+            (3, raw_component),
+            (4, typed_component),
+        ]))
+
+    assert [entry[2] for entry in layout] == [0, 8]
+    assert total_bytes == 12
+    buffer = torch.zeros(12, dtype=torch.uint8)
+    typed_view = ExpertOffloadManager._prefill_comm_component_view(
+        buffer, 8, typed_component)
+    typed_view.copy_(torch.tensor([3.5]))
+    assert typed_view.item() == 3.5
+    assert torch.equal(
+        buffer[8:12], torch.tensor([3.5]).view(torch.uint8))
+
+
+@pytest.mark.parametrize("dtype", [
+    torch.uint8,
+    torch.bfloat16,
+    torch.float32,
+    torch.int64,
+])
+def test_exclusive_prefill_comm_view_preserves_metadata_dtype(dtype):
+    source = torch.arange(4, dtype=torch.float32).to(dtype)
+    element_size = source.element_size()
+    offset = element_size
+    component = _PrefillPeerComponent(
+        name="metadata",
+        source=source,
+        destination=object(),
+        nbytes=source.numel() * element_size,
+        dtype=dtype,
+        shape=tuple(source.shape),
+        element_size=element_size,
+    )
+    buffer = torch.zeros(
+        offset + component.nbytes, dtype=torch.uint8)
+
+    view = ExpertOffloadManager._prefill_comm_component_view(
+        buffer, offset, component)
+    view.copy_(source)
+
+    assert view.dtype == dtype
+    assert view.is_contiguous()
+    assert torch.equal(view, source)
+
+
+def test_exclusive_prefill_comm_chunks_are_bounded_and_realigned():
+    components = [
+        _PrefillPeerComponent(
+            name="weight",
+            source=object(),
+            destination=object(),
+            nbytes=6,
+        ),
+        _PrefillPeerComponent(
+            name="scale",
+            source=object(),
+            destination=object(),
+            nbytes=4,
+            dtype=torch.float32,
+            shape=(1,),
+            element_size=4,
+        ),
+        _PrefillPeerComponent(
+            name="offset",
+            source=object(),
+            destination=object(),
+            nbytes=8,
+            dtype=torch.int64,
+            shape=(1,),
+            element_size=8,
+        ),
+    ]
+
+    chunks = ExpertOffloadManager._chunk_prefill_peer_components(
+        list(enumerate(components)), max_chunk_bytes=10)
+
+    assert [size for _, size in chunks] == [6, 4, 8]
+    assert [[offset for _, _, offset in layout]
+            for layout, _ in chunks] == [[0], [0], [0]]
+
+
+def test_exclusive_prefill_plan_validation_rejects_mismatched_peer():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager._ep_size = 2
+    manager._ep_rank = 0
+    manager._ep_info_resolved = True
+    component = _PrefillPeerComponent(
+        name="weight",
+        source=object(),
+        destination=object(),
+        nbytes=8,
+    )
+    send_components = {1: [(2, component)]}
+    cpu_group = object()
+    dist = SimpleNamespace()
+
+    def gather(output, local_plan, group):
+        assert group is cpu_group
+        remote_signature = local_plan["send"][1]
+        output[:] = [
+            local_plan,
+            {"send": {}, "recv": {0: (
+                remote_signature[0] + 1,
+                remote_signature[1],
+                remote_signature[2],
+            )}},
+        ]
+
+    dist.all_gather_object = gather
+
+    with pytest.raises(RuntimeError, match="plans do not match"):
+        manager._validate_prefill_peer_plans(
+            dist, cpu_group, 0, send_components, {})
 
 
 def test_exclusive_shared_prefill_uses_raw_storage_for_local_npu():
@@ -1709,11 +1937,17 @@ def test_exclusive_shared_prefill_uses_raw_storage_for_local_npu():
     ep_group = SimpleNamespace(
         cpu_group=object(), device_group=object(), ranks=[10, 11])
 
+    def gather_plans(output, local_plan, group):
+        assert group is ep_group.cpu_group
+        output[:] = [local_plan, local_plan]
+
     with (
         patch("vllm.distributed.parallel_state.get_ep_group",
               return_value=ep_group),
         patch("torch.distributed.P2POp") as p2p_op,
         patch("torch.distributed.batch_isend_irecv") as batch,
+        patch("torch.distributed.all_gather_object",
+              side_effect=gather_plans),
         patch("torch.distributed.barrier") as barrier,
         patch(
             "vllm_ascend.expert_offload.expert_offload_manager."

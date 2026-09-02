@@ -12,7 +12,7 @@
 - NZ、FP4 等格式元数据及真实 GMM 精度；
 - ACL Graph host callback、预取流和计算重叠。
 
-仓库现已提供对应的生产调用链实现，包括 `exclusive_dynamic` 的跨 rank 原子 swap 和 prefill HCCL P2P，但本脚本本身仍只是独立的前置条件验证，不能替代真实模型精度和性能测试，也不验证跨卡 D2D。
+仓库现已提供对应的生产调用链实现，包括 `exclusive_dynamic` 的跨 rank 原子 swap 和 prefill HCCL P2P。共享 CPU 脚本本身仍只是独立的前置条件验证，不能替代真实模型精度和性能测试；跨卡 D2D 另由 `validate_torch_prefill_p2p_950dt.py` 做轻量原语验证。
 
 950DT 文档中的“不支持内存共享（IPC）”是指 NPU Device Tensor IPC。本测试不共享 NPU Tensor，只使用 Linux `MAP_SHARED` CPU 文件映射，然后执行 CPU 到本地 NPU 的 `copy_`。
 
@@ -21,6 +21,8 @@
 - `validate_torch_shared_cpu_h2d_950dt.py`：多 rank 功能、并发、pinned staging、生产 pool/transport 切片和时延测试。
 - `inspect_torch_shared_cpu_pss.sh`：从 `/proc/<pid>/smaps` 汇总共享映射的 PSS。
 - `run_torch_shared_cpu_h2d_950dt.sh`：环境打印和 `torchrun` 启动入口。
+- `validate_torch_prefill_p2p_950dt.py`：验证 raw Storage 权重、非连续 MXFP4 scale、零偏移 `uint8` HCCL buffer 和分块复用。
+- `run_torch_prefill_p2p_950dt.sh`：跨卡 prefill P2P 快速启动入口。
 
 ## 前置条件
 
@@ -121,6 +123,23 @@ bash script/run_torch_shared_cpu_h2d_950dt.sh
 
 配置校验会拒绝非 Torch backend、`enable_multi_card=false` 或 `shard_per_rank=false` 的共享 CPU 组合；多卡 `exclusive_dynamic` 若没有 `shared_cpu_weights=true` 也会被拒绝。共享目录、共享源、HCCL P2P 或分布式 swap 任一环节不可用时都会显式报错。
 
+## 先验证 prefill 跨卡原语
+
+完整模型初始化前，先用两张卡运行针对本次通信路径的轻量测试：
+
+```bash
+export NPROC_PER_NODE=2
+bash script/run_torch_prefill_p2p_950dt.sh
+```
+
+该脚本使用与日志中相同的 MXFP4 scale 逻辑形状 `(64, 4096, 2)` 和 stride `(2, 128, 1)`，验证 raw Storage 权重、typed scale、HCCL `uint8` buffer 以及顺序分块。全部 rank 成功时会输出：
+
+```text
+TORCH_PREFILL_P2P_RESULT PASS_ALL_RANKS
+```
+
+这是独立原语 smoke test，不会构造 `ExpertOffloadManager`、真实 internal-format 权重或运行 GMM；它通过后仍必须执行完整模型的初始化、prefill 精度和 decode 回归。
+
 如果 Gloo 初始化失败：
 
 ```bash
@@ -175,10 +194,11 @@ bash script/inspect_torch_shared_cpu_pss.sh \
 
 ```text
 [EXCLUSIVE-SHARED-SWAP] layer=... rank=... global_swaps=... local_swaps=...
+[PREFILL-D2D-PLAN] layer=... rank=... typed_pack_tasks=... rounds=... chunk_limit=134217728 peak_send_chunk=... peak_recv_chunk=...
 [PREFILL-D2D] layer=... rank=... local_tasks=... p2p_ops=... global_remote_experts=...
 ```
 
-要证明“直接跨卡 D2D”实际生效，至少应看到 `p2p_ops > 0`，并结合 HCCL profiler/trace 确认对应 send/recv；只有源码或单测不能证明 950DT 实机链路已经通过。
+MXFP4 模型的跨卡元数据路径应看到 `typed_pack_tasks > 0`；每个普通通信块的峰值应不超过 `chunk_limit`。发送端和接收端的专家、组件、dtype、shape、offset 或字节数不一致时，会在进入正式 HCCL 传输前报 `Cross-rank prefill communication plans do not match`。要证明“直接跨卡 D2D”实际生效，至少应看到 `p2p_ops > 0`，并结合 HCCL profiler/trace 确认对应 send/recv；只有源码、单测或独立 smoke test 不能证明完整模型在 950DT 上已经通过。
 
 ## 测试内容和通过标准
 
