@@ -360,6 +360,44 @@ def test_multi_card_torch_offload_admission_uses_owner_capacity_when_sharded(
         "fits" if expected == MoECommType.MC2 else "expert_slots")
 
 
+def test_exclusive_sharded_torch_offload_uses_correctness_alltoall(monkeypatch):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A3,
+        capacity=128,
+        ep_world_size=2,
+    )
+    offload_config = SimpleNamespace(
+        expert_offload=True,
+        enable_multi_card=True,
+        moe_offload_debug=True,
+        storage_partition_mode="exclusive_dynamic",
+        shard_per_rank=True,
+        h2d_backend="torch",
+        shared_cpu_weights=False,
+        num_device_experts_list=[78],
+        num_device_experts_for_rank=lambda _layer, ep_size: 78 // ep_size,
+    )
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(expert_offload_config=offload_config),
+    )
+    vllm_config = _make_vllm_config()
+    vllm_config.model_config.hf_config = SimpleNamespace(
+        num_experts_per_tok=6)
+
+    with patch.object(afc.logger, "info") as log_info:
+        selected = afc.select_moe_comm_method(3, vllm_config)
+
+    assert selected == MoECommType.ALLTOALL
+    admission = next(
+        call for call in log_info.call_args_list
+        if call.args[0].startswith("[MC_ADMISSION]"))
+    assert admission.args[12] == MoECommType.ALLTOALL.name
+    assert admission.args[13] == "exclusive_sharded_correctness"
+
+
 @pytest.mark.parametrize(
     ("h2d_backend", "shared_cpu_weights", "is_draft_model", "expected",
      "admission_slots", "placement_scope"),

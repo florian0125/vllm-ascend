@@ -346,6 +346,8 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         if enable_expert_offload and not use_prefill_pool and num_tokens <= mgr.offload_threshold:
             mgr.trigger_next_layer_prefetch(layer, x)
 
+        if enable_expert_offload:
+            mgr.log_exclusive_sharded_numeric(layer, x, "moe_input")
         try:
             final_hidden_states = moe_comm_method.fused_experts(
                 fused_experts_input=build_fused_experts_input(
@@ -387,6 +389,9 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                     token_dispatcher.local_expert_indices = _saved_dispatcher_state["local_expert_indices"]
                     token_dispatcher.expert_ids_per_ep_rank = _saved_dispatcher_state["expert_ids_per_ep_rank"]
 
+        if enable_expert_offload:
+            mgr.log_exclusive_sharded_numeric(
+                layer, final_hidden_states, "moe_output")
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):

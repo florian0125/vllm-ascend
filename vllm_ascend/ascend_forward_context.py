@@ -408,7 +408,7 @@ def select_moe_comm_method(
     elif (get_ascend_config().expert_offload_config.expert_offload
             and get_ascend_config().expert_offload_config.enable_multi_card):
         # Multi-card offload routes by batch size AND device-buffer fit:
-        #  - DECODE (small batch): MC2 with dynamic per-layer placement
+        #  - DECODE (small batch): normally MC2 with dynamic per-layer placement
         #    (log2phy) + the device buffer (num_device_experts slots). Used
         #    only when (a) tokens fit the MC2 kernel hard limit (512) and
         #    (b) the buffer can hold the local route upper bound
@@ -423,6 +423,8 @@ def select_moe_comm_method(
         # Pad-token garbage is filtered by mc2_mask (51a6d644).
         # num_device_experts remains a free knob: smaller => more batches use
         # the full-expert pool.
+        # Rank-local exclusive Torch storage is temporarily correctness-gated
+        # to ALLTOALL for both regimes; see _force_owner_exclusive_alltoall.
         _offload_config = get_ascend_config().expert_offload_config
         # Communication selection is process-wide rather than layer-specific,
         # so use the smallest configured layer capacity as the safe bound.
@@ -454,6 +456,21 @@ def select_moe_comm_method(
         )
         _placement_scope = (
             "global" if _supports_global_placement else "owner")
+        # Correctness-first boundary for rank-local exclusive Torch storage.
+        # Its canonical CPU+NPU ownership is local to one EP shard and it has no
+        # cross-rank weight source.  Use the already-supported ALLTOALL path,
+        # which moves tokens to the owning rank and assembles that rank's full
+        # shard in the prefill/execution pool using local H2D/D2D only.  The MC2
+        # dynamic-slot path can be re-enabled once it has request-level accuracy
+        # coverage on 950DT; selecting it here previously produced non-finite
+        # layer outputs despite successful swap callbacks.
+        _force_owner_exclusive_alltoall = (
+            getattr(_offload_config, "storage_partition_mode", "replicated")
+            == "exclusive_dynamic"
+            and _offload_config.shard_per_rank
+            and not _torch_shared_cpu
+            and _h2d_backend == "torch"
+        )
         _hf = getattr(vllm_config.model_config, "hf_config", None)
         if _hf is None:
             _hf = vllm_config.model_config.hf_text_config
@@ -471,13 +488,17 @@ def select_moe_comm_method(
         # can double-count routes. Use the local route bound for admission.
         _route_upper_bound = num_tokens * _topk
         _buffer_fits = _route_upper_bound <= _admission_slots
-        if (num_tokens <= mc2_tokens_capacity and num_tokens <= 512
-                and _buffer_fits):
+        if _force_owner_exclusive_alltoall:
+            moe_comm_type = MoECommType.ALLTOALL
+        elif (num_tokens <= mc2_tokens_capacity and num_tokens <= 512
+              and _buffer_fits):
             moe_comm_type = MoECommType.MC2
         else:
             moe_comm_type = MoECommType.ALLTOALL
         if _offload_config.moe_offload_debug:
-            if num_tokens > mc2_tokens_capacity:
+            if _force_owner_exclusive_alltoall:
+                _reason = "exclusive_sharded_correctness"
+            elif num_tokens > mc2_tokens_capacity:
                 _reason = "mc2_capacity"
             elif num_tokens > 512:
                 _reason = "mc2_hard_limit"

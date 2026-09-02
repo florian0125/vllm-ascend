@@ -222,8 +222,11 @@ def test_exclusive_sharded_allocates_one_rank_local_cpu_npu_partition():
     assert manager._cpu_slot_to_eid[0] == [6, 7]
     assert manager._eid_to_npu_slot[0] == [-1, -1, -1, -1, 0, 1, -1, -1]
     assert manager._eid_to_cpu_slot[0] == [-1, -1, -1, -1, -1, -1, 0, 1]
-    assert len(manager.w13_weights_cpu[0]) == 2
+    # Two canonical CPU owners plus two initialization-only copies for the
+    # experts whose canonical owner is already the local NPU.
+    assert len(manager.w13_weights_cpu[0]) == 4
     assert manager._checkpoint_cpu_local(0, 2) is None
+    assert manager._checkpoint_cpu_local(0, 4) == 2
     assert manager._checkpoint_cpu_local(0, 6) == 0
 
 
@@ -1704,6 +1707,76 @@ def test_exclusive_sharded_initializes_one_global_owner_constrained_map():
     assert manager._mc_resident[0] == {0: 2}
     assert manager._cpu_slot_to_eid[0] == [3]
     assert manager._npu_slot_to_eid[0] == [2]
+
+
+def test_exclusive_sharded_bootstrap_materializes_and_drops_cpu_suffix():
+    manager = _exclusive_sharded_runtime_manager()
+    # Canonical CPU prefix owns expert 3. The initialization-only suffix owns
+    # expert 2 until its processed bytes are materialized in local NPU slot 0.
+    manager.w13_weights_cpu[0].append(
+        torch.full((4,), 2, dtype=torch.uint8))
+    manager.w2_weights_cpu[0].append(
+        torch.full((2,), 12, dtype=torch.uint8))
+    manager.scale_cpu_buffers = {
+        "w13_weight_scale": [[
+            torch.tensor([3.0]),
+            torch.tensor([2.0]),
+        ]],
+    }
+    manager.moe_layers[0].w13_weight.zero_()
+    manager.moe_layers[0].w2_weight.zero_()
+    manager.moe_layers[0].w13_weight_scale = torch.zeros((1, 1))
+    manager._exclusive_sharded_bootstrap_layers = {0}
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
+        return_value=nullcontext(),
+    ):
+        manager._materialize_exclusive_sharded_bootstrap()
+
+    assert torch.equal(
+        manager.moe_layers[0].w13_weight[0],
+        torch.full((4,), 2, dtype=torch.uint8))
+    assert torch.equal(
+        manager.moe_layers[0].w2_weight[0],
+        torch.full((2,), 12, dtype=torch.uint8))
+    assert manager.moe_layers[0].w13_weight_scale[0].item() == 2
+    assert len(manager.w13_weights_cpu[0]) == 1
+    assert len(manager.w2_weights_cpu[0]) == 1
+    assert len(manager.scale_cpu_buffers["w13_weight_scale"][0]) == 1
+    assert manager._exclusive_sharded_bootstrap_layers == set()
+    assert all(
+        task.direction == CopyDirection.H2D
+        for task in manager.h2d_transport.batches[0])
+    manager._synchronize_h2d.assert_called_once_with()
+
+
+def test_exclusive_sharded_numeric_log_reports_first_ok_and_each_failure():
+    manager = _exclusive_sharded_runtime_manager()
+    manager._debug = True
+    comm_context = SimpleNamespace(
+        moe_comm_type=SimpleNamespace(name="ALLTOALL"))
+
+    with (
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager._EXTRA_CTX",
+            comm_context,
+        ),
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager.logger",
+        ) as mock_logger,
+    ):
+        manager.log_exclusive_sharded_numeric(
+            manager.moe_layers[0], torch.ones(2), "moe_output")
+        manager.log_exclusive_sharded_numeric(
+            manager.moe_layers[0], torch.ones(2), "moe_output")
+        manager.log_exclusive_sharded_numeric(
+            manager.moe_layers[0], torch.tensor([1.0, float("nan")]),
+            "moe_output")
+
+    assert mock_logger.info.call_count == 1
+    assert mock_logger.warning.call_count == 1
+    assert mock_logger.warning.call_args.args[-1] == 1
 
 
 def test_exclusive_sharded_prefill_uses_only_local_h2d_and_d2d():

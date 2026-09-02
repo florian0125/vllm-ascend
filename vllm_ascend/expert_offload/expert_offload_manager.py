@@ -245,6 +245,13 @@ class ExpertOffloadManager:
         # canonical CPU expert is initialized exactly once.
         self._exclusive_shared_local_cpu_slots: list[list[int]] = []
         self._exclusive_shared_cpu_slot_to_local: list[dict[int, int]] = []
+        # Rank-local exclusive mode must put the initial NPU owners through the
+        # same CPU post-processing path as later H2D misses.  During checkpoint
+        # loading each layer therefore appends one temporary CPU tensor per
+        # initial NPU slot after its compact canonical CPU tensors.  Finalize
+        # materializes those processed bytes on the local NPU and immediately
+        # drops the temporary suffix, restoring CPU + NPU == one local shard.
+        self._exclusive_sharded_bootstrap_layers: set[int] = set()
         # Cross-rank prefill transfers cannot pass internal-format expert
         # slices through torch.distributed because those views commonly have
         # a non-zero storage_offset and ProcessGroupHCCL owns a separate
@@ -706,13 +713,24 @@ class ExpertOffloadManager:
                 w2_list = self._allocate_torch_shared_expert_buffer(
                     layer_moe_idx, "w2", w2_shape, params_dtype)
             else:
+                # The suffix is initialization-only.  It captures the experts
+                # whose canonical owner is already NPU so they receive exactly
+                # the same transpose/NZ/scale processing as CPU-owned experts.
+                # _materialize_exclusive_sharded_bootstrap removes it before
+                # runtime and before memory accounting.
+                checkpoint_experts = cpu_experts
+                if self.exclusive_sharded_cpu_enabled:
+                    checkpoint_experts += device_slots
+                    if not hasattr(self, "_exclusive_sharded_bootstrap_layers"):
+                        self._exclusive_sharded_bootstrap_layers = set()
+                    self._exclusive_sharded_bootstrap_layers.add(layer_moe_idx)
                 w13_list = [
                     self._allocate_expert_host_tensor(w13_shape, params_dtype)
-                    for _ in range(cpu_experts)
+                    for _ in range(checkpoint_experts)
                 ]
                 w2_list = [
                     self._allocate_expert_host_tensor(w2_shape, params_dtype)
-                    for _ in range(cpu_experts)
+                    for _ in range(checkpoint_experts)
                 ]
             self.w13_weights_cpu.append(w13_list)
             self.w2_weights_cpu.append(w2_list)
@@ -1005,6 +1023,10 @@ class ExpertOffloadManager:
         use_shard = self.offload_config.shard_per_rank
         if self.exclusive_dynamic_enabled:
             nalloc = len(self._cpu_slot_to_eid[layer_moe_idx])
+            if (self.exclusive_sharded_cpu_enabled
+                    and layer_moe_idx in getattr(
+                        self, "_exclusive_sharded_bootstrap_layers", set())):
+                nalloc += len(self._npu_slot_to_eid[layer_moe_idx])
         else:
             nalloc = ((ntotal // max(1, self.ep_size))
                       if use_shard else ntotal)
@@ -1222,6 +1244,7 @@ class ExpertOffloadManager:
             # H2D; only the format persists.
             self._cast_device_slots_to_mxfp4_nz()
         # else: non-quantized model, no-op
+        self._materialize_exclusive_sharded_bootstrap()
 
     def _cast_cpu_weights_to_device_format(self, mxfp4: bool = False,
                                             w4a8_dynamic: bool = False):
@@ -1287,6 +1310,23 @@ class ExpertOffloadManager:
                 # remaps it to the local slot); w13/w2_storage are indexed by
                 # the local position in the stacked tensor (== global id when
                 # not sharded).
+                if (self.exclusive_sharded_cpu_enabled
+                        and layer_id in getattr(
+                            self, "_exclusive_sharded_bootstrap_layers", set())):
+                    # Checkpoint buffers contain compact canonical CPU owners
+                    # followed by the initial local NPU owners.  All of them
+                    # are temporary CPU tensors at this point, so write the
+                    # converted bytes back directly; ownership-aware accessors
+                    # intentionally reject the NPU-owned suffix.
+                    self.w13_weights_cpu[layer_id][
+                        local_i].untyped_storage().copy_(
+                            w13_storage[local_i * per_w13:
+                                        (local_i + 1) * per_w13])
+                    self.w2_weights_cpu[layer_id][
+                        local_i].untyped_storage().copy_(
+                            w2_storage[local_i * per_w2:
+                                      (local_i + 1) * per_w2])
+                    continue
                 if self.exclusive_dynamic_enabled:
                     cpu_slot = (
                         self._exclusive_shared_local_cpu_slots[
@@ -1350,6 +1390,118 @@ class ExpertOffloadManager:
                         "npu_grouped_matmul path. Error: %s", name, e)
                     return
                 w.data = d.transpose(1, 2)
+
+    def _materialize_exclusive_sharded_bootstrap(self) -> None:
+        """Materialize uniformly processed initial owners on the local NPU.
+
+        The original routed-expert loader writes initial NPU owners directly to
+        their device slots, while CPU-owned experts pass through this manager's
+        CPU post-processing.  That is unsafe when a device-wide format cast is
+        unsupported: an initial expert evicted by the first exclusive swap can
+        otherwise enter the canonical CPU pool with a different byte layout
+        from experts loaded from the checkpoint CPU path.
+
+        For every bootstrap layer, the temporary suffix in each CPU buffer is
+        ordered exactly like ``_npu_slot_to_eid``.  Copy those already-processed
+        weight and quant bytes to the matching local device slots, synchronize,
+        then remove the suffix.  No cross-rank transfer or persistent CPU
+        duplicate is introduced.
+        """
+        bootstrap_layers = getattr(
+            self, "_exclusive_sharded_bootstrap_layers", set())
+        if not self.exclusive_sharded_cpu_enabled or not bootstrap_layers:
+            return
+
+        for layer_idx in sorted(tuple(bootstrap_layers)):
+            layer = self.moe_layers[layer_idx]
+            cpu_count = len(self._cpu_slot_to_eid[layer_idx])
+            npu_count = len(self._npu_slot_to_eid[layer_idx])
+            expected_count = cpu_count + npu_count
+            weight_buffers = (
+                ("w13", self.w13_weights_cpu[layer_idx],
+                 self.w13_expert_size_bytes),
+                ("w2", self.w2_weights_cpu[layer_idx],
+                 self.w2_expert_size_bytes),
+            )
+            for name, buffers, _ in weight_buffers:
+                if len(buffers) != expected_count:
+                    raise RuntimeError(
+                        "Rank-local exclusive bootstrap buffer count mismatch: "
+                        f"rank={self.ep_rank}, layer={layer_idx}, name={name}, "
+                        f"expected={expected_count}, actual={len(buffers)}")
+
+            tasks = []
+            for slot, eid in enumerate(self._npu_slot_to_eid[layer_idx]):
+                source_index = cpu_count + slot
+                for name, buffers, nbytes in weight_buffers:
+                    tasks.append(H2DCopyTask(
+                        source=buffers[source_index].untyped_storage(),
+                        destination=self._expert_device_storage(
+                            layer, slot, name),
+                        nbytes=nbytes,
+                        name=(f"exclusive-bootstrap-{name}[L{layer_idx},"
+                              f"E{eid}->S{slot}]"),
+                    ))
+
+                for buffer_dict in (
+                        self.scale_cpu_buffers,
+                        self.offset_cpu_buffers,
+                        self.scale_bias_cpu_buffers):
+                    for attr_name, layer_buffers in buffer_dict.items():
+                        if layer_idx >= len(layer_buffers):
+                            continue
+                        buffers = layer_buffers[layer_idx]
+                        dev_tensor = getattr(layer, attr_name, None)
+                        if dev_tensor is None:
+                            continue
+                        if len(buffers) != expected_count:
+                            raise RuntimeError(
+                                "Rank-local exclusive bootstrap quant buffer "
+                                "count mismatch: "
+                                f"rank={self.ep_rank}, layer={layer_idx}, "
+                                f"name={attr_name}, expected={expected_count}, "
+                                f"actual={len(buffers)}")
+                        source = buffers[source_index]
+                        destination = dev_tensor.data[slot]
+                        tasks.append(H2DCopyTask(
+                            source=source.reshape(destination.shape),
+                            destination=destination,
+                            nbytes=(source.numel() * source.element_size()),
+                            name=(f"exclusive-bootstrap-{attr_name}[L{layer_idx},"
+                                  f"E{eid}->S{slot}]"),
+                        ))
+
+            with torch_npu.npu.stream(self.load_stream):
+                self._get_h2d_transport().copy_batch(tasks)
+                for slot in range(npu_count):
+                    self._refresh_expert_fp32_scale(layer, slot)
+                self._synchronize_h2d()
+
+            # Drop only the temporary initial-NPU suffix.  The retained prefix
+            # remains indexed by _cpu_slot_to_eid and is the sole canonical CPU
+            # owner set used by runtime swaps.
+            self.w13_weights_cpu[layer_idx] = self.w13_weights_cpu[
+                layer_idx][:cpu_count]
+            self.w2_weights_cpu[layer_idx] = self.w2_weights_cpu[
+                layer_idx][:cpu_count]
+            for buffer_dict in (
+                    self.scale_cpu_buffers,
+                    self.offset_cpu_buffers,
+                    self.scale_bias_cpu_buffers):
+                for layer_buffers in buffer_dict.values():
+                    if layer_idx < len(layer_buffers):
+                        layer_buffers[layer_idx] = layer_buffers[
+                            layer_idx][:cpu_count]
+
+            bootstrap_layers.remove(layer_idx)
+            self._validate_exclusive_ownership(layer_idx)
+            logger.info(
+                "[EXCLUSIVE-SHARDED-BOOTSTRAP] rank=%d/%d layer=%d "
+                "checkpoint_local_experts=%d materialized_npu_slots=%d "
+                "canonical_cpu_slots=%d copy_tasks=%d source_layout=cpu_postprocess "
+                "cross_rank_weight_transfer=False status=ok",
+                self.ep_rank, self.ep_size, layer_idx, expected_count,
+                npu_count, cpu_count, len(tasks))
 
     def _process_scale_bias_cpu_buffers(self):
         """Apply update_bias transformation to scale_bias CPU buffers.
@@ -1656,6 +1808,12 @@ class ExpertOffloadManager:
     ) -> int | None:
         """Resolve this rank's writable checkpoint slot for one CPU expert."""
         cpu_slot = self._cpu_local(layer_idx, global_eid)
+        if (cpu_slot is None and self.exclusive_sharded_cpu_enabled
+                and layer_idx in getattr(
+                    self, "_exclusive_sharded_bootstrap_layers", set())):
+            npu_slot = self._eid_to_npu_slot[layer_idx][global_eid]
+            if npu_slot >= 0:
+                cpu_slot = len(self._cpu_slot_to_eid[layer_idx]) + npu_slot
         if cpu_slot is None or not self.exclusive_shared_cpu_enabled:
             return cpu_slot
         return self._exclusive_shared_cpu_slot_to_local[layer_idx].get(
@@ -3034,6 +3192,45 @@ class ExpertOffloadManager:
             time.time_ns(),
             details_text,
         )
+
+    def log_exclusive_sharded_numeric(self, layer, tensor: torch.Tensor,
+                                      stage: str) -> None:
+        """Report the first finite result and every non-finite local result.
+
+        This diagnostic is deliberately limited to the correctness-gated
+        rank-local exclusive mode.  ``item()`` synchronizes the NPU, which is
+        acceptable under ``moe_offload_debug`` while validating this path but
+        must not leak into the normal performance path.
+        """
+        if not self._debug or not self.exclusive_sharded_cpu_enabled:
+            return
+        try:
+            layer_idx = self.moe_layers.index(layer)
+        except ValueError:
+            return
+        nonfinite = int((~torch.isfinite(tensor)).sum().item())
+        comm_type = getattr(_EXTRA_CTX.moe_comm_type, "name",
+                            _EXTRA_CTX.moe_comm_type)
+        if nonfinite:
+            logger.warning(
+                "[EXCLUSIVE-SHARDED-NUMERIC] rank=%d/%d layer=%d stage=%s "
+                "comm=%s shape=%s dtype=%s total=%d nonfinite=%d status=fail",
+                self.ep_rank, self.ep_size, layer_idx, stage, comm_type,
+                tuple(tensor.shape), tensor.dtype, tensor.numel(), nonfinite)
+            return
+        seen = getattr(self, "_exclusive_sharded_numeric_seen", None)
+        if seen is None:
+            seen = set()
+            self._exclusive_sharded_numeric_seen = seen
+        key = (layer_idx, stage, str(comm_type))
+        if key in seen:
+            return
+        seen.add(key)
+        logger.info(
+            "[EXCLUSIVE-SHARDED-NUMERIC] rank=%d/%d layer=%d stage=%s "
+            "comm=%s shape=%s dtype=%s total=%d nonfinite=0 status=ok",
+            self.ep_rank, self.ep_size, layer_idx, stage, comm_type,
+            tuple(tensor.shape), tensor.dtype, tensor.numel())
 
     def _log_mc_debug_schedule(self, layer_idx: int,
                                is_prefetch: bool) -> None:

@@ -148,13 +148,30 @@ bash script/run_torch_shared_cpu_h2d_950dt.sh
     = 一份完整全局专家权重
 ```
 
-Decode planner 使用 owner-shard 约束，miss 只在同一 rank 内执行 victim D2H 和 incoming H2D；prefill 的 CPU-owned 专家做本地 H2D，已在本地 decode NPU 的专家做本地 D2D。专家权重不会跨 rank 传输；MC2/ALLTOALL 仍可跨 rank 传递 token。配置中的 `num_device_experts` 仍是全局 NPU 槽数，例如 EP=8、值为 32 时每 rank 有 4 个 NPU 槽。
+初始化装载时，本 rank 的完整 EP shard 会临时经过同一套 CPU 后处理。初始 NPU owner 随后从这些已经后处理的临时 CPU tensor H2D 到本地槽位，临时后缀立即释放，只留下互斥的 canonical CPU/NPU 集合。这样即使 950DT 拒绝对整个 decode tensor 执行 format-29 metadata cast，初始 NPU 专家和后续 CPU 专家仍具有一致的实际权重与 scale 字节布局。
+
+当前该组合采用 correctness-first 边界：prefill 和 decode 都使用 ALLTOALL，把 token 传到静态 owner rank；每层执行前从本 rank 的 canonical CPU/NPU 集合组装完整本地 shard，CPU-owned 专家做本地 H2D，NPU-owned 专家做本地 D2D。专家权重不会跨 rank 传输。该边界暂时绕开尚未完成 950DT 请求级精度验证的 MC2 动态小槽位路径，代价是 decode 每层也要组装完整 shard。配置中的 `num_device_experts` 仍是全局 canonical decode NPU 槽数，例如 EP=8、值为 32 时每 rank 有 4 个 canonical NPU 槽；prefill/execution pool 属于运行工作区，不计入 canonical 权重总量。
 
 初始化完成后应看到 `cpu_mode=exclusive_sharded`、`expected_full_weight_copies_across_ep=1`，以及：
 
 ```text
 [EXCLUSIVE-SHARDED] ... cpu_experts_per_layer=... npu_experts_per_layer=... cross_rank_weight_transfer=False
+[EXCLUSIVE-SHARDED-BOOTSTRAP] ... source_layout=cpu_postprocess cross_rank_weight_transfer=False status=ok
+[MC_ADMISSION] ... selected=ALLTOALL reason=exclusive_sharded_correctness
+[EXCLUSIVE-SHARDED-NUMERIC] ... stage=moe_input ... nonfinite=0 status=ok
+[EXCLUSIVE-SHARDED-NUMERIC] ... stage=moe_output ... nonfinite=0 status=ok
 ```
+
+`[EXCLUSIVE-SHARDED-BOOTSTRAP]` 应覆盖全部 MoE 层；任意
+`[EXCLUSIVE-SHARDED-NUMERIC] ... status=fail` 都表示非有限值已经进入或离开该层 MoE。验证日志时可执行：
+
+```bash
+grep -c 'EXCLUSIVE-SHARDED-BOOTSTRAP.*status=ok' model.log
+grep 'MC_ADMISSION' model.log | sort -u
+grep 'EXCLUSIVE-SHARDED-NUMERIC.*status=fail' model.log
+```
+
+启动成功并不等于精度通过。还必须发送至少一个真实 `curl` 请求，确认响应正文包含非空答案，并确认最后一条命令没有输出。
 
 多卡 `exclusive_dynamic` 的配置边界为：`shared_cpu_weights=true` 使用全局 ownership 和跨卡权重 P2P；`shared_cpu_weights=false` 必须同时设置 `shard_per_rank=true`，使用上述 rank-local ownership。后一种配置不能做跨 rank 的专家负载均衡，只能在每个专家的静态 owner rank 内换入换出。
 
