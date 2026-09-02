@@ -13,6 +13,7 @@ from vllm_ascend.expert_offload.expert_offload_manager import (
     ExpertOffloadManager,
     _PrefillPeerComponent,
     _expert_weight,
+    _stable_float_checksum,
     _stable_int_checksum,
 )
 from vllm_ascend.expert_offload.h2d_transfer import (
@@ -67,6 +68,16 @@ def test_cpu_tensor_storage_bytes_counts_unique_nested_storages():
 
     assert total == weight.untyped_storage().nbytes() + \
         scale.untyped_storage().nbytes()
+
+
+def test_stable_float_checksum_handles_nonfinite_values():
+    values = torch.tensor([0.25, float("nan"), float("inf"), float("-inf")])
+
+    checksum = _stable_float_checksum(values)
+
+    assert isinstance(checksum, int)
+    assert checksum == _stable_float_checksum(values.tolist())
+    assert checksum != _stable_float_checksum(values.flip(0))
 
 
 def test_exclusive_dynamic_allocates_only_cpu_owned_experts():
@@ -309,6 +320,64 @@ def test_multi_card_lrc_log_exposes_cross_rank_checksums():
     assert args[-1][0]["expert"] == 1
     assert args[-1][0]["count"] == 2
     assert args[-1][0]["freq"] == 5
+
+
+def test_multi_card_router_score_sanitizer_logs_origin_and_zeros_nonfinite():
+    manager = _manager_for_mc_debug()
+    ids = torch.tensor([1, 2, 3, 2], dtype=torch.int64)
+    scores = torch.tensor([0.5, float("nan"), float("inf"), float("-inf")])
+    context = {"source": "eager_inline"}
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.warning"
+    ) as log_warning:
+        sanitized = manager._sanitize_mc_router_scores(
+            7, scores, ids, "local_topk", context)
+
+    assert torch.equal(sanitized, torch.tensor([0.5, 0.0, 0.0, 0.0]))
+    assert torch.isnan(scores[1])
+    args = log_warning.call_args.args
+    assert args[0].startswith("[MC_ROUTER_NONFINITE]")
+    assert args[1:12] == (8, 16, 7, "local_topk", "eager_inline", 4, 3,
+                          1, 1, 1, [{
+                              "position": 1,
+                              "expert": 2,
+                              "value": "nan",
+                          }, {
+                              "position": 2,
+                              "expert": 3,
+                              "value": "+inf",
+                          }, {
+                              "position": 3,
+                              "expert": 2,
+                              "value": "-inf",
+                          }])
+
+
+def test_multi_card_lrc_observes_only_finite_router_scores():
+    manager = _manager_for_mc_debug()
+    manager._debug = False
+    manager.num_total_experts = 4
+    manager.offload_config = SimpleNamespace(cache_policy_enabled=True)
+    manager._mc_prev_log2phy = {}
+    manager._mc_lrc = MagicMock()
+    manager._mc_lrc.layer_states = [object()]
+    manager._mc_lrc.hotness_array.return_value = torch.zeros(4)
+    manager._gather_cpu_with_mc_debug = (
+        lambda values, _group, _kind, _context: values.clone())
+    topk_ids = torch.tensor([[1, 2]], dtype=torch.int64)
+    topk_weights = torch.tensor([[float("nan"), 0.5]])
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.warning"
+    ) as log_warning:
+        manager._gather_global_counts_and_hotness(
+            0, topk_ids, None, topk_weights)
+
+    router_score = manager._mc_lrc.observe_global_counts.call_args.args[2]
+    assert torch.equal(router_score, torch.tensor([0.0, 0.0, 0.5, 0.0]))
+    assert torch.isfinite(router_score).all()
+    assert log_warning.call_count == 1
 
 
 def test_mc_debug_callback_log_exposes_sequence_and_reentry():

@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import math
 import os
 import threading
 import time
@@ -37,6 +38,9 @@ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
 _EXCLUSIVE_PREFILL_P2P_CHUNK_BYTES = 128 * 1024 * 1024
+_FLOAT_CHECKSUM_NAN = 2_147_483_647
+_FLOAT_CHECKSUM_POS_INF = 2_147_483_646
+_FLOAT_CHECKSUM_NEG_INF = -2_147_483_646
 
 
 def get_subscribed_compute_streams() -> set:
@@ -57,10 +61,30 @@ def _stable_int_checksum(values) -> int:
 
 
 def _stable_float_checksum(values, scale: int = 1_000_000) -> int:
-    """Deterministic fixed-point checksum for cross-rank debug comparison."""
+    """Deterministic fixed-point checksum for cross-rank debug comparison.
+
+    Router scores are diagnostic inputs and may already contain NaN/Inf when
+    the model produces a non-finite activation. Debug logging must report that
+    condition instead of raising while converting it to an integer.
+    """
     flat = values.reshape(-1).tolist() if hasattr(values, "reshape") else values
-    return sum((index + 1) * round(float(value) * scale)
-               for index, value in enumerate(flat))
+    checksum = 0
+    for index, value in enumerate(flat):
+        number = float(value)
+        if math.isnan(number):
+            quantized = _FLOAT_CHECKSUM_NAN
+        elif math.isinf(number):
+            quantized = (_FLOAT_CHECKSUM_POS_INF if number > 0 else
+                         _FLOAT_CHECKSUM_NEG_INF)
+        else:
+            scaled = number * scale
+            if math.isinf(scaled):
+                quantized = (_FLOAT_CHECKSUM_POS_INF if scaled > 0 else
+                             _FLOAT_CHECKSUM_NEG_INF)
+            else:
+                quantized = round(scaled)
+        checksum += (index + 1) * quantized
+    return checksum
 
 
 def _expert_weight(layer, name: str):
@@ -3805,6 +3829,48 @@ class ExpertOffloadManager:
             _stable_float_checksum(state.router_score),
             _stable_float_checksum(hotness), hot_sample)
 
+    def _sanitize_mc_router_scores(self, layer_idx, scores, expert_ids=None,
+                                   stage="local_topk", debug_context=None):
+        """Keep non-finite router scores out of the optional LRC heuristic.
+
+        ``scores`` and ``expert_ids`` are CPU tensors copied for placement
+        accounting; the router output used by model execution is untouched.
+        Logging local values before Gloo identifies the originating rank,
+        layer, route position and expert. A second call after Gloo protects
+        against non-finite reduction results as well.
+        """
+        finite = torch.isfinite(scores)
+        if bool(finite.all()):
+            return scores
+
+        invalid_positions = (~finite).nonzero(as_tuple=True)[0]
+        nan_count = int(torch.isnan(scores).sum())
+        infinite = torch.isinf(scores)
+        posinf_count = int((infinite & (scores > 0)).sum())
+        neginf_count = int((infinite & (scores < 0)).sum())
+        sample = []
+        for position in invalid_positions[
+                :self._DEBUG_EXPERT_SAMPLE_LIMIT].tolist():
+            number = float(scores[position])
+            value = ("nan" if math.isnan(number) else
+                     "+inf" if number > 0 else "-inf")
+            expert_id = (int(expert_ids[position])
+                         if expert_ids is not None else int(position))
+            sample.append({
+                "position": int(position),
+                "expert": expert_id,
+                "value": value,
+            })
+        source = (debug_context or {}).get("source", "-")
+        logger.warning(
+            "[MC_ROUTER_NONFINITE] rank=%s/%s layer=%s stage=%s "
+            "source=%s total=%s nonfinite=%s nan=%s posinf=%s neginf=%s "
+            "action=zero_for_lrc sample=%s",
+            self.ep_rank, self.ep_size, layer_idx, stage, source,
+            scores.numel(), invalid_positions.numel(), nan_count,
+            posinf_count, neginf_count, sample)
+        return scores.masked_fill(~finite, 0.0)
+
     def _gather_global_counts_and_hotness(self, layer_idx, topk_ids_h,
                                           cpu_group, topk_weights_h=None,
                                           debug_context=None):
@@ -3843,11 +3909,16 @@ class ExpertOffloadManager:
         if topk_weights_h is not None:
             ids = topk_ids_h.reshape(-1).to(torch.int64)
             scores = topk_weights_h.reshape(-1).to(torch.float32)
+            scores = self._sanitize_mc_router_scores(
+                layer_idx, scores, ids, "local_topk", debug_context)
             local_score_sum = torch.zeros(self.num_total_experts,
                                           dtype=torch.float32)
             local_score_sum.scatter_add_(0, ids, scores)
             global_score_sum = self._gather_cpu_with_mc_debug(
                 local_score_sum, cpu_group, "router_score", debug_context)
+            global_score_sum = self._sanitize_mc_router_scores(
+                layer_idx, global_score_sum, stage="global_sum",
+                debug_context=debug_context)
             global_router_score = torch.zeros_like(global_score_sum)
             active = global_counts > 0
             global_router_score[active] = (
