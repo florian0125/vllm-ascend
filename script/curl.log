@@ -1,0 +1,12 @@
+[root@localhost vllm-ascend]#   unset https_proxy
+unset http_proxy
+  curl http://0.0.0.0:8155/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "glm-5",
+        "prompt": "滚滚长江东逝水，浪花淘尽英雄。是非成败转头空。青山依旧在，几度夕阳红。白发渔樵江渚上，惯看秋月春风。 一壶浊酒喜相逢。古今多少事，都付笑谈中。\n——调寄《临江仙》\n\n话说天下大势，分久必合，合久必分。周末七国分争，并入于秦。及秦灭之后，楚、汉分争，又并入于汉。汉朝自高祖斩白蛇而起义，",
+                "max_tokens": 50,
+        "temperature": 0
+    }'  
+{"id":"cmpl-af1d0c7b0ef9c2d2","object":"text_completion","created":1788411183,"model":"glm-5","choices":[{"index":0,"text":"","logprobs":null,"finish_reason":"length","stop_reason":null,"token_ids":null,"prompt_logprobs":null,"prompt_token_ids":null,"routed_experts":null}],"service_tier":null,"system_fingerprint":"vllm-0.26.1.dev0+g568afb3a1.d20260801-dp2-ep-998a8008","usage":{"prompt_tokens":115,"total_tokens":165,"completion_tokens":50,"prompt_tokens_details":null},"kv_transfer_params":null,"ec_transfer_params":null,"metrics":null}[root@localhost vllm-ascend]# 
+
