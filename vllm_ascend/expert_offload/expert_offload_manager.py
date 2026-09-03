@@ -3198,10 +3198,10 @@ class ExpertOffloadManager:
         """Report the first finite result and every non-finite local result.
 
         This diagnostic is deliberately limited to rank-local exclusive mode.
-        ``item()`` synchronizes the NPU, which is
-        acceptable under ``moe_offload_debug`` while validating this path but
-        must not leak into the normal performance path.  Diagnostics must not
-        abort model startup if a caller accidentally passes a result wrapper.
+        ``item()`` synchronizes the NPU, which is acceptable under
+        ``moe_offload_debug`` while validating an eager path but is forbidden
+        while ACL Graph capture is active. Diagnostics must not abort model
+        startup if a caller accidentally passes a result wrapper.
         """
         if not self._debug or not self.exclusive_sharded_cpu_enabled:
             return
@@ -3215,6 +3215,12 @@ class ExpertOffloadManager:
                 "input_type=%s status=skip reason=not_tensor",
                 self.ep_rank, self.ep_size, layer_idx, stage,
                 type(tensor).__name__)
+            return
+        if bool(getattr(_EXTRA_CTX, "capturing", False)):
+            logger.info_once(
+                "[EXCLUSIVE-SHARDED-NUMERIC] skip NPU value inspection "
+                "during ACL Graph capture; other offload debug diagnostics "
+                "remain enabled")
             return
         nonfinite = int((~torch.isfinite(tensor)).sum().item())
         comm_type = getattr(_EXTRA_CTX.moe_comm_type, "name",

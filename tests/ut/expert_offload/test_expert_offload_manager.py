@@ -1755,7 +1755,7 @@ def test_exclusive_sharded_numeric_log_reports_first_ok_and_each_failure():
     manager = _exclusive_sharded_runtime_manager()
     manager._debug = True
     comm_context = SimpleNamespace(
-        moe_comm_type=SimpleNamespace(name="ALLTOALL"))
+        capturing=False, moe_comm_type=SimpleNamespace(name="ALLTOALL"))
 
     with (
         patch(
@@ -1777,6 +1777,32 @@ def test_exclusive_sharded_numeric_log_reports_first_ok_and_each_failure():
     assert mock_logger.info.call_count == 1
     assert mock_logger.warning.call_count == 1
     assert mock_logger.warning.call_args.args[-1] == 1
+
+
+def test_exclusive_sharded_numeric_log_skips_graph_capture():
+    manager = _exclusive_sharded_runtime_manager()
+    manager._debug = True
+    comm_context = SimpleNamespace(
+        capturing=True, moe_comm_type=SimpleNamespace(name="MC2"))
+
+    with (
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager._EXTRA_CTX",
+            comm_context,
+        ),
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager.logger",
+        ) as mock_logger,
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager.torch.isfinite",
+        ) as mock_isfinite,
+    ):
+        manager.log_exclusive_sharded_numeric(
+            manager.moe_layers[0], torch.ones(2), "moe_input")
+
+    mock_isfinite.assert_not_called()
+    mock_logger.info_once.assert_called_once()
+    assert "during ACL Graph capture" in mock_logger.info_once.call_args.args[0]
 
 
 def test_exclusive_sharded_numeric_log_skips_non_tensor_input():
