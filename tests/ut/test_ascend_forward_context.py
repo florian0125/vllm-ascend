@@ -138,8 +138,17 @@ def test_should_skip_compiled_for_multi_card_offload(
     assert afc._should_skip_compiled_for_multi_card_offload(moe_comm_type) is expected
 
 
-def test_set_forward_context_skips_compiled_alltoall_for_multi_card_offload(
+@pytest.mark.parametrize(
+    ("moe_comm_type", "expected_skip_compiled"),
+    [
+        (MoECommType.ALLTOALL, True),
+        (MoECommType.MC2, False),
+    ],
+)
+def test_set_forward_context_compiles_only_mc2_for_multi_card_offload(
     monkeypatch,
+    moe_comm_type,
+    expected_skip_compiled,
 ):
     forward_context = SimpleNamespace(skip_compiled=False, dp_metadata=None)
 
@@ -163,7 +172,7 @@ def test_set_forward_context_skips_compiled_alltoall_for_multi_card_offload(
     monkeypatch.setattr(
         afc,
         "select_moe_comm_method",
-        lambda *_: MoECommType.ALLTOALL,
+        lambda *_: moe_comm_type,
     )
     monkeypatch.setattr(afc, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(afc, "is_moe_model", lambda _: False)
@@ -181,7 +190,7 @@ def test_set_forward_context_skips_compiled_alltoall_for_multi_card_offload(
         vllm_config=SimpleNamespace(),
         num_tokens=8192,
     ):
-        assert forward_context.skip_compiled is True
+        assert forward_context.skip_compiled is expected_skip_compiled
 
 
 def test_set_mc2_tokens_capacity_without_cudagraph_aligns_per_tp_rank():
@@ -360,7 +369,19 @@ def test_multi_card_torch_offload_admission_uses_owner_capacity_when_sharded(
         "fits" if expected == MoECommType.MC2 else "expert_slots")
 
 
-def test_exclusive_sharded_torch_offload_uses_correctness_alltoall(monkeypatch):
+@pytest.mark.parametrize(
+    ("num_tokens", "expected", "reason"),
+    [
+        (3, MoECommType.MC2, "fits"),
+        (115, MoECommType.ALLTOALL, "expert_slots"),
+    ],
+)
+def test_exclusive_sharded_torch_offload_uses_mc2_decode_and_alltoall_prefill(
+    monkeypatch,
+    num_tokens,
+    expected,
+    reason,
+):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
         device_type=afc.AscendDeviceType.A3,
@@ -388,14 +409,17 @@ def test_exclusive_sharded_torch_offload_uses_correctness_alltoall(monkeypatch):
         num_experts_per_tok=6)
 
     with patch.object(afc.logger, "info") as log_info:
-        selected = afc.select_moe_comm_method(3, vllm_config)
+        selected = afc.select_moe_comm_method(num_tokens, vllm_config)
 
-    assert selected == MoECommType.ALLTOALL
+    assert selected == expected
     admission = next(
         call for call in log_info.call_args_list
         if call.args[0].startswith("[MC_ADMISSION]"))
-    assert admission.args[12] == MoECommType.ALLTOALL.name
-    assert admission.args[13] == "exclusive_sharded_correctness"
+    assert admission.args[1:11] == (
+        "sharded", "torch", "owner", num_tokens, 6, 2, 78, 39,
+        num_tokens * 6, 128)
+    assert admission.args[12] == expected.name
+    assert admission.args[13] == reason
 
 
 @pytest.mark.parametrize(

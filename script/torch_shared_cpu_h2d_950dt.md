@@ -150,14 +150,17 @@ bash script/run_torch_shared_cpu_h2d_950dt.sh
 
 初始化装载时，本 rank 的完整 EP shard 会临时经过同一套 CPU 后处理。初始 NPU owner 随后从这些已经后处理的临时 CPU tensor H2D 到本地槽位，临时后缀立即释放，只留下互斥的 canonical CPU/NPU 集合。这样即使 950DT 拒绝对整个 decode tensor 执行 format-29 metadata cast，初始 NPU 专家和后续 CPU 专家仍具有一致的实际权重与 scale 字节布局。
 
-当前该组合采用 correctness-first 边界：prefill 和 decode 都使用 ALLTOALL，把 token 传到静态 owner rank；每层执行前从本 rank 的 canonical CPU/NPU 集合组装完整本地 shard，CPU-owned 专家做本地 H2D，NPU-owned 专家做本地 D2D。专家权重不会跨 rank 传输。该边界暂时绕开尚未完成 950DT 请求级精度验证的 MC2 动态小槽位路径，代价是 decode 每层也要组装完整 shard。配置中的 `num_device_experts` 仍是全局 canonical decode NPU 槽数，例如 EP=8、值为 32 时每 rank 有 4 个 canonical NPU 槽；prefill/execution pool 属于运行工作区，不计入 canonical 权重总量。
+当前该组合恢复为 ALLTOALL Prefill + MC2 Decode：大 batch、超过 MC2 token 限制或 `num_tokens * topk` 超过单个 owner rank 槽位上界时使用 ALLTOALL，把 token 传到静态 owner rank，并从本 rank 的 canonical CPU/NPU 集合组装完整本地 shard；容量允许的小 batch decode 使用 MC2 和动态 `log2phy`。MC2 只跨 rank 分发/合并 token，placement 由 `force_shard` 固定在专家的 owner rank；CPU-owned miss 做本地 H2D，已在本 rank NPU 的专家做本地 D2D，专家权重不会跨 rank 传输。配置中的 `num_device_experts` 仍是全局 canonical decode NPU 槽数，例如 EP=8、值为 32 时每 rank 有 4 个 canonical NPU 槽；prefill pool 属于运行工作区，不计入 canonical 权重总量。
+
+图模式只捕获 MC2 Decode。ALLTOALL Prefill 和 Decode overflow 会设置 `skip_compiled=true` 并以 eager 路径执行，不再实现或依赖 ALLTOALL Decode 图适配。
 
 初始化完成后应看到 `cpu_mode=exclusive_sharded`、`expected_full_weight_copies_across_ep=1`，以及：
 
 ```text
 [EXCLUSIVE-SHARDED] ... cpu_experts_per_layer=... npu_experts_per_layer=... cross_rank_weight_transfer=False
 [EXCLUSIVE-SHARDED-BOOTSTRAP] ... source_layout=cpu_postprocess cross_rank_weight_transfer=False status=ok
-[MC_ADMISSION] ... selected=ALLTOALL reason=exclusive_sharded_correctness
+[MC_ADMISSION] ... selected=MC2 reason=fits
+[MC_ADMISSION] ... selected=ALLTOALL reason=expert_slots
 [EXCLUSIVE-SHARDED-NUMERIC] ... stage=moe_input ... nonfinite=0 status=ok
 [EXCLUSIVE-SHARDED-NUMERIC] ... stage=moe_output ... nonfinite=0 status=ok
 ```
@@ -372,7 +375,7 @@ bash script/run_torch_shared_cpu_h2d_950dt.sh
 4. 验证初始化 barrier、异常退出、target/draft 生命周期和重复启动清理。
 5. 测量 decode miss 的 H2D p50/p99、吞吐和计算重叠。
 6. 对 `exclusive_dynamic + shared_cpu_weights=true` 验证 MC2 decode 的全局 ownership、原子 swap、`log2phy` 一致性，以及 ALLTOALL prefill 的 HCCL P2P；同时确认没有 NPU→CPU→NPU 的远端回退。
-7. 对 `exclusive_dynamic + shared_cpu_weights=false` 验证每个 rank 的 CPU/NPU ownership 并集恰好等于本 rank EP shard、不同 rank 互不重叠，且日志始终显示 `cross_rank_weight_transfer=False`。
+7. 对 `exclusive_dynamic + shared_cpu_weights=false` 先在 eager 模式验证 MC2 Decode 请求级精度，再打开图模式验证 MC2 Decode capture/replay；同时验证 ALLTOALL Prefill、每个 rank 的 CPU/NPU ownership 并集恰好等于本 rank EP shard、不同 rank 互不重叠，且日志始终显示 `cross_rank_weight_transfer=False`。
 
 ## 官方参考
 

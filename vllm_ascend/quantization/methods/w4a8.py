@@ -602,11 +602,11 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             # Prefill regime: num_tokens > offload_threshold.
             #  - single-card: pool holds all experts, identity log2phy.
             #  - multi-card:  pool holds this rank's EP shard (loaded by
-            #    update_weights_multi_card); AllGather comm, shard config.
-            # Multi-card also uses the pool during profile_run (AllGather needs
+            #    update_weights_multi_card); ALLTOALL comm, shard config.
+            # Multi-card also uses the pool during profile_run (ALLTOALL needs
             # an allocated weight buffer; dummy data, garbage weights are fine).
             # Drive the multi-card split off the comm TYPE (MC2=decode,
-            # AllGather=prefill) — the single source of truth — so decode and
+            # ALLTOALL=prefill) — the single source of truth — so decode and
             # prefill never disagree at the mc2_capacity/offload_threshold gap.
             if is_mc:
                 prefill_regime = _EXTRA_CTX.moe_comm_type != MoECommType.MC2

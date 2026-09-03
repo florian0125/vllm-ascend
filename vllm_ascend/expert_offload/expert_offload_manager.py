@@ -3197,8 +3197,8 @@ class ExpertOffloadManager:
                                       stage: str) -> None:
         """Report the first finite result and every non-finite local result.
 
-        This diagnostic is deliberately limited to the correctness-gated
-        rank-local exclusive mode.  ``item()`` synchronizes the NPU, which is
+        This diagnostic is deliberately limited to rank-local exclusive mode.
+        ``item()`` synchronizes the NPU, which is
         acceptable under ``moe_offload_debug`` while validating this path but
         must not leak into the normal performance path.  Diagnostics must not
         abort model startup if a caller accidentally passes a result wrapper.
@@ -3382,8 +3382,8 @@ class ExpertOffloadManager:
         # CPU topk_ids_h, not the live NPU tensor).
 
         # PREFILL regime: the MC2 dispatch kernel caps at 512 tokens, so prefill
-        # uses AllGather + a per-rank EP shard loaded into the prefill pool
-        # (selected by select_moe_comm_method -> ALLGATHER for multi-card large
+        # uses ALLTOALL + a per-rank EP shard loaded into the prefill pool
+        # (selected by select_moe_comm_method -> ALLTOALL for multi-card large
         # batches). Drive off the comm TYPE (MC2=decode, else prefill) — the
         # single source of truth — so this stays in lockstep with apply().
         if self._mc_handle_prefill_regime(layer_idx):
