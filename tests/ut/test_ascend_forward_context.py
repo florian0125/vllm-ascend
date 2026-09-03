@@ -259,19 +259,17 @@ def test_select_moe_comm_method_uses_allgather_without_effective_expert_parallel
 
 
 @pytest.mark.parametrize(
-    ("hf_config", "num_tokens", "expected"),
+    ("hf_text_config", "num_tokens", "expected"),
     [
         (SimpleNamespace(num_experts_per_tok=2), 2, MoECommType.MC2),
         (SimpleNamespace(num_experts_per_tok=2), 3, MoECommType.ALLTOALL),
         (
-            SimpleNamespace(
-                text_config=SimpleNamespace(num_experts_per_token=4)),
+            SimpleNamespace(num_experts_per_token=4),
             1,
             MoECommType.MC2,
         ),
         (
-            SimpleNamespace(
-                text_config=SimpleNamespace(num_experts_per_token=4)),
+            SimpleNamespace(num_experts_per_token=4),
             2,
             MoECommType.ALLTOALL,
         ),
@@ -279,7 +277,7 @@ def test_select_moe_comm_method_uses_allgather_without_effective_expert_parallel
 )
 def test_multi_card_offload_capacity_supports_deepseek_and_kimi_k3(
     monkeypatch,
-    hf_config,
+    hf_text_config,
     num_tokens,
     expected,
 ):
@@ -304,9 +302,48 @@ def test_multi_card_offload_capacity_supports_deepseek_and_kimi_k3(
         ),
     )
     vllm_config = _make_vllm_config()
-    vllm_config.model_config.hf_config = hf_config
+    vllm_config.model_config.hf_text_config = hf_text_config
 
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
+
+
+def test_multi_card_offload_kimi_k3_ignores_stale_top_level_topk(
+    monkeypatch,
+):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A3,
+        capacity=8,
+        ep_world_size=8,
+    )
+    offload_config = SimpleNamespace(
+        expert_offload=True,
+        enable_multi_card=True,
+        moe_offload_debug=True,
+        shard_per_rank=True,
+        h2d_backend="torch",
+        shared_cpu_weights=False,
+        num_device_experts_list=[192],
+        num_device_experts_for_rank=lambda _layer, ep_size: 192 // ep_size,
+    )
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(expert_offload_config=offload_config),
+    )
+    vllm_config = _make_vllm_config(
+        top_k_experts=None,
+        num_experts_per_token=16,
+    )
+    vllm_config.model_config.hf_text_config.model_type = "kimi_linear"
+    vllm_config.model_config.hf_text_config.num_experts_per_tok = 32
+    vllm_config.model_config.hf_config = SimpleNamespace(
+        num_experts_per_tok=32,
+        text_config=SimpleNamespace(num_experts_per_token=16),
+    )
+
+    assert afc.get_moe_topk(vllm_config) == 16
+    assert afc.select_moe_comm_method(1, vllm_config) == MoECommType.MC2
 
 
 @pytest.mark.parametrize(

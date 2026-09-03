@@ -18,7 +18,7 @@ from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_moe_topk
 from vllm_ascend.expert_offload.h2d_transfer import (
     CopyDirection,
     H2DCopyTask,
@@ -165,17 +165,11 @@ class ExpertOffloadManager:
         # actual weight and placement sizes are resolved per MoE layer.
         self.num_device_experts = min(
             self.offload_config.num_device_experts_list)
-        # topk: 标准 MoE 用 num_experts_per_tok;Kimi-K3 用 num_experts_per_token(在 text_config)
-        _hf = vllm_config.model_config.hf_config
-        _tc = getattr(_hf, "text_config", None)
-        self.topk = (
-            getattr(_hf, "num_experts_per_tok", None)
-            or getattr(_hf, "num_experts_per_token", None)
-            or getattr(_tc, "num_experts_per_tok", None)
-            or getattr(_tc, "num_experts_per_token", None)
-        )
+        # Match the FusedMoE layer, which is built from hf_text_config. A
+        # multimodal top-level config may retain a different, stale TopK.
+        self.topk = get_moe_topk(vllm_config)
         assert self.topk, ("offload: cannot find num_experts_per_tok/num_experts_per_token "
-                           "on hf_config/text_config")
+                           "on hf_text_config")
         self.topk = int(self.topk)
         self.offload_threshold = self.num_device_experts // self.topk
 
@@ -364,6 +358,11 @@ class ExpertOffloadManager:
         self._prefill_w13_scale_bias: list[torch.Tensor] = []
         self._prefill_w2_scale_bias: list[torch.Tensor] = []
         self._prefill_log2phy: torch.Tensor = None              # identity [0..127]
+        # Multi-card All2All temporarily expands the dispatcher from the
+        # decode cache size to the full EP shard. Build its CPU metadata and
+        # NPU mapping once, before ACL graph capture; apply() only swaps refs.
+        self._prefill_local_expert_indices: list[int] | None = None
+        self._prefill_expert_ids_per_ep_rank: torch.Tensor | None = None
         self._prefill_initialized: bool = False
         self._skip_prefill: bool = False  # set during profile runs
 
@@ -2170,6 +2169,21 @@ class ExpertOffloadManager:
 
         # Prefill log2phy: identity — all experts mapped to their slots
         self._prefill_log2phy = torch.arange(ntotal, dtype=torch.int32, device=dev)
+
+        if self.enable_multi_card:
+            from vllm_ascend.expert_offload.multi_card_planner import (
+                all2all_expert_ids_per_ep_rank,
+                all2all_local_expert_indices,
+            )
+
+            self._prefill_local_expert_indices = all2all_local_expert_indices(
+                self.ep_rank, ntotal)
+            self._prefill_expert_ids_per_ep_rank = torch.tensor(
+                all2all_expert_ids_per_ep_rank(
+                    ntotal, self.num_total_experts),
+                dtype=torch.int32,
+                device=dev,
+            )
 
         # Pre-initialize all pool slots with layer 0 weights so that
         # profile_run / _dummy_run (which may use prefill path) has

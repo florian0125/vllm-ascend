@@ -44,6 +44,7 @@ _MEGA_MOE_SUPPORTED = importlib.util.find_spec("cann_ops_transformer") is not No
 _MEGA_MOE_TOKENS_PER_RANK_LIMIT = 4096
 _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT = 512
 _MC2_TOKENS_PER_RANK_LIMIT = 512
+_KIMI_MOE_MODEL_TYPES = frozenset({"kimi_k3", "kimi_linear"})
 
 
 @contextmanager
@@ -345,12 +346,7 @@ def _select_a5_moe_comm_method(
     vllm_config: VllmConfig,
     mc2_tokens_capacity: int,
 ) -> MoECommType:
-    hf_text_config = vllm_config.model_config.hf_text_config
-    num_experts_per_tok = getattr(hf_text_config, "num_experts_per_tok", None)
-    if num_experts_per_tok is None:
-        num_experts_per_tok = getattr(hf_text_config, "top_k_experts", None)
-    if num_experts_per_tok is None:
-        num_experts_per_tok = getattr(hf_text_config, "num_experts_per_token", 1)
+    num_experts_per_tok = get_moe_topk(vllm_config) or 1
 
     ep_world_size = get_ep_group().world_size
     if num_tokens <= mc2_tokens_capacity and ep_world_size > 1:
@@ -358,6 +354,38 @@ def _select_a5_moe_comm_method(
     if ep_world_size <= num_experts_per_tok:
         return MoECommType.ALLGATHER
     return MoECommType.ALLTOALL
+
+
+def get_moe_topk(vllm_config: VllmConfig) -> int | None:
+    """Resolve the runtime MoE TopK from the canonical text config.
+
+    Multimodal models can retain stale MoE attributes on the top-level HF
+    config while the language model is built from ``hf_text_config``. Kimi K3
+    can additionally carry both naming variants in its text config, while its
+    FusedMoE layer specifically uses ``num_experts_per_token``.
+    """
+    hf_text_config = vllm_config.model_config.hf_text_config
+    model_type = getattr(hf_text_config, "model_type", "")
+    if model_type in _KIMI_MOE_MODEL_TYPES:
+        # Kimi's FusedMoE constructor reads num_experts_per_token. Some K3
+        # checkpoints also carry num_experts_per_tok=32 as compatibility
+        # metadata, but that is not the runtime routed-expert count.
+        attr_names = (
+            "num_experts_per_token",
+            "num_experts_per_tok",
+            "top_k_experts",
+        )
+    else:
+        attr_names = (
+            "num_experts_per_tok",
+            "top_k_experts",
+            "num_experts_per_token",
+        )
+    for attr_name in attr_names:
+        value = getattr(hf_text_config, attr_name, None)
+        if value is not None:
+            return int(value)
+    return None
 
 
 def select_moe_comm_method(
@@ -454,17 +482,7 @@ def select_moe_comm_method(
         )
         _placement_scope = (
             "global" if _supports_global_placement else "owner")
-        _hf = getattr(vllm_config.model_config, "hf_config", None)
-        if _hf is None:
-            _hf = vllm_config.model_config.hf_text_config
-        _text_config = getattr(_hf, "text_config", None)
-        _topk = (
-            getattr(_hf, "num_experts_per_tok", None)
-            or getattr(_hf, "num_experts_per_token", None)
-            or getattr(_text_config, "num_experts_per_tok", None)
-            or getattr(_text_config, "num_experts_per_token", None)
-            or 1
-        )
+        _topk = get_moe_topk(vllm_config) or 1
         # ``num_tokens`` is the per-rank execution shape. TP ranks can hold
         # replicated token rows and idle DP ranks can execute dummy rows to
         # stay in collective lockstep, so multiplying this bound by EP size

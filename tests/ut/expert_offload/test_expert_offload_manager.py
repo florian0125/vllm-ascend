@@ -1220,6 +1220,32 @@ def test_prefill_weight_and_quant_attributes_are_one_h2d_task_batch():
         manager._prefill_w13_scale[0][1].data_ptr()
 
 
+def test_create_prefill_pool_precomputes_all2all_dispatcher_metadata():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager._init_prefill_pool_state()
+    manager.num_device_layers = 1
+    manager.num_total_experts = 8
+    manager.enable_multi_card = True
+    manager._ep_info_resolved = True
+    manager._ep_size = 2
+    manager._ep_rank = 1
+    manager.moe_layers = [SimpleNamespace(
+        w13_weight=torch.empty((2, 3, 4), dtype=torch.uint8),
+        w2_weight=torch.empty((2, 4, 3), dtype=torch.uint8),
+    )]
+    manager._cast_prefill_pool_format = MagicMock()
+    manager._init_prefill_pool_data = MagicMock()
+
+    manager.create_prefill_pool()
+
+    assert manager._prefill_local_expert_indices == [4, 5, 6, 7]
+    assert torch.equal(
+        manager._prefill_expert_ids_per_ep_rank,
+        torch.tensor([0, 1, 2, 3, 0, 1, 2, 3], dtype=torch.int32),
+    )
+    assert manager._prefill_initialized is True
+
+
 def test_quant_attributes_are_represented_as_h2d_tasks():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager.offload_config = ExpertOffloadConfig({"shard_per_rank": False})

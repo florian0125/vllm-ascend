@@ -47,6 +47,11 @@ def _make_manager(layer: SimpleNamespace, *, offload_threshold: int = 4) -> Mock
     manager._prefill_w13_scale = [object()]
     manager._prefill_w2_scale = [object()]
     manager._prefill_log2phy = torch.arange(NUM_EXPERTS, dtype=torch.int32)
+    manager._prefill_local_expert_indices = list(range(NUM_EXPERTS // 2))
+    manager._prefill_expert_ids_per_ep_rank = torch.tensor(
+        [index % (NUM_EXPERTS // 2) for index in range(NUM_EXPERTS)],
+        dtype=torch.int32,
+    )
     return manager
 
 
@@ -299,6 +304,7 @@ def test_multi_card_prefill_uses_ep_shard_and_restores_dispatcher():
     layer = _make_layer(multi_card=True)
     manager = _make_manager(layer)
     manager._skip_prefill = True
+    manager._prefill_local_expert_indices = [4, 5, 6, 7]
     shard_map = torch.tensor([-1, -1, -1, -1, 0, 1, 2, 3], dtype=torch.int32)
     manager._get_shard_expert_map.return_value = shard_map
     original_expert_ids = torch.arange(NUM_EXPERTS, dtype=torch.int32)
@@ -322,15 +328,19 @@ def test_multi_card_prefill_uses_ep_shard_and_restores_dispatcher():
         )
         return object()
 
-    result = _run_apply(
-        method,
-        layer,
-        manager,
-        comm_method,
-        MoECommType.ALLTOALL,
-        num_tokens=2,
-        build_side_effect=capture_state,
-    )
+    with patch(
+        "vllm_ascend.quantization.methods.w4a8_mxfp4.torch.tensor",
+        side_effect=AssertionError("device tensor created during apply"),
+    ):
+        result = _run_apply(
+            method,
+            layer,
+            manager,
+            comm_method,
+            MoECommType.ALLTOALL,
+            num_tokens=2,
+            build_side_effect=capture_state,
+        )
 
     manager.update_weights.assert_not_called()
     manager.update_weights_multi_card.assert_called_once()
@@ -373,6 +383,43 @@ def test_prefill_restores_state_when_fused_experts_raises():
 
     with pytest.raises(RuntimeError, match="GMM failed"):
         _run_apply(method, layer, manager, comm_method, MoECommType.ALLTOALL, num_tokens=2)
+
+    assert layer.local_num_experts == 4
+    assert layer.moe_config.num_local_experts == 4
+    assert dispatcher.num_experts_local == 2
+    assert dispatcher.num_local_experts == 2
+    assert dispatcher.local_expert_indices is original_local_indices
+    assert dispatcher.expert_ids_per_ep_rank is original_expert_ids
+
+
+def test_multi_card_prefill_rejects_missing_cached_dispatcher_metadata():
+    method = _make_method()
+    layer = _make_layer(multi_card=True)
+    manager = _make_manager(layer)
+    manager._prefill_local_expert_indices = None
+    original_expert_ids = torch.arange(NUM_EXPERTS, dtype=torch.int32)
+    original_local_indices = [0, 1]
+    dispatcher = SimpleNamespace(
+        ep_rank=0,
+        num_experts_local=2,
+        num_local_experts=2,
+        expert_ids_per_ep_rank=original_expert_ids,
+        local_expert_indices=original_local_indices,
+    )
+    comm_method = Mock(token_dispatcher=dispatcher)
+
+    with pytest.raises(
+        RuntimeError,
+        match="dispatcher metadata was not initialized",
+    ):
+        _run_apply(
+            method,
+            layer,
+            manager,
+            comm_method,
+            MoECommType.ALLTOALL,
+            num_tokens=2,
+        )
 
     assert layer.local_num_experts == 4
     assert layer.moe_config.num_local_experts == 4

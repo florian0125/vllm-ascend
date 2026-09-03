@@ -659,16 +659,23 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                 # its contiguous local_expert_indices / all-to-all splits match.
                 # All2All routes via local_expert_indices, so NO log2phy and the
                 # shard expert_map is unused (All2All doesn't read expert_map).
+                if mgr._prefill_local_expert_indices is None:
+                    raise RuntimeError(
+                        "multi-card prefill dispatcher metadata was not "
+                        "initialized before graph capture")
+                if (_saved_td["expert_ids_per_ep_rank"] is not None
+                        and mgr._prefill_expert_ids_per_ep_rank is None):
+                    raise RuntimeError(
+                        "multi-card prefill dispatcher metadata was not "
+                        "initialized before graph capture")
                 shard = mgr.mc_shard_size
                 layer.moe_config.num_local_experts = shard
                 layer.local_num_experts = shard
                 if getattr(td, "num_local_experts", None) is not None:
                     td.num_local_experts = shard
-                    td.local_expert_indices = [td.ep_rank * shard + i for i in range(shard)]
-                    if td.expert_ids_per_ep_rank is not None:
-                        td.expert_ids_per_ep_rank = torch.tensor(
-                            [i % shard for i in range(mgr.num_total_experts)],
-                            dtype=torch.int32, device=td.expert_ids_per_ep_rank.device)
+                    td.local_expert_indices = mgr._prefill_local_expert_indices
+                    if _saved_td["expert_ids_per_ep_rank"] is not None:
+                        td.expert_ids_per_ep_rank = mgr._prefill_expert_ids_per_ep_rank
                 if getattr(td, "num_experts_local", None) is not None:
                     td.num_experts_local = shard
                 expert_map = mgr._get_shard_expert_map()

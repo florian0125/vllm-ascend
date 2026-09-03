@@ -310,20 +310,23 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
                 "local_expert_indices": getattr(token_dispatcher, "local_expert_indices", None),
             }
             if enable_multi_card:
+                if mgr._prefill_local_expert_indices is None:
+                    raise RuntimeError(
+                        "multi-card prefill dispatcher metadata was not "
+                        "initialized before graph capture")
+                if (_saved_dispatcher_state["expert_ids_per_ep_rank"] is not None
+                        and mgr._prefill_expert_ids_per_ep_rank is None):
+                    raise RuntimeError(
+                        "multi-card prefill dispatcher metadata was not "
+                        "initialized before graph capture")
                 shard_size = mgr.mc_shard_size
                 layer.moe_config.num_local_experts = shard_size
                 layer.local_num_experts = shard_size
                 if getattr(token_dispatcher, "num_local_experts", None) is not None:
                     token_dispatcher.num_local_experts = shard_size
-                    token_dispatcher.local_expert_indices = [
-                        token_dispatcher.ep_rank * shard_size + index for index in range(shard_size)
-                    ]
-                    if token_dispatcher.expert_ids_per_ep_rank is not None:
-                        token_dispatcher.expert_ids_per_ep_rank = torch.tensor(
-                            [index % shard_size for index in range(mgr.num_total_experts)],
-                            dtype=torch.int32,
-                            device=token_dispatcher.expert_ids_per_ep_rank.device,
-                        )
+                    token_dispatcher.local_expert_indices = mgr._prefill_local_expert_indices
+                    if _saved_dispatcher_state["expert_ids_per_ep_rank"] is not None:
+                        token_dispatcher.expert_ids_per_ep_rank = mgr._prefill_expert_ids_per_ep_rank
                 if getattr(token_dispatcher, "num_experts_local", None) is not None:
                     token_dispatcher.num_experts_local = shard_size
                 expert_map = mgr._get_shard_expert_map()
