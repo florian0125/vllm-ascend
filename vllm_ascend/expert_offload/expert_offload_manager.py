@@ -1290,6 +1290,30 @@ class ExpertOffloadManager:
         self._materialize_exclusive_shared_bootstrap()
         self._materialize_exclusive_sharded_bootstrap()
 
+    @staticmethod
+    def _tensor_storage_window(
+        tensor: torch.Tensor,
+        nbytes: int,
+    ) -> torch.UntypedStorage:
+        """Return this tensor view's byte range within its backing storage.
+
+        ``tensor.untyped_storage()`` returns the complete backing storage and
+        does not apply ``tensor.storage_offset()``. That distinction matters
+        for one-expert views into the compact Torch shared mmap: copying a
+        converted expert into the unsliced storage would target the whole
+        shared pool. Private bootstrap tensors have offset zero and use the
+        same bounded path.
+        """
+        storage = tensor.untyped_storage()
+        start = tensor.storage_offset() * tensor.element_size()
+        end = start + nbytes
+        if nbytes <= 0 or start < 0 or end > storage.nbytes():
+            raise RuntimeError(
+                "Tensor storage window is outside its backing storage: "
+                f"offset_bytes={start}, requested_bytes={nbytes}, "
+                f"storage_bytes={storage.nbytes()}")
+        return storage[start:end]
+
     def _cast_cpu_weights_to_device_format(self, mxfp4: bool = False,
                                             w4a8_dynamic: bool = False):
         """Relayout resident CPU w13/w2 expert buffers into the device format.
@@ -1364,18 +1388,22 @@ class ExpertOffloadManager:
                         self, "_exclusive_sharded_bootstrap_layers", set()))
                 if shared_bootstrap or sharded_bootstrap:
                     # Checkpoint buffers contain compact canonical CPU owners
-                    # followed by the initial local NPU owners.  All of them
-                    # are temporary CPU tensors at this point, so write the
-                    # converted bytes back directly; ownership-aware accessors
-                    # intentionally reject the NPU-owned suffix.
-                    self.w13_weights_cpu[layer_id][
-                        local_i].untyped_storage().copy_(
-                            w13_storage[local_i * per_w13:
-                                        (local_i + 1) * per_w13])
-                    self.w2_weights_cpu[layer_id][
-                        local_i].untyped_storage().copy_(
-                            w2_storage[local_i * per_w2:
-                                      (local_i + 1) * per_w2])
+                    # followed by the initial local NPU owners. Shared-mode
+                    # prefix entries are views into the whole mmap, whereas
+                    # the suffix and rank-local mode use private tensors. Apply
+                    # each tensor view's byte offset before writing either.
+                    self._tensor_storage_window(
+                        self.w13_weights_cpu[layer_id][local_i],
+                        per_w13,
+                    ).copy_(
+                        w13_storage[local_i * per_w13:
+                                    (local_i + 1) * per_w13])
+                    self._tensor_storage_window(
+                        self.w2_weights_cpu[layer_id][local_i],
+                        per_w2,
+                    ).copy_(
+                        w2_storage[local_i * per_w2:
+                                   (local_i + 1) * per_w2])
                     continue
                 if self.exclusive_dynamic_enabled:
                     cpu_slot = (

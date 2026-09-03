@@ -1828,6 +1828,25 @@ def test_exclusive_shared_replacement_keeps_bootstrap_suffix_private():
     manager._allocate_torch_shared_expert_buffer.assert_called_once()
 
 
+def test_tensor_storage_window_honors_shared_expert_view_offset():
+    backing = torch.arange(12, dtype=torch.uint8).reshape(3, 4)
+    expert_view = backing[1]
+
+    # A tensor view exposes the complete backing storage unless its logical
+    # storage_offset is applied explicitly.
+    assert expert_view.untyped_storage().nbytes() == 12
+    assert expert_view.storage_offset() == 4
+    destination = ExpertOffloadManager._tensor_storage_window(expert_view, 4)
+    assert destination.nbytes() == 4
+    destination.copy_(torch.full((4,), 99, dtype=torch.uint8).untyped_storage())
+
+    assert backing.tolist() == [
+        [0, 1, 2, 3],
+        [99, 99, 99, 99],
+        [8, 9, 10, 11],
+    ]
+
+
 def test_exclusive_sharded_numeric_log_reports_first_ok_and_each_failure():
     manager = _exclusive_sharded_runtime_manager()
     manager._debug = True
