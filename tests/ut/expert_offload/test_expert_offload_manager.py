@@ -490,8 +490,13 @@ def test_mc_debug_gloo_log_pairs_collective_sequences():
 
 def test_mc_debug_callback_logs_python_error_and_exit():
     manager = _manager_for_mc_debug()
+
+    def fail_in_shared_swap(_args, context):
+        context["stage"] = "shared_swap_device_consensus"
+        raise RuntimeError("debug failure")
+
     manager._update_weights_multi_card_impl = MagicMock(
-        side_effect=RuntimeError("debug failure"))
+        side_effect=fail_in_shared_swap)
     args = (
         None, None, None, 39, 16, False, None, False, None, "softmax",
         None, None, True,
@@ -499,7 +504,9 @@ def test_mc_debug_callback_logs_python_error_and_exit():
 
     with patch(
         "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info:
+    ) as log_info, patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.exception"
+    ) as log_exception:
         try:
             manager._update_weights_multi_card(args)
         except RuntimeError as exc:
@@ -509,7 +516,13 @@ def test_mc_debug_callback_logs_python_error_and_exit():
 
     events = [entry.args[1] for entry in log_info.call_args_list]
     assert events == ["CB_ENTER", "CB_ERROR", "CB_EXIT"]
+    error_details = log_info.call_args_list[1].args[-1]
+    assert "error_stage=shared_swap_device_consensus" in error_details
+    assert "error_type=RuntimeError" in error_details
+    assert "error_message=RuntimeError('debug failure')" in error_details
     assert "status=error:RuntimeError" in log_info.call_args_list[-1].args[-1]
+    log_exception.assert_called_once()
+    assert "callback traceback" in log_exception.call_args.args[0]
     assert manager._mc_debug_active_callbacks == 0
 
 
@@ -1997,6 +2010,7 @@ def test_exclusive_sharded_decode_rejects_an_empty_local_slot():
 
 def test_exclusive_shared_swap_commits_compact_cpu_and_global_ownership():
     manager = _exclusive_shared_runtime_manager()
+    manager._debug = True
     layer = SimpleNamespace(
         w13_weight=torch.stack([
             torch.zeros(4, dtype=torch.uint8),
@@ -2011,6 +2025,13 @@ def test_exclusive_shared_swap_commits_compact_cpu_and_global_ownership():
     )
     log2phy = torch.empty(4, dtype=torch.int32)
     ep_group = SimpleNamespace(cpu_group=object())
+    debug_context = {
+        "layer_idx": 0,
+        "layer_call": 1,
+        "callback_seq": 1,
+        "source": "graph_callback",
+        "is_prefetch": True,
+    }
 
     def gather(output, value, group):
         assert group is ep_group.cpu_group
@@ -2025,9 +2046,12 @@ def test_exclusive_shared_swap_commits_compact_cpu_and_global_ownership():
             "torch_npu.npu.stream",
             return_value=nullcontext(),
         ),
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
+        ) as log_info,
     ):
         manager._swap_expert_weights_multi_card_shared(
-            layer, 0, placement, 1, log2phy)
+            layer, 0, placement, 1, log2phy, debug_context)
 
     assert torch.equal(
         manager._torch_shared_cpu_buffers[(0, "w13")][0],
@@ -2040,6 +2064,82 @@ def test_exclusive_shared_swap_commits_compact_cpu_and_global_ownership():
     assert manager._eid_to_cpu_slot[0] == [0, -1, -1, 1]
     assert manager._eid_to_npu_slot[0] == [-1, 1, 0, -1]
     assert torch.equal(log2phy, placement.log2phy)
+    debug_events = [
+        entry.args[1] for entry in log_info.call_args_list
+        if entry.args and entry.args[0].startswith("[MC_DEBUG]")
+    ]
+    assert debug_events == ["SHARED_SWAP_PLAN"]
+    assert debug_context["stage"] == "shared_swap_complete"
+
+
+def test_exclusive_shared_swap_logs_local_device_copy_failure():
+    manager = _exclusive_shared_runtime_manager()
+    manager._debug = True
+    manager.h2d_transport.copy_batch = MagicMock(
+        side_effect=RuntimeError("device copy failed"))
+    layer = SimpleNamespace(
+        w13_weight=torch.stack([
+            torch.zeros(4, dtype=torch.uint8),
+        ]),
+        w2_weight=torch.stack([
+            torch.full((2,), 10, dtype=torch.uint8),
+        ]),
+    )
+    placement = SimpleNamespace(
+        per_rank_experts=[[2], [1]],
+        log2phy=torch.tensor([-1, 1, 0, -1], dtype=torch.int32),
+    )
+    log2phy = torch.empty(4, dtype=torch.int32)
+    ep_group = SimpleNamespace(cpu_group=object())
+    debug_context = {
+        "layer_idx": 0,
+        "layer_call": 1,
+        "callback_seq": 1,
+        "source": "graph_callback",
+        "is_prefetch": True,
+    }
+
+    def gather(output, value, group):
+        assert group is ep_group.cpu_group
+        output[:] = [value, value]
+
+    with (
+        patch("torch.distributed.all_gather_object", side_effect=gather),
+        patch("vllm.distributed.parallel_state.get_ep_group",
+              return_value=ep_group),
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager."
+            "torch_npu.npu.stream",
+            return_value=nullcontext(),
+        ),
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
+        ) as log_info,
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager.logger.exception"
+        ) as log_exception,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="Exclusive shared swap failed during device copy.*"
+                  "device copy failed",
+        ):
+            manager._swap_expert_weights_multi_card_shared(
+                layer, 0, placement, 1, log2phy, debug_context)
+
+    debug_calls = [
+        entry for entry in log_info.call_args_list
+        if entry.args and entry.args[0].startswith("[MC_DEBUG]")
+    ]
+    assert [entry.args[1] for entry in debug_calls] == [
+        "SHARED_SWAP_PLAN", "SHARED_SWAP_LOCAL_ERROR"
+    ]
+    error_details = debug_calls[-1].args[-1]
+    assert "error_stage=device_copy" in error_details
+    assert "error_type=RuntimeError" in error_details
+    assert "error_message=RuntimeError('device copy failed')" in error_details
+    assert debug_context["stage"] == "shared_swap_device_consensus"
+    log_exception.assert_called_once()
 
 
 def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():

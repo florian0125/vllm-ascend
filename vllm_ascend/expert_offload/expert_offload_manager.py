@@ -4142,13 +4142,30 @@ class ExpertOffloadManager:
             or (len(args) == 13 and bool(args[12])))
         context = self._begin_mc_debug_callback(
             layer_idx, is_prefetch, from_graph_callback)
+        context["stage"] = "callback_body"
         status = "ok"
         try:
             return self._update_weights_multi_card_impl(args, context)
         except BaseException as exc:
             status = f"error:{type(exc).__name__}"
+            error_stage = (context or {}).get("stage", "unknown")
             self._log_mc_debug_event(
-                "CB_ERROR", context, error_type=type(exc).__name__)
+                "CB_ERROR",
+                context,
+                error_stage=error_stage,
+                error_type=type(exc).__name__,
+                error_message=repr(exc),
+            )
+            logger.exception(
+                "[MC_DEBUG] callback traceback rank=%s layer=%s "
+                "source=%s prefetch=%s stage=%s error=%r",
+                self.ep_rank,
+                layer_idx,
+                context.get("source", "unknown"),
+                is_prefetch,
+                error_stage,
+                exc,
+            )
             raise
         finally:
             self._end_mc_debug_callback(context, status)
@@ -4181,6 +4198,8 @@ class ExpertOffloadManager:
         # counting. Each rank changes only its active local rows; the following
         # all-reduce makes the substituted route counts globally consistent.
         if do_substitution:
+            if debug_context is not None:
+                debug_context["stage"] = "substitution"
             self._apply_multi_card_substitution(
                 layer_idx, topk_ids_h, router_logits_h, log2phy_h,
                 mc2_mask_h, scoring_func, correction_bias_h, cpu_group)
@@ -4206,6 +4225,8 @@ class ExpertOffloadManager:
         if self._debug:
             self._log_mc_router_observation(layer_idx, topk_for_count)
 
+        if debug_context is not None:
+            debug_context["stage"] = "count_and_hotness"
         counts_start = time.perf_counter() if self._debug else None
         global_counts, cache_on, hotness, prev_log2phy = \
             self._gather_global_counts_and_hotness(layer_idx, topk_for_count,
@@ -4218,6 +4239,8 @@ class ExpertOffloadManager:
         # MemFabric SHARED exposes peer shard pointers, so published layers may
         # use global load-balanced placement. Unpublished late layers (MTP)
         # retain owner-shard placement until their pointers are available.
+        if debug_context is not None:
+            debug_context["stage"] = "shared_layer_ready"
         if (self.exclusive_shared_cpu_enabled
                 and not self._shared_h2d_layer_ready(layer_idx)):
             raise RuntimeError(
@@ -4227,6 +4250,8 @@ class ExpertOffloadManager:
             getattr(self, '_shard_size', None)
             if (self.offload_config.shard_per_rank
                 and not self._shared_h2d_layer_ready(layer_idx)) else None)
+        if debug_context is not None:
+            debug_context["stage"] = "placement"
         placement_start = time.perf_counter() if self._debug else None
         placement = plan_placement(global_counts, self.ep_size, per_rank_slots,
                                    prev_log2phy, hotness, force_shard=force_shard)
@@ -4245,6 +4270,8 @@ class ExpertOffloadManager:
         # late to switch collectives safely: every rank has already entered the
         # MC2 execution path.  Fail explicitly instead of mapping experts to
         # unrelated weights via a spread log2phy and silently corrupting output.
+        if debug_context is not None:
+            debug_context["stage"] = "capacity_check"
         if placement.unassigned:
             layer_capacity = per_rank_slots * self.ep_size
             cpu_mode = (
@@ -4272,17 +4299,23 @@ class ExpertOffloadManager:
         # that placement retains a persistent hot set across steps.
         active_set = (set(global_counts.nonzero(as_tuple=True)[0].tolist())
                       if global_counts is not None else None)
+        if debug_context is not None:
+            debug_context["stage"] = "resident_diff"
         resident_map, hits, misses = self._compute_resident_hits(
             layer_idx, my_experts, cache_on, active_set)
         h2d_start = time.perf_counter() if self._debug and misses else None
         if self.exclusive_shared_cpu_enabled:
+            if debug_context is not None:
+                debug_context["stage"] = "shared_swap_lock"
             lock = self._exclusive_layer_locks[layer_idx]
             with lock:
                 self._swap_expert_weights_multi_card_shared(
                     layer, layer_idx, placement, per_rank_slots,
-                    log2phy_h)
+                    log2phy_h, debug_context)
             resident_map = self._mc_resident[layer_idx]
         elif self.exclusive_sharded_cpu_enabled:
+            if debug_context is not None:
+                debug_context["stage"] = "sharded_swap"
             lock = self._exclusive_layer_locks[layer_idx]
             with lock:
                 self._swap_expert_weights_multi_card_sharded(
@@ -4290,6 +4323,8 @@ class ExpertOffloadManager:
                     log2phy_h)
             resident_map = self._mc_resident[layer_idx]
         elif misses:
+            if debug_context is not None:
+                debug_context["stage"] = "h2d_load"
             self._h2d_load_mc_misses(layer, layer_idx, misses, resident_map,
                                      debug_context)
         h2d_ms = ((time.perf_counter() - h2d_start) * 1000.0
@@ -4300,8 +4335,12 @@ class ExpertOffloadManager:
         # my_experts would leave remote experts at -1 -> clamp 0 -> zero cross-
         # rank traffic -> MC2 uniform-mode dispatch deadlocks.
         if not self.exclusive_shared_cpu_enabled:
+            if debug_context is not None:
+                debug_context["stage"] = "publish_log2phy"
             log2phy_h.copy_(placement.log2phy)
         if self._debug:
+            if debug_context is not None:
+                debug_context["stage"] = "cache_log"
             total_ms = (time.perf_counter() - decode_start) * 1000.0
             self._log_mc_decode_cache(
                 layer_idx, my_experts, hits, misses, resident_map,
@@ -4859,6 +4898,7 @@ class ExpertOffloadManager:
         placement,
         per_rank_slots: int,
         log2phy_h,
+        debug_context=None,
     ) -> None:
         """Atomically swap this rank's slots and commit global ownership.
 
@@ -4871,6 +4911,8 @@ class ExpertOffloadManager:
         from vllm.distributed.parallel_state import get_ep_group
 
         cpu_group = get_ep_group().cpu_group
+        if debug_context is not None:
+            debug_context["stage"] = "shared_swap_plan_diff"
         global_swaps = self._exclusive_shared_swaps_from_placement(
             layer_idx, placement, per_rank_slots)
         base = self.ep_rank * per_rank_slots
@@ -4880,8 +4922,20 @@ class ExpertOffloadManager:
             in global_swaps
             if base <= physical_slot < base + per_rank_slots
         ]
+        if self._debug:
+            sample_limit = getattr(
+                self, "_DEBUG_EXPERT_SAMPLE_LIMIT", 8)
+            self._log_mc_debug_event(
+                "SHARED_SWAP_PLAN",
+                debug_context,
+                global_swaps=len(global_swaps),
+                local_swaps=len(local_swaps),
+                swap_sample=global_swaps[:sample_limit],
+            )
         scratch_bundles = []
         local_error = None
+        if debug_context is not None:
+            debug_context["stage"] = "shared_swap_device_copy"
         try:
             scratch_bundles = [
                 self._allocate_exclusive_swap_bundle(layer_idx, cpu_slot)
@@ -4905,12 +4959,31 @@ class ExpertOffloadManager:
         except BaseException as exc:
             local_error = (
                 f"rank={self.ep_rank} {type(exc).__name__}: {exc}")
+            self._log_mc_debug_event(
+                "SHARED_SWAP_LOCAL_ERROR",
+                debug_context,
+                error_stage="device_copy",
+                error_type=type(exc).__name__,
+                error_message=repr(exc),
+            )
+            if self._debug:
+                logger.exception(
+                    "[EXCLUSIVE-SHARED-SWAP] local traceback rank=%s "
+                    "layer=%s stage=device_copy error=%r",
+                    self.ep_rank,
+                    layer_idx,
+                    exc,
+                )
         device_errors = [None] * self.ep_size
+        if debug_context is not None:
+            debug_context["stage"] = "shared_swap_device_consensus"
         dist.all_gather_object(
             device_errors, local_error, group=cpu_group)
         self._raise_distributed_swap_errors("device copy", device_errors)
 
         local_error = None
+        if debug_context is not None:
+            debug_context["stage"] = "shared_swap_cpu_commit"
         try:
             for (_, _, _, cpu_slot), scratch in zip(
                     local_swaps, scratch_bundles):
@@ -4919,10 +4992,29 @@ class ExpertOffloadManager:
         except BaseException as exc:
             local_error = (
                 f"rank={self.ep_rank} {type(exc).__name__}: {exc}")
+            self._log_mc_debug_event(
+                "SHARED_SWAP_LOCAL_ERROR",
+                debug_context,
+                error_stage="shared_cpu_commit",
+                error_type=type(exc).__name__,
+                error_message=repr(exc),
+            )
+            if self._debug:
+                logger.exception(
+                    "[EXCLUSIVE-SHARED-SWAP] local traceback rank=%s "
+                    "layer=%s stage=shared_cpu_commit error=%r",
+                    self.ep_rank,
+                    layer_idx,
+                    exc,
+                )
         cpu_errors = [None] * self.ep_size
+        if debug_context is not None:
+            debug_context["stage"] = "shared_swap_cpu_consensus"
         dist.all_gather_object(cpu_errors, local_error, group=cpu_group)
         self._raise_distributed_swap_errors("shared CPU commit", cpu_errors)
 
+        if debug_context is not None:
+            debug_context["stage"] = "shared_swap_ownership_commit"
         for physical_slot, incoming_eid, victim_eid, cpu_slot in global_swaps:
             self._cpu_slot_to_eid[layer_idx][cpu_slot] = victim_eid
             self._eid_to_cpu_slot[layer_idx][incoming_eid] = -1
@@ -4937,7 +5029,11 @@ class ExpertOffloadManager:
             if int(eid) >= 0
         }
         log2phy_h.copy_(placement.log2phy)
+        if debug_context is not None:
+            debug_context["stage"] = "shared_swap_ownership_validate"
         self._validate_exclusive_ownership(layer_idx)
+        if debug_context is not None:
+            debug_context["stage"] = "shared_swap_complete"
         if self._debug and global_swaps:
             logger.info(
                 "[EXCLUSIVE-SHARED-SWAP] layer=%d rank=%d "
