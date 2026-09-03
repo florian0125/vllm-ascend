@@ -150,6 +150,8 @@ def test_exclusive_shared_allocates_compact_pool_and_one_writer_partition():
     manager._torch_shared_cpu_buffers = {}
     manager.moe_layers = []
     manager.cache_policy = None
+    manager._allocate_expert_host_tensor = (
+        lambda shape, dtype: torch.empty(shape, dtype=dtype))
 
     def allocate(layer_idx, name, shape, dtype):
         count = len(manager._cpu_slot_to_eid[layer_idx])
@@ -173,7 +175,13 @@ def test_exclusive_shared_allocates_compact_pool_and_one_writer_partition():
     assert manager._cpu_slot_to_eid[0] == [4, 5, 6, 7]
     assert manager._torch_shared_cpu_buffers[(0, "w13")].shape[0] == 4
     assert manager._exclusive_shared_local_cpu_slots[0] == [2, 3]
-    assert len(manager.w13_weights_cpu[0]) == 2
+    assert len(manager.w13_weights_cpu[0]) == 4
+    assert len(manager.w2_weights_cpu[0]) == 4
+    assert manager._exclusive_shared_bootstrap_layers == {0}
+    assert manager._checkpoint_cpu_local(0, 0) is None
+    assert manager._checkpoint_cpu_local(0, 1) is None
+    assert manager._checkpoint_cpu_local(0, 2) == 2
+    assert manager._checkpoint_cpu_local(0, 3) == 3
     assert manager._checkpoint_cpu_local(0, 4) is None
     assert manager._checkpoint_cpu_local(0, 6) == 0
     assert manager._checkpoint_cpu_local(0, 7) == 1
@@ -1601,6 +1609,7 @@ def _exclusive_shared_runtime_manager():
     manager._exclusive_prefill_comm_buffers = {}
     manager._exclusive_shared_local_cpu_slots = [[0]]
     manager._exclusive_shared_cpu_slot_to_local = [{0: 0}]
+    manager._exclusive_shared_bootstrap_layers = set()
     manager._init_exclusive_ownership(
         0, ntotal=4, ndev=2, npu_eids=[0, 1])
     manager.w13_expert_size_bytes = 4
@@ -1749,6 +1758,74 @@ def test_exclusive_sharded_bootstrap_materializes_and_drops_cpu_suffix():
         task.direction == CopyDirection.H2D
         for task in manager.h2d_transport.batches[0])
     manager._synchronize_h2d.assert_called_once_with()
+
+
+def test_exclusive_shared_bootstrap_materializes_and_drops_private_suffix():
+    manager = _exclusive_shared_runtime_manager()
+    # Rank 0 writes canonical shared-CPU expert 2. Its private suffix owns
+    # initial NPU expert 0 only until that processed representation reaches
+    # local device slot 0.
+    manager.w13_weights_cpu[0].append(
+        torch.full((4,), 20, dtype=torch.uint8))
+    manager.w2_weights_cpu[0].append(
+        torch.full((2,), 120, dtype=torch.uint8))
+    manager.scale_cpu_buffers = {
+        "w13_weight_scale": [[
+            torch.tensor([3.0]),
+            torch.tensor([20.0]),
+        ]],
+    }
+    manager.moe_layers = [SimpleNamespace(
+        w13_weight=torch.zeros((1, 4), dtype=torch.uint8),
+        w2_weight=torch.zeros((1, 2), dtype=torch.uint8),
+        w13_weight_scale=torch.zeros((1, 1)),
+    )]
+    manager._exclusive_shared_bootstrap_layers = {0}
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
+        return_value=nullcontext(),
+    ):
+        manager._materialize_exclusive_shared_bootstrap()
+
+    assert torch.equal(
+        manager.moe_layers[0].w13_weight[0],
+        torch.full((4,), 20, dtype=torch.uint8))
+    assert torch.equal(
+        manager.moe_layers[0].w2_weight[0],
+        torch.full((2,), 120, dtype=torch.uint8))
+    assert manager.moe_layers[0].w13_weight_scale[0].item() == 20
+    assert len(manager.w13_weights_cpu[0]) == 1
+    assert len(manager.w2_weights_cpu[0]) == 1
+    assert len(manager.scale_cpu_buffers["w13_weight_scale"][0]) == 1
+    assert manager._exclusive_shared_bootstrap_layers == set()
+    assert manager._cpu_slot_to_eid[0] == [2, 3]
+    assert manager._npu_slot_to_eid[0] == [0, 1]
+    assert all(
+        task.direction == CopyDirection.H2D
+        for task in manager.h2d_transport.batches[0])
+    manager._synchronize_h2d.assert_called_once_with()
+
+
+def test_exclusive_shared_replacement_keeps_bootstrap_suffix_private():
+    manager = _exclusive_shared_runtime_manager()
+    manager._exclusive_shared_bootstrap_layers = {0}
+    shared_destination = torch.zeros(1, dtype=torch.int64)
+    manager._allocate_torch_shared_expert_buffer = MagicMock(
+        return_value=[shared_destination])
+
+    result = manager._replace_torch_shared_expert_buffer(
+        0,
+        "w13_weight_scale",
+        [torch.tensor([11]), torch.tensor([22])],
+    )
+
+    assert len(result) == 2
+    assert result[0] is shared_destination
+    assert result[0].item() == 11
+    assert result[1].item() == 22
+    assert result[1] is not shared_destination
+    manager._allocate_torch_shared_expert_buffer.assert_called_once()
 
 
 def test_exclusive_sharded_numeric_log_reports_first_ok_and_each_failure():

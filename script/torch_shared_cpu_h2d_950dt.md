@@ -115,7 +115,7 @@ bash script/run_torch_shared_cpu_h2d_950dt.sh
 
 该模式的正式数据流是：
 
-1. 初始化时，全局初始 NPU 专家按 physical slot 切到各 rank，checkpoint 直接写入对应 rank 的 decode NPU 槽；剩余专家按紧凑 CPU slot 分配唯一 writer rank，写入所有 rank 共同映射的 mmap。
+1. 初始化时，全局初始 NPU 专家按 physical slot 切到各 rank。每个 rank 为本地初始 NPU owner 创建临时 CPU 后缀，使它们与共享 CPU 专家经过完全相同的 transpose、NZ/format-29 和量化元数据后处理，再 H2D 覆盖本地 decode NPU 槽并立即释放临时后缀。剩余专家按紧凑 CPU slot 分配唯一 writer rank，写入所有 rank 共同映射的 mmap。运行态仍满足紧凑共享 CPU 与全部 decode NPU 共同组成唯一一份 canonical 权重。
 2. Decode placement 保留未迁移专家的 rank 和 slot。miss 发生时，槽所在 rank 先把 victim D2H 到小型 pinned scratch，同时把 incoming 从共享 CPU H2D 到该槽；设备复制成功后才把 victim 写回 incoming 原来的紧凑 CPU slot。
 3. 全部 rank 通过 CPU group 汇总 device-copy 和 CPU-commit 状态；任一 rank 失败都会显式报错，所有权表和 `log2phy` 不会提交新版本。
 4. Prefill 仍使用静态 EP shard。CPU-owned 专家从共享 mmap H2D；本 rank NPU-owned 专家本地 D2D；其他 rank NPU-owned 专家先 pack 到零偏移 `uint8` NPU buffer，再通过独立 PyHCCL communicator 的 raw-pointer `HcclBatchSendRecv` 直接传到目标 rank。
@@ -245,10 +245,21 @@ bash script/inspect_torch_shared_cpu_pss.sh \
 `exclusive_dynamic` 初始化还会输出：
 
 ```text
+[EXCLUSIVE-SHARED-BOOTSTRAP] rank=.../... layer=... checkpoint_local_experts=... materialized_npu_slots=... shared_cpu_writer_slots=... canonical_shared_cpu_slots=... copy_tasks=... source_layout=cpu_postprocess cross_rank_weight_transfer=False status=ok
 [EXCLUSIVE-SHARED-AUDIT] ranks=8 layers=61 compact_shared_cpu_mib=... global_decode_npu_mib=... canonical_total_mib=... expected_one_model_mib=... cpu_experts_per_layer=[96, ...] global_npu_experts_per_layer=[32, ...] result=PASS_ONE_CANONICAL_MODEL
 ```
 
-这里的 `PASS_ONE_CANONICAL_MODEL` 验证逻辑容量和实际 storage 字节：紧凑共享 CPU 加全部 rank 的 decode NPU canonical storage 等于一份完整模型专家权重。它不包含 prefill pool、pinned swap scratch、Torch staging 和派生 fp32 scale；这些都是运行工作区或派生数据，不属于 canonical 权重。CPU 是否确实只有一份物理页仍以同一次运行中的 `TORCH_SHARED_CPU_PSS` 为准。
+每个 rank、每个 MoE 层都必须先出现一条 `EXCLUSIVE-SHARED-BOOTSTRAP ... status=ok`；它表示该 rank 的初始 NPU owner 已从统一 CPU 后处理结果覆盖到本地 NPU，且初始化临时后缀已释放。这里的 `PASS_ONE_CANONICAL_MODEL` 验证逻辑容量和实际 storage 字节：紧凑共享 CPU 加全部 rank 的 decode NPU canonical storage 等于一份完整模型专家权重。它不包含初始化临时后缀、prefill pool、pinned swap scratch、Torch staging 和派生 fp32 scale；这些都是初始化/运行工作区或派生数据，不属于 canonical 权重。CPU 是否确实只有一份物理页仍以同一次运行中的 `TORCH_SHARED_CPU_PSS` 为准。
+
+完整模型日志可先做这三项检查：
+
+```bash
+grep -c 'EXCLUSIVE-SHARED-BOOTSTRAP.*status=ok' model.log
+grep 'EXCLUSIVE-SHARED-AUDIT' model.log
+grep 'MC_ROUTER_NONFINITE' model.log
+```
+
+第一条数量应等于 `EP rank 数 × MoE 层数`，第二条应为 `PASS_ONE_CANONICAL_MODEL`，第三条不应有输出。最后仍需发送真实 `curl` 请求，确认正文为非空答案。
 
 发生 decode 迁移和 prefill 跨卡直传时可分别检查：
 
