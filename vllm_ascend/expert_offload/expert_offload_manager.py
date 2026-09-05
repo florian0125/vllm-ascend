@@ -293,6 +293,19 @@ class ExpertOffloadManager:
         self._mc_debug_collective_seq = 0
         self._mc_debug_active_callbacks = 0
         self._mc_debug_layer_calls: dict[tuple[int, bool], int] = {}
+        # Decode graph callbacks must not share the EP CPU process group with
+        # prefill.  ALLTOALL prefill uses the ordinary EP cpu_group for D2D
+        # completion barriers; under sustained batching it can start while a
+        # previous MC2 graph replay is still draining host callbacks.  Mixing
+        # those barriers with callback all-reduces on one Gloo group can pair
+        # different collectives across ranks and block both workers forever.
+        # A dedicated group isolates the two protocols, while a one-thread
+        # executor keeps every decode-side Gloo call ordered and moves it off
+        # the ACL host-callback/report thread.
+        self._mc_runtime_cpu_group = None
+        self._mc_collective_executor: ThreadPoolExecutor | None = None
+        self._mc_collective_thread_id: int | None = None
+        self._mc_graph_callbacks_registered = False
 
         # Diagnostic: wall time of the parallel weight-load phase (safetensors
         # → pinned CPU buffers). Logged in _finalize_offload.
@@ -1131,6 +1144,7 @@ class ExpertOffloadManager:
         t1 = time.perf_counter()
         self.process_weights_after_loading()
         self._publish_shared_h2d_sources()
+        self._initialize_mc_runtime_collectives()
         t2 = time.perf_counter()
 
         num_moe_layers = len(self.moe_layers)
@@ -3390,6 +3404,22 @@ class ExpertOffloadManager:
         from vllm_ascend.ascend_forward_context import MoECommType
         if _EXTRA_CTX.moe_comm_type == MoECommType.MC2:
             return False
+        if (layer_idx == 0
+                and getattr(self, "_mc_graph_callbacks_registered", False)):
+            # An ACL graph replay returns control before every queued host
+            # callback is necessarily finished.  Drain the compute stream at
+            # the MC2 -> ALLTOALL boundary before prefill starts touching the
+            # shared expert ownership state or entering its CPU barriers.  Do
+            # this once per forward (the first registered MoE layer), not once
+            # per layer, so decode remains fully asynchronous and prefill pays
+            # only one transition synchronization.
+            torch_npu.npu.synchronize()
+            if self._debug:
+                logger.info(
+                    "[MC_MODE_SYNC] rank=%s drained decode graph callbacks "
+                    "before ALLTOALL prefill",
+                    self.ep_rank,
+                )
         if self._prefill_initialized:
             self._prefill_load_layer_shard(layer_idx)
             if self._debug and logger.isEnabledFor(logging.DEBUG):
@@ -3544,7 +3574,8 @@ class ExpertOffloadManager:
             gather_global_counts_cpu)
 
         if context is None:
-            return gather_global_counts_cpu(local_values, cpu_group)
+            return self._run_mc_cpu_collective(
+                gather_global_counts_cpu, local_values, cpu_group)
         with self._mc_debug_lock:
             self._mc_debug_collective_seq += 1
             collective_seq = self._mc_debug_collective_seq
@@ -3562,7 +3593,8 @@ class ExpertOffloadManager:
             numel=local_values.numel(),
         )
         try:
-            global_values = gather_global_counts_cpu(local_values, cpu_group)
+            global_values = self._run_mc_cpu_collective(
+                gather_global_counts_cpu, local_values, cpu_group)
         except BaseException as exc:
             self._log_mc_debug_event(
                 "GLOO_ERROR",
@@ -3581,6 +3613,71 @@ class ExpertOffloadManager:
             elapsed_us=elapsed_us,
         )
         return global_values
+
+    def _initialize_mc_runtime_collectives(self) -> None:
+        """Create an isolated, serial Gloo lane for decode graph callbacks.
+
+        Every distributed worker iterates over the complete EP group list in
+        the same order, matching vLLM's process-group construction contract.
+        The selected local group is used only by dynamic decode placement;
+        initialization and ALLTOALL prefill keep using the ordinary EP CPU
+        group, so their collectives cannot interleave with graph callbacks.
+        """
+        if (not self.enable_multi_card or self.ep_size <= 1
+                or self._mc_runtime_cpu_group is not None):
+            return
+
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_ep_group
+        from vllm.distributed.utils import (
+            get_cpu_distributed_timeout_or_none,
+        )
+
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "Distributed runtime must be initialized before creating "
+                "the expert-offload decode CPU group")
+        ep_group = get_ep_group()
+        global_rank = dist.get_rank()
+        selected_group = None
+        timeout = get_cpu_distributed_timeout_or_none()
+        for ranks in ep_group.group_ranks:
+            group = dist.new_group(ranks, backend="gloo", timeout=timeout)
+            if global_rank in ranks:
+                selected_group = group
+        if selected_group is None:
+            raise RuntimeError(
+                f"Global rank {global_rank} is absent from every EP group")
+
+        self._mc_runtime_cpu_group = selected_group
+        self._mc_collective_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="offload-gloo")
+        # Start the worker before graph capture. Creating a Python thread from
+        # an ACL host callback is avoidable and has produced runtime-dependent
+        # scheduling behaviour under sustained graph replay.
+        self._mc_collective_thread_id = self._mc_collective_executor.submit(
+            threading.get_ident).result()
+        logger.info(
+            "[EXPERT-OFFLOAD] initialized isolated decode Gloo group: "
+            "rank=%d/%d group=%s collective_thread=%s",
+            self.ep_rank, self.ep_size,
+            getattr(selected_group, "group_name", "none"),
+            self._mc_collective_thread_id,
+        )
+
+    def _run_mc_cpu_collective(self, operation, *args, **kwargs):
+        """Run one decode CPU collective on the manager's serial worker.
+
+        Unit tests and partial initialization paths intentionally fall back to
+        an inline call. Production multi-card runtime initializes the executor
+        before profile/capture in :meth:`_finalize_offload`.
+        """
+        executor = getattr(self, "_mc_collective_executor", None)
+        graph_callbacks_registered = getattr(
+            self, "_mc_graph_callbacks_registered", False)
+        if executor is None or not graph_callbacks_registered:
+            return operation(*args, **kwargs)
+        return executor.submit(operation, *args, **kwargs).result()
 
     def update_weights_multi_card(self, layer, topk_ids, log2phy,
                                   topk_weights=None, hidden_states=None,
@@ -3634,11 +3731,12 @@ class ExpertOffloadManager:
         # callback (_launch_host_func, re-executed every replay with the current
         # topk) or inline (eager), H2D log2phy back. The host callback's
         # load_stream.synchronize() gates the compute stream until H2D is done.
-        # The cross-rank expert-count all_reduce uses gloo cpu_group
-        # (get_ep_group().cpu_group), while HCCL all_reduce cannot be a captured
-        # graph op and the planner needs the counts on host. Every EP rank must
-        # still enter the Gloo collectives in exactly the same order; MC_DEBUG
-        # traces that ordering across graph host callbacks.
+        # Cross-rank planning uses the dedicated decode Gloo group because
+        # HCCL all_reduce cannot be captured and the planner needs host data.
+        # The callback submits collectives to one serial CPU worker, keeping
+        # them off the ACL report thread and isolated from prefill barriers.
+        # Every EP rank must still enter them in the same callback order;
+        # MC_DEBUG traces that ordering.
         per_rank_slots = self.offload_config.num_device_experts_for_rank(
             layer_idx, self.ep_size)
         topk_ids_h = self.topk_ids_h[:num_tokens]
@@ -3706,6 +3804,7 @@ class ExpertOffloadManager:
         if self._debug:
             args += (from_graph_callback,)
         if from_graph_callback:
+            self._mc_graph_callbacks_registered = True
             self._log_mc_debug_schedule(layer_idx, is_prefetch=False)
             torch_npu.npu._launch_host_func(
                 current_compute_stream, self._update_weights_multi_card, args)
@@ -4105,6 +4204,7 @@ class ExpertOffloadManager:
         scoring_func,
         correction_bias_h,
         cpu_group=None,
+        debug_context=None,
     ):
         """Atomically substitute source experts across all active EP rows."""
         if mc2_mask_h is None:
@@ -4129,9 +4229,14 @@ class ExpertOffloadManager:
             gather_global_substitution_state_cpu,
         )
 
-        global_referenced, global_blocked = \
-            gather_global_substitution_state_cpu(
-                plan.referenced, plan.blocked, cpu_group)
+        if debug_context is not None:
+            debug_context["stage"] = "substitution_consensus"
+        global_referenced, global_blocked = self._run_mc_cpu_collective(
+            gather_global_substitution_state_cpu,
+            plan.referenced,
+            plan.blocked,
+            cpu_group,
+        )
         allowed = global_referenced & ~global_blocked
         substituted_ids = commit_expert_substitutions(
             plan,
@@ -4187,7 +4292,7 @@ class ExpertOffloadManager:
     def _update_weights_multi_card_impl(self, args, debug_context=None):
         """Host callback (graph replay) / inline (eager) for multi-card DECODE
         placement + H2D. Reads the pinned CPU topk_ids_h, does CPU bincount +
-        gloo all_reduce (cpu_group) for global expert counts, plans the
+        serial Gloo all_reduce for global expert counts, plans the
         load-balanced placement, H2D-loads misses on load_stream (synced to gate
         the compute stream), and writes placement.log2phy into the pinned
         log2phy_h (the wrapper H2D-copies it back to the NPU tensor).
@@ -4206,7 +4311,13 @@ class ExpertOffloadManager:
 
         from vllm_ascend.expert_offload.multi_card_planner import plan_placement
 
-        cpu_group = get_ep_group().cpu_group if self.ep_size > 1 else None
+        if self.ep_size > 1:
+            ep_cpu_group = get_ep_group().cpu_group
+            cpu_group = getattr(self, "_mc_runtime_cpu_group", None)
+            if cpu_group is None:
+                cpu_group = ep_cpu_group
+        else:
+            cpu_group = None
 
         # Substitute against the previous FULL global placement before global
         # counting. Each rank changes only its active local rows; the following
@@ -4216,7 +4327,8 @@ class ExpertOffloadManager:
                 debug_context["stage"] = "substitution"
             self._apply_multi_card_substitution(
                 layer_idx, topk_ids_h, router_logits_h, log2phy_h,
-                mc2_mask_h, scoring_func, correction_bias_h, cpu_group)
+                mc2_mask_h, scoring_func, correction_bias_h, cpu_group,
+                debug_context)
 
         # Drop pad-token rows (mc2_mask==0) BEFORE any counting / placing / LRU.
         # Under single-batch TP the ranks past the real-token count hold PAD
@@ -4508,9 +4620,9 @@ class ExpertOffloadManager:
         and return its per-expert hotness. global_counts and router score sums
         are all-reduced EVERY step (identical across ranks after the mc2_mask
         filter), so the LRC state + hotness are too -> placement/eviction stay
-        deterministic. Gloo runs on cpu_group rather than the captured NPU
-        stream, but all callbacks must still enter its collectives in the same
-        order on every rank."""
+        deterministic. Gloo runs on the isolated decode CPU group through one
+        serial worker rather than the captured NPU stream; all callbacks must
+        still submit collectives in the same order on every rank."""
         from vllm_ascend.expert_offload.multi_card_planner import (
             local_expert_counts_cpu)
         local_counts = local_expert_counts_cpu(topk_ids_h, self.num_total_experts)
@@ -4605,6 +4717,18 @@ class ExpertOffloadManager:
 
     def close(self) -> None:
         """Release H2D backend resources; safe to call more than once."""
+        collective_executor = getattr(
+            self, "_mc_collective_executor", None)
+        if collective_executor is not None:
+            collective_executor.shutdown(wait=True, cancel_futures=True)
+            self._mc_collective_executor = None
+            self._mc_collective_thread_id = None
+        runtime_cpu_group = getattr(self, "_mc_runtime_cpu_group", None)
+        if runtime_cpu_group is not None:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                dist.destroy_process_group(runtime_cpu_group)
+            self._mc_runtime_cpu_group = None
         transport = getattr(self, 'h2d_transport', None)
         if transport is not None:
             transport.synchronize(self.load_stream)
@@ -4924,7 +5048,10 @@ class ExpertOffloadManager:
         from torch import distributed as dist
         from vllm.distributed.parallel_state import get_ep_group
 
-        cpu_group = get_ep_group().cpu_group
+        ep_cpu_group = get_ep_group().cpu_group
+        cpu_group = getattr(self, "_mc_runtime_cpu_group", None)
+        if cpu_group is None:
+            cpu_group = ep_cpu_group
         if debug_context is not None:
             debug_context["stage"] = "shared_swap_plan_diff"
         global_swaps = self._exclusive_shared_swaps_from_placement(
@@ -4991,8 +5118,12 @@ class ExpertOffloadManager:
         device_errors = [None] * self.ep_size
         if debug_context is not None:
             debug_context["stage"] = "shared_swap_device_consensus"
-        dist.all_gather_object(
-            device_errors, local_error, group=cpu_group)
+        self._run_mc_cpu_collective(
+            dist.all_gather_object,
+            device_errors,
+            local_error,
+            group=cpu_group,
+        )
         self._raise_distributed_swap_errors("device copy", device_errors)
 
         local_error = None
@@ -5024,7 +5155,12 @@ class ExpertOffloadManager:
         cpu_errors = [None] * self.ep_size
         if debug_context is not None:
             debug_context["stage"] = "shared_swap_cpu_consensus"
-        dist.all_gather_object(cpu_errors, local_error, group=cpu_group)
+        self._run_mc_cpu_collective(
+            dist.all_gather_object,
+            cpu_errors,
+            local_error,
+            group=cpu_group,
+        )
         self._raise_distributed_swap_errors("shared CPU commit", cpu_errors)
 
         if debug_context is not None:
@@ -5818,6 +5954,7 @@ class ExpertOffloadManager:
 
             if _EXTRA_CTX.capturing:
                 if self.enable_multi_card:
+                    self._mc_graph_callbacks_registered = True
                     self._log_mc_debug_schedule(
                         next_idx, is_prefetch=True)
                 torch_npu.npu._launch_host_func(

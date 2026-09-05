@@ -372,10 +372,11 @@ def local_expert_counts_cpu(
 
     Counterpart of :func:`local_expert_counts` but runs entirely on the CPU:
     ``topk_ids`` is a (pinned) CPU tensor (e.g. the ``topk_ids_h`` buffer the
-    single-card graph path D2H-copies into). Used by the multi-card graph-mode
-    host callback so the expert counts never touch the NPU stream (the HCCL
-    all_reduce can't be a captured graph op, but a gloo CPU all_reduce can be
-    issued from a ``_launch_host_func`` callback).
+    single-card graph path D2H-copies into). Used by multi-card graph mode so
+    expert counts never touch the NPU stream. The caller submits the Gloo
+    collective to a dedicated serial CPU worker because HCCL all_reduce cannot
+    be captured and distributed calls must not execute on the ACL host-callback
+    thread.
     """
     flat = topk_ids.reshape(-1).to(torch.int64)
     counts = torch.bincount(flat, minlength=global_num_experts)
@@ -388,13 +389,11 @@ def gather_global_counts_cpu(
 ) -> torch.Tensor:
     """All-reduce CPU expert counts across the EP group via gloo.
 
-    ``cpu_group`` is ``get_ep_group().cpu_group`` (a gloo ``ProcessGroup`` that
-    vLLM creates alongside every device group). gloo is socket/host-based and
-    **stream-independent**, so this is safe to call from inside a
-    ``_launch_host_func`` host callback during cudagraph replay — unlike the
-    HCCL ``all_reduce`` in :func:`gather_global_counts`, which cannot be a
-    captured graph op. ``cpu_group=None`` returns ``local_counts`` unchanged
-    (unit-test path).
+    Production graph mode passes an expert-offload-only Gloo process group and
+    invokes this function on a serial CPU worker. Keeping the group separate
+    from ALLTOALL prefill barriers prevents cross-protocol collective ordering
+    races. ``cpu_group=None`` returns ``local_counts`` unchanged (unit-test
+    path).
     """
     if cpu_group is None:
         return local_counts

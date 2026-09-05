@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -486,6 +487,124 @@ def test_mc_debug_gloo_log_pairs_collective_sequences():
     assert "collective_seq=1" in log_info.call_args_list[0].args[-1]
     assert "kind=router_score" in log_info.call_args_list[2].args[-1]
     assert "collective_seq=2" in log_info.call_args_list[2].args[-1]
+
+
+def test_multi_card_collectives_serialize_after_graph_registration():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager._mc_collective_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="test-offload-gloo")
+    manager._mc_graph_callbacks_registered = False
+    caller_thread = threading.get_ident()
+    collective_threads = []
+
+    def record_thread(value):
+        collective_threads.append(threading.get_ident())
+        return value + 1
+
+    try:
+        eager_result = manager._run_mc_cpu_collective(record_thread, 0)
+        manager._mc_graph_callbacks_registered = True
+        first_graph_result = manager._run_mc_cpu_collective(record_thread, 1)
+        second_graph_result = manager._run_mc_cpu_collective(record_thread, 2)
+    finally:
+        manager._mc_collective_executor.shutdown(wait=True)
+
+    assert (eager_result, first_graph_result, second_graph_result) == (1, 2, 3)
+    assert collective_threads[0] == caller_thread
+    assert len(set(collective_threads[1:])) == 1
+    assert collective_threads[1] != caller_thread
+
+
+def test_initialize_multi_card_collectives_creates_isolated_gloo_groups():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.enable_multi_card = True
+    manager._ep_size = 2
+    manager._ep_rank = 0
+    manager._ep_info_resolved = True
+    manager._mc_runtime_cpu_group = None
+    manager._mc_collective_executor = None
+    manager._mc_collective_thread_id = None
+    manager._mc_graph_callbacks_registered = False
+    ep_group = SimpleNamespace(
+        group_ranks=[[0, 1], [2, 3]],
+    )
+    local_group = SimpleNamespace(group_name="decode-ep0")
+    remote_group = SimpleNamespace(group_name="decode-ep1")
+    timeout = object()
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.new_group",
+              side_effect=[local_group, remote_group]) as new_group,
+        patch("vllm.distributed.parallel_state.get_ep_group",
+              return_value=ep_group),
+        patch(
+            "vllm.distributed.utils.get_cpu_distributed_timeout_or_none",
+            return_value=timeout,
+        ),
+    ):
+        manager._initialize_mc_runtime_collectives()
+
+    try:
+        assert manager._mc_runtime_cpu_group is local_group
+        assert manager._mc_collective_thread_id is not None
+        assert new_group.call_args_list == [
+            call([0, 1], backend="gloo", timeout=timeout),
+            call([2, 3], backend="gloo", timeout=timeout),
+        ]
+    finally:
+        manager._mc_collective_executor.shutdown(wait=True)
+
+
+def test_close_releases_decode_collective_executor_and_group():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    executor = MagicMock()
+    manager._mc_collective_executor = executor
+    runtime_group = object()
+    manager._mc_runtime_cpu_group = runtime_group
+    manager.h2d_transport = None
+    manager._torch_shared_cpu_pool = None
+    manager._exclusive_prefill_pyhccl = None
+    manager._exclusive_prefill_comm_buffers = {}
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.destroy_process_group") as destroy_group,
+    ):
+        manager.close()
+
+    executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
+    assert manager._mc_collective_executor is None
+    destroy_group.assert_called_once_with(runtime_group)
+    assert manager._mc_runtime_cpu_group is None
+
+
+def test_alltoall_prefill_drains_old_graph_callbacks_once_per_forward():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager._debug = False
+    manager._prefill_initialized = True
+    manager._prefill_load_layer_shard = MagicMock()
+    manager._mc_graph_callbacks_registered = True
+    comm_context = SimpleNamespace(moe_comm_type=object())
+
+    with (
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager._EXTRA_CTX",
+            comm_context,
+        ),
+        patch(
+            "vllm_ascend.expert_offload.expert_offload_manager."
+            "torch_npu.npu.synchronize",
+        ) as synchronize,
+    ):
+        assert manager._mc_handle_prefill_regime(0)
+        assert manager._mc_handle_prefill_regime(1)
+
+    synchronize.assert_called_once_with()
+    assert manager._prefill_load_layer_shard.call_args_list == [
+        call(0), call(1)
+    ]
 
 
 def test_mc_debug_callback_logs_python_error_and_exit():
@@ -1715,6 +1834,8 @@ def _exclusive_shared_runtime_manager():
     manager._debug = False
     manager._torch_shared_cpu_sources_ready = True
     manager._torch_shared_cpu_ready_layers = {0}
+    manager._mc_runtime_cpu_group = None
+    manager._mc_collective_executor = None
     return manager
 
 
@@ -2084,6 +2205,8 @@ def test_exclusive_shared_swap_commits_compact_cpu_and_global_ownership():
     )
     log2phy = torch.empty(4, dtype=torch.int32)
     ep_group = SimpleNamespace(cpu_group=object())
+    decode_group = object()
+    manager._mc_runtime_cpu_group = decode_group
     debug_context = {
         "layer_idx": 0,
         "layer_call": 1,
@@ -2093,7 +2216,7 @@ def test_exclusive_shared_swap_commits_compact_cpu_and_global_ownership():
     }
 
     def gather(output, value, group):
-        assert group is ep_group.cpu_group
+        assert group is decode_group
         output[:] = [value, value]
 
     with (
