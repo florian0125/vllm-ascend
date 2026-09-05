@@ -5671,7 +5671,7 @@ class ExpertOffloadManager:
     def predict_next_layer_experts_npu(
         self,
         layer_idx: int,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Predict which experts layer layer_idx+1 will need, on NPU.
 
@@ -5731,6 +5731,33 @@ class ExpertOffloadManager:
         # independently caps transfers with prefetch_topk, so if a higher-ranked
         # candidate is already resident it can still prefetch the next miss.
         # Keeping the full width also matches the fixed-width CPU staging buffer.
+        # Latent-MoE models such as Kimi K3 route with the full-width residual
+        # stream but execute their experts on a down-projected hidden state. A
+        # quant method must never make that optimization fatal if it supplies
+        # the routed latent by mistake.
+        if hidden_states is None or hidden_states.ndim != 2:
+            logger.warning_once(
+                "[PREFETCH] skip learned-router prediction because the "
+                "hidden state is unavailable or not a matrix: layer=%d "
+                "next_layer=%d shape=%s",
+                layer_idx,
+                next_idx,
+                None if hidden_states is None else tuple(hidden_states.shape),
+            )
+            return None
+        hidden_width = hidden_states.shape[-1]
+        gate_input_width = gate_w.shape[-1]
+        if hidden_width != gate_input_width:
+            logger.warning_once(
+                "[PREFETCH] skip learned-router prediction because the "
+                "hidden width does not match the next gate: layer=%d "
+                "next_layer=%d hidden_width=%s gate_input_width=%s",
+                layer_idx,
+                next_idx,
+                hidden_width,
+                gate_input_width,
+            )
+            return None
         # On-device prediction: [1, hidden_dim] x [n_experts, hidden_dim]^T
         router_logits = F.linear(hidden_states[:1].float(), gate_w)
         probs = router_logits.softmax(dim=-1)
@@ -5757,6 +5784,14 @@ class ExpertOffloadManager:
             layer_idx = self.moe_layers.index(layer)
         except ValueError:
             return
+
+        # MoERunner keeps the original full-width residual stream alongside a
+        # transformed routed-expert input. Prefer that original tensor for the
+        # next layer's gate prediction (Kimi K3: 7168 rather than latent 3584).
+        full_width_hidden_states = getattr(
+            layer, "_expert_offload_prefetch_hidden_states", None)
+        if full_width_hidden_states is not None:
+            hidden_states = full_width_hidden_states
 
         staged = self._stage_predicted_topk(layer_idx, hidden_states)
         if staged is None:

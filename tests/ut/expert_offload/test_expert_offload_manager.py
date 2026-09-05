@@ -728,6 +728,39 @@ def test_kimi_k3_learned_router_prefetch_keeps_full_topk_candidates():
     assert torch.allclose(weights, expected_weights)
 
 
+def test_learned_router_prefetch_skips_mismatched_hidden_width():
+    next_layer = SimpleNamespace(gate=SimpleNamespace())
+    manager = _manager_for_prediction(
+        next_layer, torch.ones((3, 4)), topk=2, prefetch_topk=1)
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.warning_once"
+    ) as warning_once:
+        predicted = manager.predict_next_layer_experts_npu(
+            0, torch.ones((1, 2)))
+
+    assert predicted is None
+    assert "hidden width does not match" in warning_once.call_args.args[0]
+    assert warning_once.call_args.args[3:] == (2, 4)
+
+
+def test_trigger_prefetch_prefers_staged_full_width_hidden_states():
+    routed_hidden_states = torch.ones((1, 2))
+    full_width_hidden_states = torch.ones((1, 4))
+    layer = SimpleNamespace(
+        _expert_offload_prefetch_hidden_states=full_width_hidden_states)
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    manager.offload_config = SimpleNamespace(expert_prefetch_enabled=True)
+    manager._skip_prefill = False
+    manager.moe_layers = [layer]
+    manager._stage_predicted_topk = MagicMock(return_value=None)
+
+    manager.trigger_next_layer_prefetch(layer, routed_hidden_states)
+
+    manager._stage_predicted_topk.assert_called_once_with(
+        0, full_width_hidden_states)
+
+
 def test_expert_substitution_log_is_controlled_by_debug():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager.offload_config = ExpertOffloadConfig({

@@ -1299,8 +1299,35 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        with self._sequence_parallel_context():
-            if self.shared_experts is None:
-                return self.no_shared_forward_impl(hidden_states, router_logits)
-            else:
-                return self.shared_forward_impl(hidden_states, router_logits, shared_experts_input)
+        # Upstream MoERunner passes the pre-transform input separately when a
+        # latent routed-input transform is present. Expose it only for the
+        # duration of this call so expert prefetch predicts the next gate from
+        # the full-width residual stream, while expert GMM still consumes the
+        # transformed hidden_states tensor.
+        offload_layer = self.routed_experts
+        prefetch_attr = "_expert_offload_prefetch_hidden_states"
+        stage_prefetch_input = getattr(
+            offload_layer, "enable_expert_offload", False)
+        had_prefetch_attr = hasattr(offload_layer, prefetch_attr)
+        previous_prefetch_input = getattr(offload_layer, prefetch_attr, None)
+        if stage_prefetch_input:
+            setattr(
+                offload_layer,
+                prefetch_attr,
+                (shared_experts_input
+                 if shared_experts_input is not None else hidden_states),
+            )
+        try:
+            with self._sequence_parallel_context():
+                if self.shared_experts is None:
+                    return self.no_shared_forward_impl(
+                        hidden_states, router_logits)
+                return self.shared_forward_impl(
+                    hidden_states, router_logits, shared_experts_input)
+        finally:
+            if stage_prefetch_input:
+                if had_prefetch_attr:
+                    setattr(offload_layer, prefetch_attr,
+                            previous_prefetch_input)
+                else:
+                    delattr(offload_layer, prefetch_attr)

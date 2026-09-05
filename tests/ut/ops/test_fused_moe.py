@@ -621,7 +621,14 @@ def test_forward_impl_preserves_original_input_for_shared_experts(monkeypatch):
     shared_experts_input = torch.randn(2, 7168)
     router_logits = torch.randn(2, 3)
     expected = (torch.randn(2, 7168), torch.randn(2, 3584))
-    runner.shared_forward_impl = MagicMock(return_value=expected)
+    runner.routed_experts = SimpleNamespace(enable_expert_offload=True)
+
+    def shared_forward_impl(*args):
+        assert runner.routed_experts._expert_offload_prefetch_hidden_states \
+            is shared_experts_input
+        return expected
+
+    runner.shared_forward_impl = MagicMock(side_effect=shared_forward_impl)
 
     monkeypatch.setattr(AscendMoERunner, "shared_experts", property(lambda _: object()))
     monkeypatch.setattr(AscendMoERunner, "_sequence_parallel_context", lambda _: nullcontext())
@@ -634,3 +641,26 @@ def test_forward_impl_preserves_original_input_for_shared_experts(monkeypatch):
         router_logits,
         shared_experts_input,
     )
+    assert not hasattr(
+        runner.routed_experts, "_expert_offload_prefetch_hidden_states")
+
+
+def test_forward_impl_clears_prefetch_input_when_moe_raises(monkeypatch):
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    nn.Module.__init__(runner)
+    runner.routed_experts = SimpleNamespace(enable_expert_offload=True)
+    runner.no_shared_forward_impl = MagicMock(
+        side_effect=RuntimeError("moe failed"))
+
+    monkeypatch.setattr(
+        AscendMoERunner, "shared_experts", property(lambda _: None))
+    monkeypatch.setattr(
+        AscendMoERunner, "_sequence_parallel_context",
+        lambda _: nullcontext())
+
+    with pytest.raises(RuntimeError, match="moe failed"):
+        runner._forward_impl(
+            torch.randn(2, 3584), torch.randn(2, 3), None)
+
+    assert not hasattr(
+        runner.routed_experts, "_expert_offload_prefetch_hidden_states")
