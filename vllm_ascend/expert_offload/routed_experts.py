@@ -10,6 +10,7 @@ import torch
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.expert_offload.expert_offload_manager import ExpertOffloadManager
+from vllm_ascend.ops.fused_moe.moe_comm_method import _map_logical_ids_to_phy
 
 
 def _set_view_tensor(view, name, tensor):
@@ -80,7 +81,10 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
                         mgr.num_total_experts, dtype=torch.int32,
                         device=saved["expert_ids_per_ep_rank"].device) % local_count
         elif layer.log2phy is not None:
-            topk_ids = layer.log2phy[topk_ids].clamp(min=0)
+            topk_ids = _map_logical_ids_to_phy(
+                topk_ids, layer.log2phy, layer.moe_config.num_local_experts * layer.moe_config.ep_size)
+        if hidden_states.dtype != torch.float8_e4m3fn:
+            topk_weights = topk_weights.to(hidden_states.dtype)
         result = layer.quant_method.apply(
             layer=view, x=hidden_states, topk_weights=topk_weights, topk_ids=topk_ids,
             shared_experts=None, shared_experts_input=None,
