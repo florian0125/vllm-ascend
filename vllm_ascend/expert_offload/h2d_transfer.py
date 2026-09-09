@@ -134,8 +134,13 @@ class TorchSharedCPUH2DTransport(TorchCopyH2DTransport):
         available = self._free_staging.get(key)
         if available:
             return available.pop()
-        return torch.empty(
-            shape, dtype=dtype, device="cpu", pin_memory=True)
+        # Staging buffers are cached and may be reused by an ACL graph host
+        # callback running outside the InferenceMode context that allocated
+        # them. Keep these mutable, cross-context buffers as normal tensors so
+        # their in-place copies remain valid in every execution context.
+        with torch.inference_mode(False):
+            return torch.empty(
+                shape, dtype=dtype, device="cpu", pin_memory=True)
 
     def _stage_source(
         self, task: H2DCopyTask

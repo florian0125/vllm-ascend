@@ -1,4 +1,5 @@
 import os
+import threading
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -113,6 +114,54 @@ def test_torch_shared_transport_stages_until_sync_then_reuses_buffer():
     ]
     assert transport._inflight_staging[0][1] is staging
 
+    stream.synchronize.assert_called_once_with()
+
+
+def test_torch_shared_transport_reuses_normal_staging_across_inference_mode():
+    transport = TorchSharedCPUH2DTransport()
+    source = torch.tensor([1.0, 2.0])
+    destination = torch.empty_like(source)
+    task = H2DCopyTask(source, destination, source.nbytes)
+    stream = MagicMock()
+    real_empty = torch.empty
+
+    def allocate_without_pinning(*args, **kwargs):
+        # Keep the regression test portable to CPU-only test environments.
+        kwargs["pin_memory"] = False
+        return real_empty(*args, **kwargs)
+
+    with patch(
+        "vllm_ascend.expert_offload.h2d_transfer.torch.empty",
+        side_effect=allocate_without_pinning,
+    ) as empty:
+        with torch.inference_mode():
+            transport.copy_batch([task])
+            transport.synchronize(stream)
+
+        key = ("tensor", tuple(source.shape), source.dtype)
+        staging = transport._free_staging[key][0]
+        assert not torch.is_inference(staging)
+
+        source.add_(2.0)
+        errors = []
+
+        def copy_from_host_callback():
+            try:
+                assert not torch.is_inference_mode_enabled()
+                transport.copy_batch([task])
+            except Exception as error:  # pragma: no cover - assertion aid
+                errors.append(error)
+
+        callback_thread = threading.Thread(target=copy_from_host_callback)
+        callback_thread.start()
+        callback_thread.join(timeout=5)
+        assert not callback_thread.is_alive()
+
+    assert errors == []
+    assert torch.equal(destination, source)
+    assert transport._inflight_staging[0][1] is staging
+    empty.assert_called_once_with(
+        source.shape, dtype=source.dtype, device="cpu", pin_memory=True)
     stream.synchronize.assert_called_once_with()
 
 
