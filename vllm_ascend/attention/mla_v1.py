@@ -959,9 +959,15 @@ class AscendMLAImpl(MLAAttentionImpl):
         else:
             self.dtype = self.vllm_config.model_config.dtype
         # The replacement A3 attention operator accepts arbitrary head counts,
-        # so the legacy next-power-of-two padding path is no longer needed.
-        self.num_heads_padded = self.num_heads
-        self.head_padding = 0
+        # but A5's FusedInferAttentionScore still requires power-of-two
+        # num_heads in the decode MLA scenario (e.g. Kimi-K3 TP=2 -> 48 heads),
+        # so keep the next-power-of-two padding on A5.
+        if get_ascend_device_type() == AscendDeviceType.A5:
+            self.num_heads_padded = 1 << (self.num_heads - 1).bit_length()
+            self.head_padding = self.num_heads_padded - self.num_heads
+        else:
+            self.num_heads_padded = self.num_heads
+            self.head_padding = 0
 
     @staticmethod
     def update_graph_params(
