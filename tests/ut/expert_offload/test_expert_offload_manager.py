@@ -123,6 +123,20 @@ def test_multi_card_decode_plan_log_covers_sharded_baseline():
     assert args[12:15] == (0, [], [3, 3])
 
 
+def test_expert_stats_log_contains_complete_counts():
+    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
+    counts = torch.tensor([3, 0, 2, 1], dtype=torch.int64)
+
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
+    ) as log_info:
+        manager._log_expert_stats(4, counts)
+
+    assert log_info.call_args.args[0].startswith("[EXPERT-STATS]")
+    assert log_info.call_args.args[1:] == (
+        4, 4, [[0, 3], [2, 2], [3, 1]])
+
+
 def test_multi_card_lrc_log_exposes_cross_rank_checksums():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager._debug = True

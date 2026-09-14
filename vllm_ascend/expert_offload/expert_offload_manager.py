@@ -191,6 +191,9 @@ class ExpertOffloadManager:
         # Flipping it on surfaces them at info level (no need for global
         # VLLM_LOGGING_LEVEL=DEBUG).
         self._debug = self.offload_config.moe_offload_debug
+        # Minimal decode-only route counts used to build expert-rank JSON.
+        # Keep this independent from the verbose diagnostic switch above.
+        self._expert_stats_log_enabled = self.offload_config.expert_stats_log_enabled
         # Graph/collective diagnostics. Host callbacks may execute on report
         # threads, so keep the counters under a small CPU-only lock. These
         # fields are touched only when moe_offload_debug is enabled and never
@@ -2227,6 +2230,9 @@ class ExpertOffloadManager:
                                                     cpu_group,
                                                     weights_for_count,
                                                     debug_context)
+        if self._expert_stats_log_enabled and self.ep_rank == 0:
+            self._log_expert_stats(layer_idx, global_counts)
+
         counts_ms = ((time.perf_counter() - counts_start) * 1000.0
                      if counts_start is not None else 0.0)
 
@@ -2300,6 +2306,17 @@ class ExpertOffloadManager:
                 layer_idx, my_experts, hits, misses, resident_map,
                 placement.log2phy, per_rank_slots, is_prefetch, h2d_ms,
                 total_ms)
+
+    def _log_expert_stats(self, layer_idx, global_counts):
+        selected_ids = global_counts.nonzero(as_tuple=True)[0].tolist()
+        selected_counts = [
+            [int(expert_id), int(global_counts[expert_id])]
+            for expert_id in selected_ids
+        ]
+        logger.info(
+            "[EXPERT-STATS] phase=decode layer=%d num_experts=%d "
+            "selected_counts=%s",
+            layer_idx, global_counts.numel(), selected_counts)
 
     def _log_mc_router_observation(self, layer_idx, topk_ids_h):
         if not self._debug or not logger.isEnabledFor(logging.DEBUG):
@@ -2736,6 +2753,13 @@ class ExpertOffloadManager:
                 self._record_cache_stats(layer_idx, already_there, need_to_load, needed, on_device)
             reusable_slots = [s for s, e in slot_owner.items()
                             if e not in needed]          # slots to recycle
+
+            if self._expert_stats_log_enabled and not is_prefetch:
+                global_counts = torch.bincount(
+                    topk_ids_h.reshape(-1).to(torch.int64),
+                    minlength=self.num_total_experts,
+                )
+                self._log_expert_stats(layer_idx, global_counts)
 
             if self._debug:
                 flag = '[PREFETCH-W]' if is_prefetch else '[UPDATE-W]'

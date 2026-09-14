@@ -960,6 +960,7 @@ class ExpertOffloadConfig:
         "cache_age_weight": 0.01,
         "cache_stats_log_interval": 1000,
         "moe_offload_debug": False,
+        "expert_stats_log_enabled": False,
         "expert_prefetch_enabled": False,
         "expert_prefetch_num": 2,
         "shard_per_rank": True,
@@ -1123,6 +1124,9 @@ class ExpertOffloadConfig:
             raise ValueError("cache_stats_log_interval must >= 0")
         if not isinstance(self.config["moe_offload_debug"], bool):
             raise TypeError("moe_offload_debug must be a boolean")
+        if not isinstance(self.config["expert_stats_log_enabled"], bool):
+            raise TypeError(
+                "expert_stats_log_enabled must be a boolean")
         if not isinstance(self.config["expert_prefetch_enabled"], bool):
             raise TypeError("expert_prefetch_enabled must be a boolean")
         if not isinstance(self.config["expert_prefetch_num"], int):
