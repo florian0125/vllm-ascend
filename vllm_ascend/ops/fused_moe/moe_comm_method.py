@@ -581,12 +581,8 @@ def _map_logical_ids_to_phy(topk_ids, log2phy, num_local_experts):
 
     if log2phy is None:
         valid = topk_ids >= 0
-        return torch.where(
-            valid, topk_ids,
-            topk_ids.new_full(topk_ids.shape, invalid_phy))
-    logical_valid = (
-        (topk_ids >= 0) & (topk_ids < log2phy.numel())
-    )
+        return torch.where(valid, topk_ids, topk_ids.new_full(topk_ids.shape, invalid_phy))
+    logical_valid = (topk_ids >= 0) & (topk_ids < log2phy.numel())
 
     safe_ids = topk_ids.clamp(
         min=0,

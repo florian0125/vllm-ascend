@@ -4,10 +4,10 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from vllm_ascend.expert_offload.h2d_transfer import (
+    ONE_GIB,
     H2DCopyTask,
     MemFabricLocalH2DTransport,
     MemFabricSharedH2DTransport,
-    ONE_GIB,
     TorchCopyH2DTransport,
     create_h2d_transport,
 )
@@ -34,10 +34,8 @@ def test_torch_transport_preserves_task_order_and_non_blocking_flags():
 
     TorchCopyH2DTransport().copy_batch(tasks)
 
-    assert first_destination.copy_.call_args_list == [
-        call("w13-source", non_blocking=True)]
-    assert second_destination.copy_.call_args_list == [
-        call("scale-source", non_blocking=False)]
+    assert first_destination.copy_.call_args_list == [call("w13-source", non_blocking=True)]
+    assert second_destination.copy_.call_args_list == [call("scale-source", non_blocking=False)]
 
 
 def test_torch_transport_accepts_an_empty_batch():
@@ -53,12 +51,10 @@ def test_torch_transport_allocates_pinned_host_tensor():
         result = TorchCopyH2DTransport().allocate_host_tensor((2, 3), "dtype")
 
     assert result is expected
-    empty.assert_called_once_with(
-        (2, 3), dtype="dtype", device="cpu", pin_memory=True)
+    empty.assert_called_once_with((2, 3), dtype="dtype", device="cpu", pin_memory=True)
 
 
 class _FakeDescriptor:
-
     def __init__(self, values, dtype, device):
         self.values = values
         self.dtype = dtype
@@ -162,8 +158,7 @@ def test_memfabric_transport_pads_odd_sparse_copy_batch_and_retires_descriptors(
         destination.data_ptr.return_value = 200 + index
     tasks = [
         H2DCopyTask(source, destination, index + 1)
-        for index, (source, destination) in enumerate(
-            zip(sources, destinations))
+        for index, (source, destination) in enumerate(zip(sources, destinations))
     ]
     descriptors = []
 
@@ -182,8 +177,7 @@ def test_memfabric_transport_pads_odd_sparse_copy_batch_and_retires_descriptors(
     assert descriptors[1].values == [200, 201, 202, 202]
     assert descriptors[2].values == [1, 2, 3, 0]
     assert descriptors[3].values == 4
-    offload_module.sparse_copy.assert_called_once_with(
-        *descriptors, "npu:fake")
+    offload_module.sparse_copy.assert_called_once_with(*descriptors, "npu:fake")
     assert len(transport._inflight_descriptors) == 1
 
     stream = MagicMock()
@@ -194,8 +188,7 @@ def test_memfabric_transport_pads_odd_sparse_copy_batch_and_retires_descriptors(
 
 
 def test_memfabric_transport_preserves_uint32_length_bits():
-    assert MemFabricLocalH2DTransport._int32_bits((1 << 31) - 1) == \
-        (1 << 31) - 1
+    assert MemFabricLocalH2DTransport._int32_bits((1 << 31) - 1) == (1 << 31) - 1
     assert MemFabricLocalH2DTransport._int32_bits(1 << 31) == -(1 << 31)
     assert MemFabricLocalH2DTransport._int32_bits((1 << 32) - 1) == -1
     with pytest.raises(ValueError, match="exceeds uint32"):
@@ -210,8 +203,7 @@ def test_memfabric_transport_reports_sparse_copy_failure():
     with (
         patch(
             "vllm_ascend.expert_offload.h2d_transfer.torch.tensor",
-            side_effect=lambda values, dtype, device: _FakeDescriptor(
-                values, dtype, device),
+            side_effect=lambda values, dtype, device: _FakeDescriptor(values, dtype, device),
         ),
         pytest.raises(RuntimeError, match="sparse_copy failed.*ret=9"),
     ):

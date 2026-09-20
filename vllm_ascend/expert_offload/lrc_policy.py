@@ -1,8 +1,8 @@
 """Local-routing-consistency policy for expert offload decode paging."""
 
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 
 import numpy as np
 
@@ -17,8 +17,7 @@ class LRCLayerState:
     # Only `ema` is vectorized (full-array C-level decay), so it is a numpy
     # array. freq / router_score / last_used stay Python lists: their hot-path
     # access is scalar, and `ndarray[i] += 1` is ~24x slower than `list[i] += 1`.
-    ema: np.ndarray = field(
-        default_factory=lambda: np.zeros(0, dtype=np.float32))
+    ema: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     router_score: list[float] = field(default_factory=list)
     last_used: list[int] = field(default_factory=list)
     step: int = 0
@@ -107,15 +106,9 @@ class LRCExpertCachePolicy:
             raw_experts = tuple(int(eid) for eid in row)
 
             # 保存有效专家在原始top-k中的位置。
-            valid_routes = [
-                (position, eid)
-                for position, eid in enumerate(raw_experts)
-                if 0 <= eid < self.num_experts
-            ]
+            valid_routes = [(position, eid) for position, eid in enumerate(raw_experts) if 0 <= eid < self.num_experts]
 
-            experts = tuple(
-                eid for _, eid in valid_routes
-            )
+            experts = tuple(eid for _, eid in valid_routes)
             unique.update(experts)
             state.step += 1
 
@@ -138,9 +131,7 @@ class LRCExpertCachePolicy:
 
                 if len(score_row) != len(raw_experts):
                     raise ValueError(
-                        "router score width does not match "
-                        "topk ID width: "
-                        f"{len(score_row)} != {len(raw_experts)}"
+                        f"router score width does not match topk ID width: {len(score_row)} != {len(raw_experts)}"
                     )
 
                 # 使用原始position取分数，避免过滤ID后错位。
@@ -169,8 +160,7 @@ class LRCExpertCachePolicy:
         """
         counts = np.asarray(global_counts, dtype=np.int64)
         if counts.ndim != 1 or counts.size != self.num_experts:
-            raise ValueError(
-                f"global_counts must have shape ({self.num_experts},)")
+            raise ValueError(f"global_counts must have shape ({self.num_experts},)")
         if np.any(counts < 0):
             raise ValueError("global_counts must be non-negative")
 
@@ -178,8 +168,7 @@ class LRCExpertCachePolicy:
         if global_router_score is not None:
             scores = np.asarray(global_router_score, dtype=np.float32)
             if scores.shape != counts.shape:
-                raise ValueError(
-                    f"global_router_score must have shape ({self.num_experts},)")
+                raise ValueError(f"global_router_score must have shape ({self.num_experts},)")
 
         state = self.layer_states[layer_idx]
         state.step += 1
@@ -237,9 +226,7 @@ class LRCExpertCachePolicy:
         if count == 0:
             return []
 
-        candidates = [
-            eid for eid in slot_owner.values() if eid not in protected
-        ]
+        candidates = [eid for eid in slot_owner.values() if eid not in protected]
         candidates.sort(key=lambda eid: self._victim_key(layer_idx, eid))
         return candidates[:count]
 
@@ -269,8 +256,7 @@ class LRCExpertCachePolicy:
             - self.age_weight * age
         )
 
-    def seed_layer_hotness(self, layer_idx: int,
-                           weights: dict[int, float]) -> None:
+    def seed_layer_hotness(self, layer_idx: int, weights: dict[int, float]) -> None:
         """Seed per-layer hotness from offline stats (decode resident preload).
 
         Freshly preloaded hot experts must survive early choose_victim() calls
@@ -294,7 +280,7 @@ class LRCExpertCachePolicy:
             norm = (w / w_max) if w_max > 0 else 0.0
             state.freq[eid] = max(1, round(norm * self.recent_window))
             state.router_score[eid] = float(w)
-            state.last_used[eid] = state.step    # zero age penalty
+            state.last_used[eid] = state.step  # zero age penalty
 
     def layer_step(self, layer_idx: int) -> int:
         return self.layer_states[layer_idx].step

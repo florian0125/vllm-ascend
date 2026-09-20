@@ -10,10 +10,10 @@ import json
 import re
 import sys
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, TextIO
-
+from typing import TextIO
 
 DETAIL_RE = re.compile(
     r"\[UPDATE-W\]\s+l=(?P<layer>\d+)\s+call=(?P<call>\d+).*?\|needed\|=(?P<needed_count>\d+).*?needed=(?P<needed>\[[^\]]*\])"
@@ -173,28 +173,19 @@ def _print_table(summary: Summary, top_steps: int) -> None:
     print("\nPER_LAYER")
     print("layer,calls,requests,hits,misses,hit_rate")
     for layer, bucket in sorted(summary.layers.items()):
-        print(
-            f"{layer},{bucket.calls},{bucket.requests},{bucket.hits},"
-            f"{bucket.misses},{bucket.hit_rate:.6f}"
-        )
+        print(f"{layer},{bucket.calls},{bucket.requests},{bucket.hits},{bucket.misses},{bucket.hit_rate:.6f}")
 
     print("\nPER_EVENT_STEP")
     print("step,events,requests,hits,misses,hit_rate")
     for step, bucket in sorted(summary.event_steps.items())[:top_steps]:
-        print(
-            f"{step},{bucket.calls},{bucket.requests},{bucket.hits},"
-            f"{bucket.misses},{bucket.hit_rate:.6f}"
-        )
+        print(f"{step},{bucket.calls},{bucket.requests},{bucket.hits},{bucket.misses},{bucket.hit_rate:.6f}")
     if len(summary.event_steps) > top_steps:
         print(f"... truncated {len(summary.event_steps) - top_steps} event steps; use --top-steps to show more")
 
     print(f"\nPER_DECODE_STEP decode_step_layers={summary.decode_step_layers}")
     print("decode_step,layer_events,requests,hits,misses,hit_rate")
     for step, bucket in sorted(summary.decode_steps.items())[:top_steps]:
-        print(
-            f"{step},{bucket.calls},{bucket.requests},{bucket.hits},"
-            f"{bucket.misses},{bucket.hit_rate:.6f}"
-        )
+        print(f"{step},{bucket.calls},{bucket.requests},{bucket.hits},{bucket.misses},{bucket.hit_rate:.6f}")
     if len(summary.decode_steps) > top_steps:
         print(f"... truncated {len(summary.decode_steps) - top_steps} decode steps; use --top-steps to show more")
 

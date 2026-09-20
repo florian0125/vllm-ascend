@@ -15,9 +15,7 @@
 # limitations under the License.
 #
 from enum import Enum, auto
-from functools import wraps
-
-from functools import lru_cache
+from functools import cache, wraps
 
 import torch
 import torch.nn.functional as F
@@ -42,7 +40,7 @@ from vllm_ascend.utils import npu_stream_switch, shared_experts_calculation_stre
 SITU_MX_DST_TYPE_E4M3FN = 36
 
 
-@lru_cache(maxsize=None)
+@cache
 def _c_ascend_op_has_kwarg(op_name: str, kwarg: str) -> bool:
     """True if torch.ops._C_ascend.<op_name> accepts ``kwarg``.
 
@@ -425,8 +423,10 @@ class AscendSharedExperts:
                 clamp_limit=self.swiglu_limit,
                 **(
                     {}
-                    if not (get_current_hardware_profile().supports(HardwareCapability.FUSED_SWIGLU_TUNING_ARGS)
-                            and _c_ascend_op_has_kwarg("npu_dequant_swiglu_quant", "glu_alpha"))
+                    if not (
+                        get_current_hardware_profile().supports(HardwareCapability.FUSED_SWIGLU_TUNING_ARGS)
+                        and _c_ascend_op_has_kwarg("npu_dequant_swiglu_quant", "glu_alpha")
+                    )
                     else {"glu_alpha": self.swiglu_alpha, "glu_bias": self.swiglu_beta}
                 ),
             )
@@ -482,8 +482,11 @@ class AscendSharedExperts:
                 dst_type=torch.float8_e4m3fn,
                 quant_mode=2,
                 clamp_value=self.swiglu_limit,
-                **({"glu_alpha": self.swiglu_alpha, "glu_bias": self.swiglu_beta}
-                   if _c_ascend_op_has_kwarg("npu_swiglu_group_quant", "glu_alpha") else {}),
+                **(
+                    {"glu_alpha": self.swiglu_alpha, "glu_bias": self.swiglu_beta}
+                    if _c_ascend_op_has_kwarg("npu_swiglu_group_quant", "glu_alpha")
+                    else {}
+                ),
             )
         self._wait_for_routed_stage(
             milestones,

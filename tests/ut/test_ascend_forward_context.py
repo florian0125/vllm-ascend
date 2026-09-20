@@ -105,7 +105,7 @@ def _patch_select_moe_comm_method_deps(
         "get_ascend_config",
         lambda: SimpleNamespace(
             enable_fused_mc2=enable_fused_mc2,
-            enable_prefill_mc2=enable_prefill_mc2,
+            enable_prefill_mc2=False,
             expert_offload_config=SimpleNamespace(
                 expert_offload=False,
                 enable_multi_card=False,
@@ -379,14 +379,12 @@ def test_select_moe_comm_method_uses_allgather_without_effective_expert_parallel
         (SimpleNamespace(num_experts_per_tok=2), 2, MoECommType.MC2),
         (SimpleNamespace(num_experts_per_tok=2), 3, MoECommType.ALLTOALL),
         (
-            SimpleNamespace(
-                text_config=SimpleNamespace(num_experts_per_token=4)),
+            SimpleNamespace(text_config=SimpleNamespace(num_experts_per_token=4)),
             1,
             MoECommType.MC2,
         ),
         (
-            SimpleNamespace(
-                text_config=SimpleNamespace(num_experts_per_token=4)),
+            SimpleNamespace(text_config=SimpleNamespace(num_experts_per_token=4)),
             2,
             MoECommType.ALLTOALL,
         ),
@@ -462,31 +460,22 @@ def test_multi_card_torch_offload_admission_uses_owner_capacity_when_sharded(
         lambda: SimpleNamespace(expert_offload_config=offload_config),
     )
     vllm_config = _make_vllm_config()
-    vllm_config.model_config.hf_config = SimpleNamespace(
-        num_experts_per_tok=2)
+    vllm_config.model_config.hf_config = SimpleNamespace(num_experts_per_tok=2)
 
     with patch.object(afc.logger, "info") as log_info:
         selected = afc.select_moe_comm_method(num_tokens, vllm_config)
 
     assert selected == expected
-    admission = next(
-        call for call in log_info.call_args_list
-        if call.args[0].startswith("[MC_ADMISSION]"))
-    assert admission.args[1] == (
-        "sharded" if shard_per_rank else "replicated")
-    assert admission.args[2:5] == (
-        "torch", "owner" if shard_per_rank else "global", num_tokens)
-    assert admission.args[5:11] == (
-        2, 2, 8, 4 if shard_per_rank else 8,
-        num_tokens * 2, 128)
+    admission = next(call for call in log_info.call_args_list if call.args[0].startswith("[MC_ADMISSION]"))
+    assert admission.args[1] == ("sharded" if shard_per_rank else "replicated")
+    assert admission.args[2:5] == ("torch", "owner" if shard_per_rank else "global", num_tokens)
+    assert admission.args[5:11] == (2, 2, 8, 4 if shard_per_rank else 8, num_tokens * 2, 128)
     assert admission.args[12] == expected.name
-    assert admission.args[13] == (
-        "fits" if expected == MoECommType.MC2 else "expert_slots")
+    assert admission.args[13] == ("fits" if expected == MoECommType.MC2 else "expert_slots")
 
 
 @pytest.mark.parametrize(
-    ("h2d_backend", "is_draft_model", "expected", "admission_slots",
-     "placement_scope"),
+    ("h2d_backend", "is_draft_model", "expected", "admission_slots", "placement_scope"),
     [
         ("torch", False, MoECommType.ALLTOALL, 6, "owner"),
         ("memfabric", False, MoECommType.MC2, 48, "global"),
@@ -522,23 +511,16 @@ def test_multi_card_memfabric_admission_uses_global_target_capacity(
         lambda: SimpleNamespace(expert_offload_config=offload_config),
     )
     vllm_config = _make_vllm_config()
-    vllm_config.model_config.hf_config = SimpleNamespace(
-        num_experts_per_tok=6)
+    vllm_config.model_config.hf_config = SimpleNamespace(num_experts_per_tok=6)
 
     with patch.object(afc.logger, "info") as log_info:
-        selected = afc.select_moe_comm_method(
-            3, vllm_config, is_draft_model=is_draft_model)
+        selected = afc.select_moe_comm_method(3, vllm_config, is_draft_model=is_draft_model)
 
     assert selected == expected
-    admission = next(
-        call for call in log_info.call_args_list
-        if call.args[0].startswith("[MC_ADMISSION]"))
-    assert admission.args[1:11] == (
-        "sharded", h2d_backend, placement_scope,
-        3, 6, 8, 48, admission_slots, 18, 128)
+    admission = next(call for call in log_info.call_args_list if call.args[0].startswith("[MC_ADMISSION]"))
+    assert admission.args[1:11] == ("sharded", h2d_backend, placement_scope, 3, 6, 8, 48, admission_slots, 18, 128)
     assert admission.args[12] == expected.name
-    assert admission.args[13] == (
-        "fits" if expected == MoECommType.MC2 else "expert_slots")
+    assert admission.args[13] == ("fits" if expected == MoECommType.MC2 else "expert_slots")
 
 
 @pytest.mark.parametrize(

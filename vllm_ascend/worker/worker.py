@@ -968,6 +968,7 @@ class NPUWorker(WorkerBase):
         # in BOTH regimes (eager & graph), so everything above it — profile_run, the _dummy_run
         # warmups, graph capture and profile_cudagraph_memory — contributes no samples.
         from vllm_ascend.expert_offload.decode_stats import get_decode_stats
+
         _decode_stats = get_decode_stats()
         if _decode_stats is not None:
             # hand over the run header before arming, so the periodic
@@ -977,8 +978,7 @@ class NPUWorker(WorkerBase):
             try:
                 _decode_stats.set_header(self.model_runner._build_decode_stats_header())
             except Exception:
-                logger.warning("[DECODE-STATS] could not build the run header; "
-                               "interim artifacts will omit it")
+                logger.warning("[DECODE-STATS] could not build the run header; interim artifacts will omit it")
             _decode_stats.activate()
 
         # Reset the seed to ensure that the random state is not affected by

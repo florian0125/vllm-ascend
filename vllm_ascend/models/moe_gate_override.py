@@ -82,8 +82,7 @@ _GATE_SUFFIX = ".gate.weight"
 # selection is sqrtsoftplus(logits) + bias inside grouped top-k
 # (experts_selector.py :: _select_experts_with_fusion_ops), so half-applying is
 # worse than not applying. If an artefact ever grows one, this makes it visible.
-_BIAS_KEY_RE = re.compile(
-    r"(?:^|\.)(?:gate\.e_score_correction_bias|gate\.bias|router\.expert_bias|expert_bias)$")
+_BIAS_KEY_RE = re.compile(r"(?:^|\.)(?:gate\.e_score_correction_bias|gate\.bias|router\.expert_bias|expert_bias)$")
 
 # torch.load attempts, in order. weights_only=True first so a slim gate dump never
 # executes pickle; mmap=True so a full trainer checkpoint is mapped rather than
@@ -138,7 +137,8 @@ def _parse_layer_index(key: str) -> int | None:
         raise ValueError(
             f"ambiguous layer index in gate-checkpoint key '{key}': found "
             f"{found}. Refusing to guess — re-dump this checkpoint as "
-            f"{{'gates': {{<layer_index>: tensor}}}}.")
+            f"{{'gates': {{<layer_index>: tensor}}}}."
+        )
     return None
 
 
@@ -170,8 +170,8 @@ def _resolve_ckpt_path(path: str) -> str:
     cands = sorted(glob.glob(os.path.join(path, "*.pt")) + glob.glob(os.path.join(path, "*.bin")))
     if not cands:
         raise FileNotFoundError(
-            f"moe_gate_override_path is a directory with no gate_weights.pt and no "
-            f"*.pt / *.bin inside: {path}")
+            f"moe_gate_override_path is a directory with no gate_weights.pt and no *.pt / *.bin inside: {path}"
+        )
     if len(cands) > 1:
         # swap_gates.py takes next(iter(glob(...))), i.e. whichever the filesystem
         # happens to return first. Which gate checkpoint a benchmark ran with is
@@ -179,7 +179,8 @@ def _resolve_ckpt_path(path: str) -> str:
         raise ValueError(
             f"moe_gate_override_path is a directory with {len(cands)} candidate "
             f"files: {[os.path.basename(c) for c in cands]}. Name one "
-            f"gate_weights.pt, or point the key at a file.")
+            f"gate_weights.pt, or point the key at a file."
+        )
     return cands[0]
 
 
@@ -205,9 +206,7 @@ def _torch_load(path: str):
             return torch.load(path, map_location="cpu", **kwargs)
         except Exception as exc:  # noqa: BLE001 — every failure mode falls back
             last_exc = exc
-            logger.warning(
-                "[GATE-OVERRIDE] torch.load(%s, %s) failed: %s: %s",
-                path, kwargs, type(exc).__name__, exc)
+            logger.warning("[GATE-OVERRIDE] torch.load(%s, %s) failed: %s: %s", path, kwargs, type(exc).__name__, exc)
             if attempt == len(_LOAD_ATTEMPTS) - 1:
                 raise
     raise AssertionError(f"unreachable: {last_exc}")  # pragma: no cover
@@ -228,8 +227,7 @@ def load_gate_checkpoint(path: str) -> GateCheckpoint:
     sha16, size = _file_fingerprint(resolved)
     state = _torch_load(resolved)
     if not isinstance(state, dict):
-        raise TypeError(
-            f"gate checkpoint {resolved} must be a dict, got {type(state).__name__}")
+        raise TypeError(f"gate checkpoint {resolved} must be a dict, got {type(state).__name__}")
 
     gates: dict[int, torch.Tensor] = {}
     skipped_draft: list[str] = []
@@ -239,8 +237,8 @@ def load_gate_checkpoint(path: str) -> GateCheckpoint:
     def _accept(key: str, value, idx: int) -> None:
         if idx in gates:
             raise ValueError(
-                f"gate checkpoint {resolved} maps layer {idx} twice (second key "
-                f"'{key}'). Refusing to pick one.")
+                f"gate checkpoint {resolved} maps layer {idx} twice (second key '{key}'). Refusing to pick one."
+            )
         # clone(): drops the reference to the surrounding container so a trainer
         # checkpoint's optimizer state (or a shared legacy storage blob) is freed
         # by the `del state` below. 43 x [256, 4096] fp32 is ~180 MB, which is
@@ -300,7 +298,8 @@ def load_gate_checkpoint(path: str) -> GateCheckpoint:
             f"no router-gate tensors parsed from {resolved}. Top-level keys: "
             f"{list(state.keys())[:10]}; router-named but unusable: {ignored[:10]}. "
             f"Expected either {{'gates': {{<layer_index>: tensor}}}} or a flat dict "
-            f"of '*.gate.weight' / '*.router.weight' entries.")
+            f"of '*.gate.weight' / '*.router.weight' entries."
+        )
     del state  # release the trainer payload before the rest of the model loads
 
     return GateCheckpoint(
@@ -339,9 +338,7 @@ def _describe_quant(model: nn.Module) -> str:
     name = type(quant_config).__name__
     description = getattr(quant_config, "quant_description", None)
     if isinstance(description, dict):
-        bits = [f"{k}={description[k]}"
-                for k in ("ascend_quant_method", "version", "group_size")
-                if k in description]
+        bits = [f"{k}={description[k]}" for k in ("ascend_quant_method", "version", "group_size") if k in description]
         if bits:
             return f"{name}({', '.join(bits)})"
     return name
@@ -359,10 +356,9 @@ def _log_scope(model: nn.Module, config, num_gates: int, num_hash_layers: int) -
     # AscendMoERunner.quant_type is resolved at construction (fused_moe.py:489), so
     # it is already correct here. getattr-guarded because moe_layers may hold the
     # FusedMoE wrapper rather than the runner depending on the vLLM version.
-    moe_quant_types = sorted({
-        str(getattr(layer, "quant_type", None))
-        for layer in (getattr(model, "moe_layers", None) or [])
-    })
+    moe_quant_types = sorted(
+        {str(getattr(layer, "quant_type", None)) for layer in (getattr(model, "moe_layers", None) or [])}
+    )
     logger.info(
         "[GATE-OVERRIDE] scope: validated ONLY for the DeepSeek-V4-Flash / "
         "DeepSeek-V4-Flash-MTP family with W4A8 or W8A8 quantisation, target model "
@@ -370,20 +366,29 @@ def _log_scope(model: nn.Module, config, num_gates: int, num_hash_layers: int) -
         "are skipped). Observed: model_type=%s architectures=%s quant=%s "
         "moe_quant_type=%s moe_gates=%d num_hash_layers=%d n_routed_experts=%s "
         "hidden_size=%s",
-        model_type, architectures, _describe_quant(model), moe_quant_types or "?",
-        num_gates, num_hash_layers,
-        getattr(config, "n_routed_experts", "?"), getattr(config, "hidden_size", "?"))
+        model_type,
+        architectures,
+        _describe_quant(model),
+        moe_quant_types or "?",
+        num_gates,
+        num_hash_layers,
+        getattr(config, "n_routed_experts", "?"),
+        getattr(config, "hidden_size", "?"),
+    )
     if model_type != "deepseek_v4":
         logger.warning(
             "[GATE-OVERRIDE] model_type=%s is OUTSIDE the validated scope for this "
             "feature (deepseek_v4). Proceeding, but nothing here has been checked "
-            "against this architecture's gate naming or routing.", model_type)
+            "against this architecture's gate naming or routing.",
+            model_type,
+        )
     if getattr(model, "quant_config", None) is None:
         logger.warning(
             "[GATE-OVERRIDE] no quant_config (bf16) — OUTSIDE the validated scope "
             "(W4A8 / W8A8). The override itself is quantisation-independent (the "
             "router gate is built with quant_config=None either way), but note that "
-            "expert offload is a no-op for an unquantized MoE on this build.")
+            "expert offload is a no-op for an unquantized MoE on this build."
+        )
 
 
 def _refresh_precast(gate_module: nn.Module, param: torch.Tensor) -> None:
@@ -419,15 +424,14 @@ def apply_moe_gate_override(
         if idx is None:
             raise ValueError(f"cannot parse a layer index from gate parameter '{name}'")
         if idx in model_gates:
-            raise ValueError(
-                f"two gate parameters map to layer {idx}: "
-                f"'{model_gates[idx]}' and '{name}'")
+            raise ValueError(f"two gate parameters map to layer {idx}: '{model_gates[idx]}' and '{name}'")
         model_gates[idx] = name
     if not model_gates:
         raise RuntimeError(
             f"moe_gate_override_path={path} is set but this model exposes no "
             f"'*{_GATE_SUFFIX}' parameters. The gate naming changed; the override "
-            f"would be a silent no-op.")
+            f"would be a silent no-op."
+        )
 
     config = getattr(model, "config", None)
     num_hash_layers = int(getattr(config, "num_hash_layers", 0) or 0)
@@ -444,7 +448,8 @@ def apply_moe_gate_override(
             f"{sorted(ckpt.gates)[:8]}... but this rank's model has gates for layers "
             f"{sorted(model_gates)[:8]}... — zero overlap. Wrong checkpoint, or a "
             f"layer-index convention mismatch. (tools/swap_gates.py keys on the "
-            f"model's GLOBAL decoder-layer index; the producer must too.)")
+            f"model's GLOBAL decoder-layer index; the producer must too.)"
+        )
 
     # HASH EXCLUSION. Hash-routed layers take their expert ids from gate.tid2eid, not
     # from the gate matrix, and are deliberately left at their base weights. Delete
@@ -468,7 +473,8 @@ def apply_moe_gate_override(
             f"gate checkpoint {ckpt.path} matches only hash-routed layers "
             f"{hash_skipped}, which this feature deliberately does not write. "
             f"Nothing would change. Check the checkpoint's layer indexing against "
-            f"the model's (num_hash_layers={num_hash_layers}).")
+            f"the model's (num_hash_layers={num_hash_layers})."
+        )
 
     # {param_name: fp32 sum of the overridden weight}. Read back by
     # verify_moe_gate_override() after process_weights_after_loading to prove the
@@ -484,7 +490,8 @@ def apply_moe_gate_override(
             raise ValueError(
                 f"gate shape mismatch at layer {idx} ('{name}'): checkpoint "
                 f"{list(new.shape)} vs model {list(param.shape)}. Wrong "
-                f"n_routed_experts or hidden_size — continuing would corrupt routing.")
+                f"n_routed_experts or hidden_size — continuing would corrupt routing."
+            )
         # .to(param.dtype) ON THE CPU TENSOR, before copy_. This is load-bearing for
         # bit-parity with tools/swap_gates.py, which writes
         # `new.to(sd[name].dtype).contiguous()` into the safetensors shard. Letting
@@ -500,7 +507,12 @@ def apply_moe_gate_override(
         total_numel += param.numel()
         logger.debug(
             "[GATE-OVERRIDE] layer %d %s shape=%s dtype=%s sum=%.6e",
-            idx, name, list(param.shape), param.dtype, weight_sum)
+            idx,
+            name,
+            list(param.shape),
+            param.dtype,
+            weight_sum,
+        )
 
     model._moe_gate_override_state = override_state
 
@@ -509,22 +521,39 @@ def apply_moe_gate_override(
         "[GATE-OVERRIDE] applied: swapped=%d/%d gates layers=[%d..%d] "
         "hash_skipped=%s unused_ckpt=%d%s draft_skipped=%d bias_ignored=%d "
         "unparsable=%d ckpt=%s size=%dB sha256_16=%s sum=%.6e numel=%d",
-        len(covered), len(model_gates), covered[0], covered[-1],
-        hash_skipped or "[]", len(unused), f" {unused[:16]}" if unused else "",
-        len(ckpt.skipped_draft), len(ckpt.skipped_bias), len(ckpt.ignored),
-        ckpt.path, ckpt.size, ckpt.sha16, sum(override_state.values()), total_numel)
+        len(covered),
+        len(model_gates),
+        covered[0],
+        covered[-1],
+        hash_skipped or "[]",
+        len(unused),
+        f" {unused[:16]}" if unused else "",
+        len(ckpt.skipped_draft),
+        len(ckpt.skipped_bias),
+        len(ckpt.ignored),
+        ckpt.path,
+        ckpt.size,
+        ckpt.sha16,
+        sum(override_state.values()),
+        total_numel,
+    )
 
     if hash_skipped:
         logger.warning(
             "[GATE-OVERRIDE] %d hash-routed layer(s) %s are present in the checkpoint "
             "and were NOT written, by design. tools/swap_gates.py DOES write them, so "
             "this run is not bit-identical to a swap_gates.py --out model on those "
-            "layers.", len(hash_skipped), hash_skipped)
+            "layers.",
+            len(hash_skipped),
+            hash_skipped,
+        )
     if ckpt.skipped_draft:
         logger.info(
             "[GATE-OVERRIDE] draft (MTP/DSpark) entries in the checkpoint are NOT "
             "applied — the draft has its own load_weights and target/draft routers "
-            "must come from the same fine-tune: %s", ckpt.skipped_draft[:8])
+            "must come from the same fine-tune: %s",
+            ckpt.skipped_draft[:8],
+        )
     if ckpt.skipped_bias:
         logger.warning(
             "[GATE-OVERRIDE] the checkpoint contains %d router-BIAS entries which "
@@ -532,26 +561,33 @@ def apply_moe_gate_override(
             "e_score_correction_bias, so a new gate matrix with the base bias is "
             "neither router. If this fine-tune trained the bias, this needs a "
             "decision before the numbers mean anything.",
-            len(ckpt.skipped_bias), ckpt.skipped_bias[:8])
+            len(ckpt.skipped_bias),
+            ckpt.skipped_bias[:8],
+        )
     if ckpt.ignored:
-        logger.info("[GATE-OVERRIDE] ignored %d unparsable checkpoint keys: %s",
-                    len(ckpt.ignored), ckpt.ignored[:8])
+        logger.info("[GATE-OVERRIDE] ignored %d unparsable checkpoint keys: %s", len(ckpt.ignored), ckpt.ignored[:8])
     # The off-by-num_hash_layers trap: DSV4's learned routers are layers
     # [num_hash_layers, L), so a fine-tune that indexed only its trained layers from 0
     # produces a set that loads cleanly and writes every gate one block too early.
     # Hash exclusion does NOT protect against this — it only drops the first
     # num_hash_layers entries; the rest still land on the wrong layers.
-    if (num_hash_layers
-            and set(ckpt.gates) == set(range(len(ckpt.gates)))
-            and len(ckpt.gates) == len(model_gates) - num_hash_layers):
+    if (
+        num_hash_layers
+        and set(ckpt.gates) == set(range(len(ckpt.gates)))
+        and len(ckpt.gates) == len(model_gates) - num_hash_layers
+    ):
         logger.warning(
             "[GATE-OVERRIDE] the checkpoint covers exactly layers [0..%d], which is "
             "the count of LEARNED-routing MoE layers (%d = %d - %d num_hash_layers). "
             "If the producer indexed only its trained layers, every gate just written "
             "went to the WRONG layer, shifted by %d. Confirm the producer keys on the "
             "model's global decoder-layer index, as tools/swap_gates.py does.",
-            len(ckpt.gates) - 1, len(ckpt.gates), len(model_gates),
-            num_hash_layers, num_hash_layers)
+            len(ckpt.gates) - 1,
+            len(ckpt.gates),
+            len(model_gates),
+            num_hash_layers,
+            num_hash_layers,
+        )
 
 
 def verify_moe_gate_override(model: nn.Module) -> None:
@@ -587,16 +623,20 @@ def verify_moe_gate_override(model: nn.Module) -> None:
                 f"feeds to F.linear for router_logits. Either the swap no longer runs "
                 f"before that function, and _refresh_precast did not repair it, or "
                 f"weight_fp32 is no longer derived from gate.weight. Check the tail "
-                f"of AscendDeepseekV4ForCausalLM.load_weights first.")
+                f"of AscendDeepseekV4ForCausalLM.load_weights first."
+            )
         checked += 1
 
     if missing == len(override_state):
         logger.info(
             "[GATE-OVERRIDE] verified: %d overridden gates, none carrying "
             "weight_fp32 — routing reads gate.weight directly on this build",
-            len(override_state))
+            len(override_state),
+        )
     else:
         logger.info(
-            "[GATE-OVERRIDE] verified: %d/%d overridden gates match their fp32 "
-            "routing copy (%d without weight_fp32)",
-            checked, len(override_state), missing)
+            "[GATE-OVERRIDE] verified: %d/%d overridden gates match their fp32 routing copy (%d without weight_fp32)",
+            checked,
+            len(override_state),
+            missing,
+        )

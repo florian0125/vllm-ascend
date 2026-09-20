@@ -4,6 +4,7 @@ Quantization schemes consume the current layer weight view. Decode pages the
 resident slots before mapping logical IDs; prefill uses a separate view of the
 full expert pool, leaving the persistent decode parameters unchanged.
 """
+
 from copy import copy
 
 import torch
@@ -27,16 +28,19 @@ def _prefill_view(layer, mgr, slot):
     view.moe_config = copy(layer.moe_config)
     view.moe_config.num_local_experts = mgr.mc_shard_size if layer.enable_multi_card else mgr.num_total_experts
     weights = {
-        "w13_weight": "_prefill_w13", "w2_weight": "_prefill_w2",
-        "w13_weight_scale": "_prefill_w13_scale", "w2_weight_scale": "_prefill_w2_scale",
+        "w13_weight": "_prefill_w13",
+        "w2_weight": "_prefill_w2",
+        "w13_weight_scale": "_prefill_w13_scale",
+        "w2_weight_scale": "_prefill_w2_scale",
         "w13_weight_scale_fp32": "_prefill_w13_scale_fp32",
-        "w13_scale_bias": "_prefill_w13_scale_bias", "w2_scale_bias": "_prefill_w2_scale_bias",
+        "w13_scale_bias": "_prefill_w13_scale_bias",
+        "w2_scale_bias": "_prefill_w2_scale_bias",
     }
     for name, pool_name in weights.items():
         pool = getattr(mgr, pool_name, None)
         if pool:
             _set_view_tensor(view, name, pool[slot])
-    view.ascend_expert_map = mgr._get_shard_expert_map() if layer.enable_multi_card else mgr._prefill_log2phy
+    view.ascend_expert_map = mgr._get_shard_expert_map() if layer.enable_multi_card else None
     return view
 
 
@@ -45,15 +49,24 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
     comm = _EXTRA_CTX.moe_comm_method
     num_tokens = topk_ids.size(0)
     router = layer.router
-    routing = dict(router_logits=router_logits,
-                   renormalize=getattr(router, "renormalize", True),
-                   scoring_func=getattr(router, "scoring_func", "softmax"),
-                   e_score_correction_bias=getattr(router, "e_score_correction_bias", None),
-                   routed_scaling_factor=getattr(router, "routed_scaling_factor", 1.0),
-                   is_hash_routed=layer.tid2eid is not None)
+    routing = dict(
+        router_logits=router_logits,
+        renormalize=getattr(router, "renormalize", True),
+        scoring_func=getattr(router, "scoring_func", "softmax"),
+        e_score_correction_bias=getattr(router, "e_score_correction_bias", None),
+        routed_scaling_factor=getattr(router, "routed_scaling_factor", 1.0),
+        is_hash_routed=layer.tid2eid is not None,
+    )
     if layer.enable_multi_card:
-        mgr.update_weights_multi_card(layer, topk_ids, layer.log2phy, topk_weights,
-                                      hidden_states=hidden_states, mc2_mask=layer.ascend_mc2_mask, **routing)
+        mgr.update_weights_multi_card(
+            layer,
+            topk_ids,
+            layer.log2phy,
+            topk_weights,
+            hidden_states=hidden_states,
+            mc2_mask=layer.ascend_mc2_mask,
+            **routing,
+        )
         prefill_regime = _EXTRA_CTX.moe_comm_type != MoECommType.MC2
     else:
         mgr.update_weights(layer, topk_ids, layer.log2phy, topk_weights, hidden_states=hidden_states, **routing)
@@ -66,7 +79,13 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
         if use_prefill:
             slot = mgr.moe_layers.index(layer) % len(mgr._prefill_w13)
             view = _prefill_view(layer, mgr, slot)
-            names = ("num_experts_local", "num_local_experts", "num_experts", "expert_ids_per_ep_rank", "local_expert_indices")
+            names = (
+                "num_experts_local",
+                "num_local_experts",
+                "num_experts",
+                "expert_ids_per_ep_rank",
+                "local_expert_indices",
+            )
             saved = {name: getattr(dispatcher, name) for name in names if hasattr(dispatcher, name)}
             local_count = view.moe_config.num_local_experts
             for name in ("num_experts_local", "num_local_experts"):
@@ -75,23 +94,33 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
             if "num_experts" in saved:
                 dispatcher.num_experts = mgr.num_total_experts
             if layer.enable_multi_card and "local_expert_indices" in saved:
-                dispatcher.local_expert_indices = list(range(dispatcher.ep_rank * local_count, (dispatcher.ep_rank + 1) * local_count))
+                dispatcher.local_expert_indices = list(
+                    range(dispatcher.ep_rank * local_count, (dispatcher.ep_rank + 1) * local_count)
+                )
                 if saved.get("expert_ids_per_ep_rank") is not None:
-                    dispatcher.expert_ids_per_ep_rank = torch.arange(
-                        mgr.num_total_experts, dtype=torch.int32,
-                        device=saved["expert_ids_per_ep_rank"].device) % local_count
+                    dispatcher.expert_ids_per_ep_rank = (
+                        torch.arange(
+                            mgr.num_total_experts, dtype=torch.int32, device=saved["expert_ids_per_ep_rank"].device
+                        )
+                        % local_count
+                    )
         elif layer.log2phy is not None:
             topk_ids = _map_logical_ids_to_phy(
-                topk_ids, layer.log2phy, layer.moe_config.num_local_experts * layer.moe_config.ep_size)
+                topk_ids, layer.log2phy, layer.moe_config.num_local_experts * layer.moe_config.ep_size
+            )
         if hidden_states.dtype != torch.float8_e4m3fn:
             topk_weights = topk_weights.to(hidden_states.dtype)
+        if not use_prefill and num_tokens <= mgr.offload_threshold:
+            mgr.trigger_next_layer_prefetch(layer, hidden_states)
         result = layer.quant_method.apply(
-            layer=view, x=hidden_states, topk_weights=topk_weights, topk_ids=topk_ids,
-            shared_experts=None, shared_experts_input=None,
+            layer=view,
+            x=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_experts=None,
+            shared_experts_input=None,
         )
     finally:
         for name, value in saved.items():
             setattr(dispatcher, name, value)
-    if not use_prefill and num_tokens <= mgr.offload_threshold:
-        mgr.trigger_next_layer_prefetch(layer, hidden_states)
     return result

@@ -425,9 +425,15 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
                 draft_model_config.draft_moe_quant_type = self.quant_type
 
     def _init_expert_offload(self):
+        self.enable_expert_offload = False
+        self.enable_multi_card = False
+        cfg = get_ascend_config().expert_offload_config
+        if not cfg.expert_offload:
+            return
         from vllm_ascend.expert_offload import ExpertOffloadManager
         from vllm_ascend.expert_offload.utils import (
-            init_expert_offload_config, init_log2phy_for_offload,
+            init_expert_offload_config,
+            init_log2phy_for_offload,
             init_log2phy_for_offload_multi_card,
         )
 
@@ -438,8 +444,9 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             return
         mgr = ExpertOffloadManager.get_instance() if cfg.expert_offload else None
         layer_idx = len(mgr.moe_layers) if mgr is not None else 0
-        self.enable_expert_offload, expert_map, capacity = init_expert_offload_config(
-            cfg, self.moe_config.num_logical_experts, layer_idx)
+        self.enable_expert_offload, _, capacity = init_expert_offload_config(
+            cfg, self.moe_config.num_logical_experts, layer_idx
+        )
         self.enable_expert_offload = self.enable_expert_offload and self.quant_type != QuantType.NONE
         self.enable_multi_card = False
         if not self.enable_expert_offload:
@@ -456,17 +463,25 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
                 raise ValueError("num_device_experts must be divisible by the expert parallel size")
             slots //= self.moe_config.ep_size
             self.log2phy = init_log2phy_for_offload_multi_card(
-                self.global_num_experts, slots, self.moe_config.ep_size, self.ep_rank)
+                self.global_num_experts, slots, self.moe_config.ep_size, self.ep_rank
+            )
             self.ascend_expert_map = torch.arange(capacity, dtype=torch.int32)
         else:
             self.log2phy = init_log2phy_for_offload(self.global_num_experts, slots)
-            self.ascend_expert_map = expert_map
+            # IDs are physical slots by the time AllGather dispatch runs.
+            # The no-map path uses this layer's resident capacity.
+            self.ascend_expert_map = None
         self.moe_config.num_local_experts = slots
         self._wrap_weight_loader_for_offload()
         self.quant_method.create_weights(
-            layer=self, num_experts=slots, hidden_size=self.moe_config.hidden_dim,
+            layer=self,
+            num_experts=slots,
+            hidden_size=self.moe_config.hidden_dim,
             intermediate_size_per_partition=self.moe_config.intermediate_size_per_partition,
-            params_dtype=self.params_dtype, weight_loader=self.weight_loader,
+            params_dtype=self.params_dtype,
+            weight_loader=self.weight_loader,
+            unpadded_hidden_size=self.moe_config.hidden_dim_unpadded,
+            global_num_experts=self.moe_config.num_experts,
         )
         mgr.init_layer_cpu_buffers(self, self.offload_layer_idx)
 
@@ -480,6 +495,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         - otherwise → weight params
         """
         from vllm_ascend.expert_offload import ExpertOffloadManager
+
         mgr = ExpertOffloadManager.get_instance()
         layer_moe_idx = self.offload_layer_idx
         # v0.25.1: weight_loader lives on routed_experts (RoutedExperts), not the
@@ -493,32 +509,35 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         # the TOTAL slot count, so divide by ep_size. ep_size=1 (single-card) is
         # a no-op. CPU buffer still gets ALL experts (loaded above this guard).
         ndev = mgr.offload_config.num_device_experts_for_rank(
-            layer_moe_idx, mgr.ep_size if self.enable_multi_card else 1)
+            layer_moe_idx, mgr.ep_size if self.enable_multi_card else 1
+        )
 
-        def _offload_weight_loader(param, loaded_weight, weight_name, shard_id,
-                                   expert_id, **kwargs):
+        def _offload_weight_loader(param, loaded_weight, weight_name, shard_id, expert_id, **kwargs):
             # --- Handle scale/offset/scale_bias params (quantized models) ---
             if "weight_scale" in weight_name:
-                mgr._load_scale_shard(layer_moe_idx, expert_id,
-                                      "w13_weight_scale" if shard_id in ("w1", "w3")
-                                      else "w2_weight_scale",
-                                      shard_id, loaded_weight)
-                if expert_id >= ndev:
-                    return None
+                mgr._load_scale_shard(
+                    layer_moe_idx,
+                    expert_id,
+                    "w13_weight_scale" if shard_id in ("w1", "w3") else "w2_weight_scale",
+                    shard_id,
+                    loaded_weight,
+                )
             elif "weight_offset" in weight_name:
-                mgr._load_scale_shard(layer_moe_idx, expert_id,
-                                      "w13_weight_offset" if shard_id in ("w1", "w3")
-                                      else "w2_weight_offset",
-                                      shard_id, loaded_weight)
-                if expert_id >= ndev:
-                    return None
+                mgr._load_scale_shard(
+                    layer_moe_idx,
+                    expert_id,
+                    "w13_weight_offset" if shard_id in ("w1", "w3") else "w2_weight_offset",
+                    shard_id,
+                    loaded_weight,
+                )
             elif "scale_bias" in weight_name:
-                mgr._load_scale_shard(layer_moe_idx, expert_id,
-                                      "w13_scale_bias" if shard_id in ("w1", "w3")
-                                      else "w2_scale_bias",
-                                      shard_id, loaded_weight)
-                if expert_id >= ndev:
-                    return None
+                mgr._load_scale_shard(
+                    layer_moe_idx,
+                    expert_id,
+                    "w13_scale_bias" if shard_id in ("w1", "w3") else "w2_scale_bias",
+                    shard_id,
+                    loaded_weight,
+                )
             else:
                 # --- Handle weight params (existing logic) ---
                 if shard_id in ("w1", "w3"):
@@ -526,10 +545,10 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
                 elif shard_id == "w2":
                     mgr.load_w2(layer_moe_idx, expert_id, loaded_weight)
                 # Only load to device if expert_id < num_device_experts
-                if shard_id in ("w1", "w2", "w3") and expert_id >= ndev:
-                    return None
-            return orig_wl(param, loaded_weight, weight_name, shard_id,
-                           expert_id, **kwargs)
+            local_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+            if 0 <= local_id < ndev:
+                orig_wl(param, loaded_weight, weight_name, shard_id, expert_id, **kwargs)
+            return True if kwargs.get("return_success", False) else None
 
         self.weight_loader = _offload_weight_loader
 
@@ -727,15 +746,24 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         context = get_forward_context()
         router = self.router
         topm_pair = try_activation_route(
-            context, router_logits, hidden_states, self.moe_config.experts_per_token,
-            getattr(router, "renormalize", True), getattr(router, "scoring_func", "softmax"),
-            getattr(router, "e_score_correction_bias", None), getattr(router, "routed_scaling_factor", 1.0),
-            getattr(router, "custom_routing_function", None), self.tid2eid, self.mix_placement,
-            getattr(router, "topk_group", None), getattr(router, "num_expert_group", None),
+            context,
+            router_logits,
+            hidden_states,
+            self.moe_config.experts_per_token,
+            getattr(router, "renormalize", True),
+            getattr(router, "scoring_func", "softmax"),
+            getattr(router, "e_score_correction_bias", None),
+            getattr(router, "routed_scaling_factor", 1.0),
+            getattr(router, "custom_routing_function", None),
+            self.tid2eid,
+            self.mix_placement,
+            getattr(router, "topk_group", None),
+            getattr(router, "num_expert_group", None),
         )
         if topm_pair is None:
             topk_weights, topk_ids = router._select_experts(
-                hidden_states=hidden_states, router_logits=router_logits, input_ids=input_ids)
+                hidden_states=hidden_states, router_logits=router_logits, input_ids=input_ids
+            )
         else:
             topk_weights, topk_ids = topm_pair
             context.dflash_topm_state.record_selection(context, topk_weights, topk_ids)
@@ -827,7 +855,9 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             if self.enable_expert_offload:
                 from vllm_ascend.expert_offload.routed_experts import apply_offloaded_experts
 
-                fused_experts_results = apply_offloaded_experts(self, hidden_states, topk_weights, topk_ids, router_logits)
+                fused_experts_results = apply_offloaded_experts(
+                    self, hidden_states, topk_weights, topk_ids, router_logits
+                )
             else:
                 fused_experts_results: FusedExpertsResult = self.quant_method.apply(
                     layer=self,

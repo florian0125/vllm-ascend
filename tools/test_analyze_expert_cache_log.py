@@ -4,14 +4,16 @@ from analyze_expert_cache_log import parse_lines, summarize
 
 
 class AnalyzeExpertCacheLogTest(unittest.TestCase):
-
     def test_summarizes_layer_step_and_global_hit_rates(self):
         lines = [
-            "[UPDATE-W] l=0 call=10 topk_shape=(1, 6) |needed|=6 |on_dev|=12 |to_load|=4 reusable=10 needed=[1, 2, 3, 4, 5, 6]",
+            "[UPDATE-W] l=0 call=10 topk_shape=(1, 6) |needed|=6 "
+            "|on_dev|=12 |to_load|=4 reusable=10 needed=[1, 2, 3, 4, 5, 6]",
             "[UPDATE-W] l=0 cache_hit=[1, 2] cache_miss=[3, 4, 5, 6]",
-            "[UPDATE-W] l=1 call=11 topk_shape=(1, 6) |needed|=6 |on_dev|=12 |to_load|=0 reusable=6 needed=[7, 8, 9, 10, 11, 12]",
+            "[UPDATE-W] l=1 call=11 topk_shape=(1, 6) |needed|=6 "
+            "|on_dev|=12 |to_load|=0 reusable=6 needed=[7, 8, 9, 10, 11, 12]",
             "[UPDATE-W] l=1 cache_hit=[7, 8, 9, 10, 11, 12] cache_miss=[]",
-            "[UPDATE-W] l=0 call=12 topk_shape=(1, 6) |needed|=6 |on_dev|=12 |to_load|=3 reusable=9 needed=[1, 2, 3, 7, 8, 9]",
+            "[UPDATE-W] l=0 call=12 topk_shape=(1, 6) |needed|=6 "
+            "|on_dev|=12 |to_load|=3 reusable=9 needed=[1, 2, 3, 7, 8, 9]",
             "[UPDATE-W] l=0 cache_hit=[1, 2, 3] cache_miss=[7, 8, 9]",
         ]
 

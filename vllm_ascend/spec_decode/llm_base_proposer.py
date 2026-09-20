@@ -254,9 +254,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # incomplete metadata, so force the draft to eager when compress is on;
         # the target model can still use FULL_DECODE_ONLY graph.
         self.use_cuda_graph = (
-            self.runner._use_aclgraph()
-            and not self.speculative_config.enforce_eager
-            and not self.use_compress
+            self.runner._use_aclgraph() and not self.speculative_config.enforce_eager and not self.use_compress
         )
         self._raise_if_padded_drafter_batch_disabled_and_full_graph_enabled()
 

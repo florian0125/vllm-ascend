@@ -140,6 +140,7 @@ def set_ascend_forward_context(
     device_metadata_executor=None,
     has_sinks=False,
     eplb_heat_collection_status: bool = False,
+    input_ids: torch.Tensor | None = None,
     dflash_verify_rows=(),
     dflash_topm_state=None,
 ):
@@ -445,8 +446,10 @@ def select_moe_comm_method(
         # is a single fused C++ op. This covers both normal model
         # forward and _dummy_run during profile_run.
         moe_comm_type = MoECommType.ALLTOALL
-    elif (get_ascend_config().expert_offload_config.expert_offload
-            and get_ascend_config().expert_offload_config.enable_multi_card):
+    elif (
+        get_ascend_config().expert_offload_config.expert_offload
+        and get_ascend_config().expert_offload_config.enable_multi_card
+    ):
         # Multi-card offload routes by batch size AND device-buffer fit:
         #  - DECODE (small batch): MC2 with dynamic per-layer placement
         #    (log2phy) + the device buffer (num_device_experts slots). Used
@@ -475,19 +478,18 @@ def select_moe_comm_method(
         _global_slots = min(_offload_config.num_device_experts_list)
         _ep_size = get_ep_group().world_size
         _h2d_backend = getattr(_offload_config, "h2d_backend", "torch")
-        _supports_global_placement = (
-            not _offload_config.shard_per_rank
-            or (_h2d_backend == "memfabric" and not is_draft_model)
+        _supports_global_placement = not _offload_config.shard_per_rank or (
+            _h2d_backend == "memfabric" and not is_draft_model
         )
         _admission_slots = (
             _global_slots
-            if _supports_global_placement else min(
+            if _supports_global_placement
+            else min(
                 _offload_config.num_device_experts_for_rank(i, _ep_size)
-                for i in range(
-                    len(_offload_config.num_device_experts_list)))
+                for i in range(len(_offload_config.num_device_experts_list))
+            )
         )
-        _placement_scope = (
-            "global" if _supports_global_placement else "owner")
+        _placement_scope = "global" if _supports_global_placement else "owner"
         _hf = getattr(vllm_config.model_config, "hf_config", None)
         if _hf is None:
             _hf = vllm_config.model_config.hf_text_config
@@ -505,8 +507,7 @@ def select_moe_comm_method(
         # can double-count routes. Use the local route bound for admission.
         _route_upper_bound = num_tokens * _topk
         _buffer_fits = _route_upper_bound <= _admission_slots
-        if (num_tokens <= mc2_tokens_capacity and num_tokens <= 512
-                and _buffer_fits):
+        if num_tokens <= mc2_tokens_capacity and num_tokens <= 512 and _buffer_fits:
             moe_comm_type = MoECommType.MC2
         else:
             moe_comm_type = MoECommType.ALLTOALL
@@ -526,11 +527,20 @@ def select_moe_comm_method(
                 "route_upper_bound=%s "
                 "mc2_tokens_capacity=%s mc2_hard_limit=512 "
                 "buffer_fits=%s selected=%s reason=%s",
-                ("sharded" if _offload_config.shard_per_rank
-                 else "replicated"),
-                _h2d_backend, _placement_scope, num_tokens, _topk, _ep_size,
-                _global_slots, _admission_slots, _route_upper_bound,
-                mc2_tokens_capacity, _buffer_fits, moe_comm_type.name, _reason)
+                ("sharded" if _offload_config.shard_per_rank else "replicated"),
+                _h2d_backend,
+                _placement_scope,
+                num_tokens,
+                _topk,
+                _ep_size,
+                _global_slots,
+                _admission_slots,
+                _route_upper_bound,
+                mc2_tokens_capacity,
+                _buffer_fits,
+                moe_comm_type.name,
+                _reason,
+            )
     elif moe_comm_policy is MoECommPolicy.ALLGATHER:
         moe_comm_type = MoECommType.ALLGATHER
     else:

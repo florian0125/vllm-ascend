@@ -43,8 +43,7 @@ from ..registry import register_scheme
 SITU_MX_DST_TYPE_E4M3FN = 36
 
 
-def apply_mxfp4_weight_scale_layout(scale: torch.Tensor,
-                                    view_uint8: bool = False) -> torch.Tensor:
+def apply_mxfp4_weight_scale_layout(scale: torch.Tensor, view_uint8: bool = False) -> torch.Tensor:
     """MXFP4 weight-scale layout transform: ``reshape(...,n,k//2,2).transpose(-3,-2)``.
 
     Works on a full tensor ``[g, n, k]`` or a single-expert slice ``[n, k]``
@@ -508,7 +507,5 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
         )
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
-        layer.w13_weight_scale.data = apply_mxfp4_weight_scale_layout(
-            layer.w13_weight_scale.data, view_uint8=True)
-        layer.w2_weight_scale.data = apply_mxfp4_weight_scale_layout(
-            layer.w2_weight_scale.data, view_uint8=True)
+        layer.w13_weight_scale.data = apply_mxfp4_weight_scale_layout(layer.w13_weight_scale.data, view_uint8=True)
+        layer.w2_weight_scale.data = apply_mxfp4_weight_scale_layout(layer.w2_weight_scale.data, view_uint8=True)

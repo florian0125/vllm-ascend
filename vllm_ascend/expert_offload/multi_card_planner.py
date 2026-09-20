@@ -40,13 +40,14 @@ Design contract
 
 The per-layer call sequence (wired up in stage 2) is::
 
-    local_counts  = bincount(topk_ids)              # per-rank
-    global_counts = all_reduce(local_counts, EP)    #通信模式相关, uniform 可优化跳过
-    placement     = plan_placement(global_counts, ep_size, num_device_experts)
-    for e in placement.per_rank_experts[ep_rank]:   # 本 rank 只 H2D 自己分到的
+    local_counts = bincount(topk_ids)  # per-rank
+    global_counts = all_reduce(local_counts, EP)  # 通信模式相关, uniform 可优化跳过
+    placement = plan_placement(global_counts, ep_size, num_device_experts)
+    for e in placement.per_rank_experts[ep_rank]:  # 本 rank 只 H2D 自己分到的
         manager.load_expert_into_slot(layer, e, slot_of(e))
     layer.log2phy.copy_(placement.log2phy)
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -71,6 +72,7 @@ class Placement:
         unassigned: logical expert ids that were active but did not fit (capacity
             exceeded). Must be empty in normal MVP operation.
     """
+
     log2phy: torch.Tensor
     per_rank_experts: list[list[int]] = field(default_factory=list)
     per_rank_load: list[int] = field(default_factory=list)
@@ -80,9 +82,7 @@ class Placement:
 def _sort_active_experts(global_counts):
     """Active experts as (load, id) sorted by (load desc, id asc) — deterministic
     regardless of the order counts were produced in."""
-    active = [(int(global_counts[e]), e)
-              for e in range(int(global_counts.shape[0]))
-              if int(global_counts[e]) > 0]
+    active = [(int(global_counts[e]), e) for e in range(int(global_counts.shape[0])) if int(global_counts[e]) > 0]
     active.sort(key=lambda x: (-x[0], x[1]))
     return active
 
@@ -103,8 +103,7 @@ def _plan_single_rank(global_counts, num_device_experts):
         log2phy[e] = slot  # rank 0 => physical id == slot
         per_rank_experts[0].append(e)
         rank_load[0] += count
-    return Placement(log2phy=log2phy, per_rank_experts=per_rank_experts,
-                     per_rank_load=rank_load, unassigned=unassigned)
+    return Placement(log2phy=log2phy, per_rank_experts=per_rank_experts, per_rank_load=rank_load, unassigned=unassigned)
 
 
 def plan_hot_preload(
@@ -130,9 +129,7 @@ def plan_hot_preload(
     for rank, pair in enumerate(hot_pairs):
         expert_id = int(pair[0])
         if expert_id < 0 or expert_id >= global_num_experts:
-            raise ValueError(
-                f"hot expert id {expert_id} is outside "
-                f"[0, {global_num_experts})")
+            raise ValueError(f"hot expert id {expert_id} is outside [0, {global_num_experts})")
         if expert_id in seen:
             raise ValueError(f"duplicate hot expert id {expert_id}")
         seen.add(expert_id)
@@ -145,8 +142,7 @@ def plan_hot_preload(
     )
 
 
-def _assign_experts_to_ranks(active, ep_size, num_device_experts,
-                             prev_rank_of=None, force_shard=None):
+def _assign_experts_to_ranks(active, ep_size, num_device_experts, prev_rank_of=None, force_shard=None):
     """Assign each expert to a rank. Residence-aware: an expert that was on a
     rank last step (``prev_rank_of``) stays there — no cross-rank move means no
     redundant re-H2D on the new rank (the expert is already physically resident
@@ -169,14 +165,12 @@ def _assign_experts_to_ranks(active, ep_size, num_device_experts,
                 unassigned.append(e)
                 continue
         else:
-            candidates = [r for r in range(ep_size)
-                          if rank_count[r] < num_device_experts]
+            candidates = [r for r in range(ep_size) if rank_count[r] < num_device_experts]
             if not candidates:
                 unassigned.append(e)
                 continue
             home = prev_rank_of.get(e)
-            r = home if home in candidates else min(
-                candidates, key=lambda r: (rank_load[r], r))
+            r = home if home in candidates else min(candidates, key=lambda r: (rank_load[r], r))
         rank_of[e] = r
         rank_load[r] += count
         rank_count[r] += 1
@@ -232,8 +226,8 @@ def plan_placement(
             if pid >= 0:
                 prev_rank_of[expert] = pid // num_device_experts
     rank_of, rank_load, unassigned = _assign_experts_to_ranks(
-        active, ep_size, num_device_experts, prev_rank_of,
-        force_shard=force_shard)
+        active, ep_size, num_device_experts, prev_rank_of, force_shard=force_shard
+    )
 
     # Slot assignment (stable if prev_log2phy given): experts staying on the
     # same rank keep their prev slot (cache hit); new experts fill freed slots
@@ -241,20 +235,16 @@ def plan_placement(
     per_rank_experts = []
     for r in range(ep_size):
         active_r = [e for _c, e in active if rank_of.get(e) == r]
-        slots = _assign_slots_stable(active_r, r, num_device_experts,
-                                     prev_log2phy, hotness)
+        slots = _assign_slots_stable(active_r, r, num_device_experts, prev_log2phy, hotness)
         for slot, eid in enumerate(slots):
             if eid >= 0:
                 log2phy[eid] = r * num_device_experts + slot
         per_rank_experts.append(slots)
 
-    return Placement(log2phy=log2phy, per_rank_experts=per_rank_experts,
-                     per_rank_load=rank_load, unassigned=unassigned)
+    return Placement(log2phy=log2phy, per_rank_experts=per_rank_experts, per_rank_load=rank_load, unassigned=unassigned)
 
 
-
-def _assign_slots_stable(active_r, rank, num_device_experts,
-                         prev_log2phy=None, hotness=None):
+def _assign_slots_stable(active_r, rank, num_device_experts, prev_log2phy=None, hotness=None):
     """Assign slot indices on ``rank``, RETAINING the previous resident set
     (LRU-style) so recurring experts stay cached across steps — not just the
     current topk.
@@ -274,8 +264,7 @@ def _assign_slots_stable(active_r, rank, num_device_experts,
     result = [-1] * num_device_experts
     # 1. Retain previous residents on this rank (persistent hot set).
     if prev_log2phy is not None:
-        prev_list = (prev_log2phy.tolist()
-                     if hasattr(prev_log2phy, "tolist") else prev_log2phy)
+        prev_list = prev_log2phy.tolist() if hasattr(prev_log2phy, "tolist") else prev_log2phy
         for eid, pid in enumerate(prev_list):
             pid = int(pid)
             if pid >= 0 and pid // num_device_experts == rank:
@@ -289,14 +278,12 @@ def _assign_slots_stable(active_r, rank, num_device_experts,
     if hotness is not None:
         new_active.sort(key=lambda e: -float(hotness[e]))
     for eid in new_active:
-        free = next((s for s in range(num_device_experts)
-                     if result[s] == -1), None)
+        free = next((s for s in range(num_device_experts) if result[s] == -1), None)
         if free is not None:
             result[free] = eid
             continue
         # No free slot: evict the coldest NON-active resident.
-        evictees = [s for s in range(num_device_experts)
-                    if result[s] >= 0 and result[s] not in active_set]
+        evictees = [s for s in range(num_device_experts) if result[s] >= 0 and result[s] not in active_set]
         if not evictees:
             break  # every slot holds an active expert this step; can't place
         if hotness is not None:
@@ -326,8 +313,7 @@ def local_expert_counts(
         global counts the planner needs.
     """
     flat = topk_ids.reshape(-1).to(torch.int64)
-    counts = torch.zeros(global_num_experts, dtype=torch.int64,
-                         device=flat.device)
+    counts = torch.zeros(global_num_experts, dtype=torch.int64, device=flat.device)
     counts.scatter_add_(0, flat, torch.ones_like(flat))
     return counts
 
@@ -354,11 +340,11 @@ def gather_global_counts(
     if ep_group is None:
         return local_counts
     import torch.distributed as dist
+
     if not dist.is_initialized():
         return local_counts
     global_counts = local_counts.clone()
-    work = dist.all_reduce(global_counts, op=dist.ReduceOp.SUM,
-                           group=ep_group, async_op=True)
+    work = dist.all_reduce(global_counts, op=dist.ReduceOp.SUM, group=ep_group, async_op=True)
     work.wait()
     return global_counts
 
@@ -398,6 +384,7 @@ def gather_global_counts_cpu(
     if cpu_group is None:
         return local_counts
     import torch.distributed as dist
+
     if not dist.is_initialized():
         return local_counts
     global_counts = local_counts.clone()
@@ -419,6 +406,7 @@ def gather_global_substitution_state_cpu(
     state = torch.stack((local_referenced, local_blocked)).to(torch.int32)
     if cpu_group is not None:
         import torch.distributed as dist
+
         if dist.is_initialized():
             dist.all_reduce(state, op=dist.ReduceOp.MAX, group=cpu_group)
     return state[0].bool(), state[1].bool()
@@ -456,8 +444,9 @@ def plan_for_layer(
 MC2_DISPATCH_TOKEN_HARD_LIMIT = 512
 
 
-def comm_method_for_multi_card(num_tokens: int, mc2_tokens_capacity: int,
-                               mc2_hard_limit: int = MC2_DISPATCH_TOKEN_HARD_LIMIT) -> str:
+def comm_method_for_multi_card(
+    num_tokens: int, mc2_tokens_capacity: int, mc2_hard_limit: int = MC2_DISPATCH_TOKEN_HARD_LIMIT
+) -> str:
     """Decide MC2 (decode) vs ALLTOALL (prefill) for multi-card offload.
 
     Decode (small batch, fits MC2 capacity AND the kernel's 512-token hard
@@ -474,13 +463,12 @@ def comm_method_for_multi_card(num_tokens: int, mc2_tokens_capacity: int,
 def shard_size(num_total_experts: int, ep_size: int) -> int:
     """Experts per rank in a standard contiguous EP shard."""
     assert num_total_experts % ep_size == 0, (
-        f"num_total_experts ({num_total_experts}) must be divisible by ep_size "
-        f"({ep_size}) for a contiguous shard")
+        f"num_total_experts ({num_total_experts}) must be divisible by ep_size ({ep_size}) for a contiguous shard"
+    )
     return num_total_experts // ep_size
 
 
-def shard_expert_map(ep_rank: int, ep_size: int,
-                     num_total_experts: int) -> torch.Tensor:
+def shard_expert_map(ep_rank: int, ep_size: int, num_total_experts: int) -> torch.Tensor:
     """Standard EP shard expert_map for rank ``ep_rank``.
 
     ``expert_map[e] = e - ep_rank*shard`` if e is in this rank's contiguous
@@ -507,8 +495,7 @@ def all2all_local_expert_indices(ep_rank: int, shard_sz: int) -> list:
     return [base + i for i in range(shard_sz)]
 
 
-def all2all_expert_ids_per_ep_rank(shard_sz: int,
-                                   num_total_experts: int) -> list:
+def all2all_expert_ids_per_ep_rank(shard_sz: int, num_total_experts: int) -> list:
     """TokenDispatcherWithAll2AllV.expert_ids_per_ep_rank values for a shard.
 
     ``[i % shard for i in range(num_total_experts)]`` — maps each global expert

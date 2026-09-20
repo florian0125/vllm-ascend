@@ -60,6 +60,7 @@ def build_token_dispatch_input_fixture(
     act_quant_type: torch.dtype | None = None,
     is_per_channel_weight: bool = False,
     mc2_mask: torch.Tensor | None = None,
+    num_local_experts: int = 0,
 ) -> MoETokenDispatchInput:
     mxfp_spec = None
     if quant_type in (QuantType.W8A8MXFP, QuantType.W4A4MXFP):
@@ -74,6 +75,7 @@ def build_token_dispatch_input_fixture(
             mc2_mask=mc2_mask,
             apply_router_weight_on_input=apply_router_weight_on_input,
             pertoken_scale=pertoken_scale,
+            num_local_experts=num_local_experts,
         ),
         quant=MoEQuantParams(
             quant_type=quant_type,
@@ -1075,9 +1077,7 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
                 "vllm_ascend.ops.fused_moe.token_dispatcher.async_all_to_all",
                 return_value=(None, torch.randn(16, 16, dtype=torch.bfloat16), alltoall_handle),
             ) as mock_alltoall,
-            patch(
-                "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_dynamic_quant"
-            ) as mock_dynamic_quant,
+            patch("vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_dynamic_quant") as mock_dynamic_quant,
         ):
             result = self.dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
 
@@ -1115,8 +1115,7 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
 
 
 def test_allgather_token_dispatch_uses_per_layer_expert_capacity():
-    dispatcher = TokenDispatcherWithAllGather(
-        top_k=2, num_experts=128, num_local_experts=99)
+    dispatcher = TokenDispatcherWithAllGather(top_k=2, num_experts=128, num_local_experts=99)
     token_dispatch_input = build_token_dispatch_input_fixture(
         hidden_states=torch.randn(2, 8),
         topk_weights=torch.tensor([[0.7, 0.3], [0.6, 0.4]]),

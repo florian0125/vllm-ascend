@@ -487,8 +487,10 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         token_dispatch_input: MoETokenDispatchInput,
     ):
         use_mxfp_quant = token_dispatch_input.quant.is_mxfp
-        with_quant = (token_dispatch_input.quant.dispatch_with_quant
-                      and token_dispatch_input.quant.quant_type != QuantType.W4A8MXFP)
+        with_quant = (
+            token_dispatch_input.quant.dispatch_with_quant
+            and token_dispatch_input.quant.quant_type != QuantType.W4A8MXFP
+        )
         if has_lora(self.lora_context) and token_dispatch_input.quant.is_quant:
             validate_quant_moe_lora_activation_input(
                 quant_type=token_dispatch_input.quant.quant_type,

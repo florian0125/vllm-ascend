@@ -735,8 +735,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         # after self.mlp is built — DeepseekV4MoE -> FusedMoE ->
         # AscendMoERunner.__init__ registers the MoE layer with the offload
         # manager, so its gate is only findable afterwards.
-        # depends on the method's layer_delta. 
-        # delta=0 (mode2_har) captures the PRE-attention residual and targets this layer; 
+        # depends on the method's layer_delta.
+        # delta=0 (mode2_har) captures the PRE-attention residual and targets this layer;
         # delta=1 (mode2_prevhfr) captures the POST-attention residual
         # and targets the next one.
         self._predict_target_idx = None
@@ -786,8 +786,7 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # AI predictor — the `har` atom: the raw block input
         if self._predict_driver is not None and not self._predict_at_ffn:
-            residual = torch.ops.vllm_ascend.expert_predictor_launch(
-                self._predict_target_idx, hidden_states)
+            residual = torch.ops.vllm_ascend.expert_predictor_launch(self._predict_target_idx, hidden_states)
         else:
             residual = hidden_states.clone()
         full_num_tokens = positions.shape[0]
@@ -806,8 +805,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         # AI predictor — the `hfr` atom: the post-attention block input
         if self._predict_driver is not None and self._predict_at_ffn:
-            residual = torch.ops.vllm_ascend.expert_predictor_launch(
-                self._predict_target_idx, hidden_states)
+            residual = torch.ops.vllm_ascend.expert_predictor_launch(self._predict_target_idx, hidden_states)
         else:
             residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)

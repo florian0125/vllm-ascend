@@ -1,10 +1,14 @@
 """Expert pruning and substitution; base routing is provided by router/."""
+
 from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
+
 from vllm_ascend.ascend_config import get_ascend_config
 
 _prune_thr_npu = None
+
 
 def dynamic_pruning_unsorted(
     topk_weights: torch.Tensor,
@@ -16,16 +20,12 @@ def dynamic_pruning_unsorted(
     """Drop weak top-k experts. Invalid logical id is -1 (not Omni's 512)."""
     invalid_id = -1
 
-    topk_weight_sorted, sorted_indices = torch.sort(
-        topk_weights, dim=1, descending=True)
+    topk_weight_sorted, sorted_indices = torch.sort(topk_weights, dim=1, descending=True)
     topk_id_sorted = torch.gather(topk_ids, dim=1, index=sorted_indices)
     topk_weight_sum = torch.sum(topk_weight_sorted, dim=1, keepdim=True)
-    thr = thresholds.to(device=topk_weight_sorted.device,
-                        dtype=topk_weight_sorted.dtype)
+    thr = thresholds.to(device=topk_weight_sorted.device, dtype=topk_weight_sorted.dtype)
     if thr.numel() != topk_weights.shape[1]:
-        raise ValueError(
-            f"experts_pruning_threshold length {thr.numel()} "
-            f"!= top_k {topk_weights.shape[1]}")
+        raise ValueError(f"experts_pruning_threshold length {thr.numel()} != top_k {topk_weights.shape[1]}")
 
     weak_mask = topk_weight_sorted < topk_weight_sum * thr
 
@@ -72,6 +72,7 @@ def dynamic_pruning_unsorted(
     new_topk_ids = topk_id_sorted.masked_fill(prune_mask, invalid_id)
     return new_topk_weights, new_topk_ids.to(topk_ids.dtype), debug_tensor
 
+
 def maybe_prune_topk_experts(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -86,10 +87,12 @@ def maybe_prune_topk_experts(
         return topk_weights, topk_ids, None
 
     global _prune_thr_npu
-    if (_prune_thr_npu is None
-            or _prune_thr_npu.device != topk_weights.device
-            or _prune_thr_npu.dtype != topk_weights.dtype
-            or _prune_thr_npu.numel() != len(cfg.experts_pruning_threshold)):
+    if (
+        _prune_thr_npu is None
+        or _prune_thr_npu.device != topk_weights.device
+        or _prune_thr_npu.dtype != topk_weights.dtype
+        or _prune_thr_npu.numel() != len(cfg.experts_pruning_threshold)
+    ):
         _prune_thr_npu = torch.tensor(
             cfg.experts_pruning_threshold,
             device=topk_weights.device,
@@ -103,6 +106,7 @@ def maybe_prune_topk_experts(
         debug=cfg.experts_pruning_debug,
     )
 
+
 @dataclass
 class ExpertSubstitutionPlan:
     """A per-source-expert, all-or-nothing substitution plan."""
@@ -110,6 +114,7 @@ class ExpertSubstitutionPlan:
     replacements: dict[int, list[tuple[int, int, int]]]
     referenced: torch.Tensor
     blocked: torch.Tensor
+
 
 def _expert_routing_scores(
     router_logits: torch.Tensor,
@@ -122,6 +127,7 @@ def _expert_routing_scores(
     if scoring_func == "sqrtsoftplus":
         return F.softplus(router_logits).sqrt()
     raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
 
 def plan_expert_substitutions(
     router_logits: torch.Tensor,
@@ -157,10 +163,7 @@ def plan_expert_substitutions(
     lower = boundary * (1 - expert_substitution_threshold)
 
     # 剪枝后的-1不是有效专家，不能参与gather、log2phy索引和替换。
-    valid_routes = (
-        (topk_ids >= 0)
-        & (topk_ids < num_experts)
-    )
+    valid_routes = (topk_ids >= 0) & (topk_ids < num_experts)
 
     # gather不接受-1；log2phy[-1]还会错误读取最后一个专家。
     safe_ids = topk_ids.clamp(
@@ -186,8 +189,7 @@ def plan_expert_substitutions(
     source_order = sorted(
         references,
         key=lambda source_id: (
-            max(selected_scores[token_idx, position].item()
-                for token_idx, position in references[source_id]),
+            max(selected_scores[token_idx, position].item() for token_idx, position in references[source_id]),
             -len(references[source_id]),
             source_id,
         ),
@@ -195,11 +197,9 @@ def plan_expert_substitutions(
     for source_id in source_order:
         source_references = sorted(
             references[source_id],
-            key=lambda item: (
-                selected_scores[item[0], item[1]].item(), item[0], item[1]),
+            key=lambda item: (selected_scores[item[0], item[1]].item(), item[0], item[1]),
         )
-        if any(not bool(low_confidence[token_idx, position])
-               for token_idx, position in source_references):
+        if any(not bool(low_confidence[token_idx, position]) for token_idx, position in source_references):
             blocked[source_id] = True
             continue
 
@@ -207,19 +207,15 @@ def plan_expert_substitutions(
         tentative_ids = planned_ids.clone()
         for token_idx, position in source_references:
             token_scores = selection_scores[token_idx]
-            in_range = ((token_scores >= lower[token_idx])
-                        & (token_scores <= boundary[token_idx]))
-            candidates = (set(torch.where(in_range)[0].tolist())
-                          & cached_experts)
-            candidates.difference_update(
-                tentative_ids[token_idx].tolist())
+            in_range = (token_scores >= lower[token_idx]) & (token_scores <= boundary[token_idx])
+            candidates = set(torch.where(in_range)[0].tolist()) & cached_experts
+            candidates.difference_update(tentative_ids[token_idx].tolist())
             if not candidates:
                 blocked[source_id] = True
                 break
             substitute_id = max(
                 candidates,
-                key=lambda expert_id: (
-                    token_scores[expert_id].item(), -expert_id),
+                key=lambda expert_id: (token_scores[expert_id].item(), -expert_id),
             )
             tentative_ids[token_idx, position] = substitute_id
             tentative.append((token_idx, position, substitute_id))
@@ -229,6 +225,7 @@ def plan_expert_substitutions(
             replacements[source_id] = tentative
 
     return ExpertSubstitutionPlan(replacements, referenced, blocked)
+
 
 def commit_expert_substitutions(
     plan: ExpertSubstitutionPlan,
@@ -243,6 +240,7 @@ def commit_expert_substitutions(
         for token_idx, position, substitute_id in plan.replacements[source_id]:
             out_ids[token_idx, position] = substitute_id
     return out_ids
+
 
 def substitute_experts(
     router_logits: torch.Tensor,
@@ -267,6 +265,7 @@ def substitute_experts(
         allowed,
         topk_ids,
     )
+
 
 def substitute_experts_device(
     router_logits: torch.Tensor,
@@ -323,16 +322,14 @@ def substitute_experts_device(
     if n_tokens == 0 or top_k == 0 or top_k >= num_experts:
         return topk_ids
 
-    scores = _expert_routing_scores(router_logits.to(torch.float32),
-                                    scoring_func)
+    scores = _expert_routing_scores(router_logits.to(torch.float32), scoring_func)
     if e_score_correction_bias is not None:
-        scores = scores + e_score_correction_bias.to(
-            torch.float32).unsqueeze(0)
+        scores = scores + e_score_correction_bias.to(torch.float32).unsqueeze(0)
 
     # topk(k+1) instead of a full sort. The host planner sorts all E
     # columns to read one element; only the (k+1)-th largest is ever used.
     boundary = scores.topk(top_k + 1, dim=-1).values[:, top_k]
-    boundary = boundary.clamp(min=0).unsqueeze(1)                  # [n, 1]
+    boundary = boundary.clamp(min=0).unsqueeze(1)  # [n, 1]
     upper = boundary * (1.0 + expert_substitution_threshold)
     lower = boundary * (1.0 - expert_substitution_threshold)
 
@@ -341,18 +338,16 @@ def substitute_experts_device(
     valid_routes = (topk_ids >= 0) & (topk_ids < num_experts)
     safe_ids = topk_ids.clamp(min=0, max=num_experts - 1).long()
     ids_flat = safe_ids.reshape(-1)
-    selected = scores.gather(1, safe_ids)                          # [n, k]
-    low_confidence = (selected < upper) & valid_routes             # [n, k]
-    miss = valid_routes & (
-        log2phy.gather(0, ids_flat).reshape(n_tokens, top_k) < 0)
+    selected = scores.gather(1, safe_ids)  # [n, k]
+    low_confidence = (selected < upper) & valid_routes  # [n, k]
+    miss = valid_routes & (log2phy.gather(0, ids_flat).reshape(n_tokens, top_k) < 0)
 
     def _any_per_source(flag: torch.Tensor) -> torch.Tensor:
         """[n, k] bool -> [n, k] bool: True where this position's SOURCE
         expert has the flag set at any of its positions. Dense [E]
         accumulator rather than a boolean mask over topk_ids[flag], so the
         shape stays static under graph capture."""
-        acc = torch.zeros(num_experts, dtype=torch.float32,
-                          device=scores.device)
+        acc = torch.zeros(num_experts, dtype=torch.float32, device=scores.device)
         acc.scatter_add_(0, ids_flat, flag.to(torch.float32).reshape(-1))
         return acc.gather(0, ids_flat).reshape(n_tokens, top_k) > 0
 
@@ -360,28 +355,26 @@ def substitute_experts_device(
     # high-confidence, BEFORE looking for candidates
     eligible = miss & low_confidence & ~_any_per_source(miss & ~low_confidence)
 
-    resident = (log2phy >= 0).unsqueeze(0)                         # [1, E]
+    resident = (log2phy >= 0).unsqueeze(0)  # [1, E]
     chosen_count = torch.zeros_like(scores, dtype=torch.float32)
     chosen_count.scatter_add_(1, safe_ids, valid_routes.to(torch.float32))
     chosen = chosen_count > 0
     in_band = (scores >= lower) & (scores <= boundary)
-    candidate = in_band & resident & ~chosen                       # [n, E]
+    candidate = in_band & resident & ~chosen  # [n, E]
     candidate_scores = scores.masked_fill(~candidate, float("-inf"))
-    cand_vals, cand_ids = candidate_scores.topk(top_k, dim=-1)     # [n, k]
+    cand_vals, cand_ids = candidate_scores.topk(top_k, dim=-1)  # [n, k]
 
     # rank the eligible references in each row by ASCENDING selected
     # score, so the r-th least important reference takes the r-th best candidate
     order_key = selected.masked_fill(~eligible, float("inf"))
     position = torch.arange(top_k, device=scores.device)
     strictly_lower = order_key.unsqueeze(1) < order_key.unsqueeze(2)
-    tie_break = ((order_key.unsqueeze(1) == order_key.unsqueeze(2))
-                 & (position.view(1, 1, -1) < position.view(1, -1, 1)))
+    tie_break = (order_key.unsqueeze(1) == order_key.unsqueeze(2)) & (position.view(1, 1, -1) < position.view(1, -1, 1))
     rank = (strictly_lower | tie_break).sum(dim=2).clamp(max=top_k - 1)
 
-    substitute_id = cand_ids.gather(1, rank)                       # [n, k]
+    substitute_id = cand_ids.gather(1, rank)  # [n, k]
     has_candidate = torch.isfinite(cand_vals.gather(1, rank))
 
     ok = eligible & has_candidate
     blocked = _any_per_source(miss & ~ok)
-    return torch.where(ok & ~blocked,
-                       substitute_id.to(topk_ids.dtype), topk_ids)
+    return torch.where(ok & ~blocked, substitute_id.to(topk_ids.dtype), topk_ids)

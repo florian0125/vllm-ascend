@@ -23,7 +23,7 @@ import os
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
+from pydantic import ConfigDict, TypeAdapter, field_serializer, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -598,6 +598,9 @@ class AscendConfig:
     def _parse_expert_offload_config(cls, value):
         return value if isinstance(value, ExpertOffloadConfig) else ExpertOffloadConfig(value)
 
+    @field_serializer("expert_offload_config")
+    def _serialize_expert_offload_config(self, value):
+        return value.config
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_cpu_binding: bool = True
@@ -1806,8 +1809,9 @@ class ExpertOffloadConfig:
         self._validate_config()
 
     def __getattr__(self, key):
-        if key in self.config:
-            return self.config[key]
+        config = self.__dict__.get("config")
+        if config is not None and key in config:
+            return config[key]
         raise AttributeError(f"Config has no attribute '{key}'")
 
     def num_device_experts_for_layer(self, layer_idx: int) -> int:
@@ -1826,12 +1830,12 @@ class ExpertOffloadConfig:
                 raise IndexError(
                     f"num_device_experts list (len {len(val)}) does not cover "
                     f"MoE layer {layer_idx}; set its length to the number of "
-                    f"MoE layers")
+                    f"MoE layers"
+                )
             return val[layer_idx]
         return val
 
-    def num_device_experts_for_rank(self, layer_idx: int,
-                                    ep_size: int = 1) -> int:
+    def num_device_experts_for_rank(self, layer_idx: int, ep_size: int = 1) -> int:
         """Return the physical expert slots held by one EP rank.
 
         ``num_device_experts`` is the global capacity for a layer. Single-card
@@ -1845,7 +1849,8 @@ class ExpertOffloadConfig:
             raise ValueError(
                 "num_device_experts for each multi-card MoE layer must be "
                 "divisible by EP size; "
-                f"layer={layer_idx}, capacity={capacity}, ep_size={ep_size}")
+                f"layer={layer_idx}, capacity={capacity}, ep_size={ep_size}"
+            )
         return capacity // ep_size
 
     def validate_num_moe_layers(self, num_moe_layers: int) -> None:
@@ -1857,7 +1862,8 @@ class ExpertOffloadConfig:
                 f"least the number of MoE layers registered so far "
                 f"({num_moe_layers}); use a scalar or a single-element list to "
                 f"broadcast, or a list of length >= {num_moe_layers} (append "
-                f"one entry per draft MoE layer, e.g. MTP)")
+                f"one entry per draft MoE layer, e.g. MTP)"
+            )
 
     @property
     def num_device_experts_list(self) -> list[int]:
@@ -1876,19 +1882,17 @@ class ExpertOffloadConfig:
             raise TypeError("hot_expert_preload must be a boolean")
         if self.hot_expert_preload:
             if not self.hot_experts_file:
-                raise ValueError(
-                    "hot_expert_preload is True but hot_experts_file is empty")
+                raise ValueError("hot_expert_preload is True but hot_experts_file is empty")
             if not self.hot_experts_file.endswith(".json"):
                 raise TypeError("hot_experts_file must be a .json file")
             # 相对路径相对 expert_offload 模块目录 resolve（热点 JSON 始终放该目录）
             hot_path = self.hot_experts_file
             if not os.path.isabs(hot_path):
-                hot_path = os.path.join(os.path.dirname(__file__),
-                                        "expert_offload", hot_path)
+                hot_path = os.path.join(os.path.dirname(__file__), "expert_offload", hot_path)
             if not (os.path.exists(hot_path) and os.access(hot_path, os.R_OK)):
                 raise ValueError(
-                    f"hot_experts_file not found or unreadable: "
-                    f"{self.hot_experts_file} (resolved: {hot_path})")
+                    f"hot_experts_file not found or unreadable: {self.hot_experts_file} (resolved: {hot_path})"
+                )
         # num_device_experts may be a scalar (broadcast to every MoE layer) or
         # a list of per-layer device-expert buffer sizes. A list must be
         # non-empty with non-negative integer elements. Its length must cover
@@ -1901,14 +1905,11 @@ class ExpertOffloadConfig:
             if len(nde) == 0:
                 raise ValueError("num_device_experts list must not be empty")
             if not all(isinstance(x, int) for x in nde):
-                raise TypeError(
-                    "num_device_experts list elements must be integers")
+                raise TypeError("num_device_experts list elements must be integers")
             if any(x < 0 for x in nde):
-                raise ValueError(
-                    f"num_device_experts list elements must >= 0; got {nde}")
+                raise ValueError(f"num_device_experts list elements must >= 0; got {nde}")
         elif not isinstance(nde, int):
-            raise TypeError(
-                "num_device_experts must be an integer or a list of integers")
+            raise TypeError("num_device_experts must be an integer or a list of integers")
         elif nde < 0:
             raise ValueError(f"num_device_experts must >= 0; got {nde} instead")
         if not isinstance(self.config["num_device_layers"], int):
@@ -1945,26 +1946,20 @@ class ExpertOffloadConfig:
         if not isinstance(self.config["expert_prefetch_num"], int):
             raise TypeError("expert_prefetch_num must be an integer")
         if self.config["expert_prefetch_num"] < 1:
-            raise ValueError(
-                f"expert_prefetch_num must >= 1; "
-                f"got {self.config['expert_prefetch_num']} instead")
+            raise ValueError(f"expert_prefetch_num must >= 1; got {self.config['expert_prefetch_num']} instead")
         # No upper bound here: the ceiling is the forward's token count
         if not isinstance(self.config["expert_prefetch_tokens"], int):
             raise TypeError("expert_prefetch_tokens must be an integer")
         if self.config["expert_prefetch_tokens"] < 1:
-            raise ValueError(
-                f"expert_prefetch_tokens must >= 1; "
-                f"got {self.config['expert_prefetch_tokens']} instead")
+            raise ValueError(f"expert_prefetch_tokens must >= 1; got {self.config['expert_prefetch_tokens']} instead")
         if not isinstance(self.config["enable_multi_card"], bool):
             raise TypeError("enable_multi_card must be a boolean")
         if not isinstance(self.config["enable_multi_card"], bool):
             raise TypeError("enable_multi_card must be a boolean")
         if self.config["h2d_backend"] not in ("torch", "memfabric"):
-            raise ValueError(
-                "h2d_backend must be either 'torch' or 'memfabric'")
+            raise ValueError("h2d_backend must be either 'torch' or 'memfabric'")
         pool_size_gib = self.config["memfabric_pool_size_gib"]
-        if isinstance(pool_size_gib, bool) or not isinstance(
-                pool_size_gib, int):
+        if isinstance(pool_size_gib, bool) or not isinstance(pool_size_gib, int):
             raise TypeError("memfabric_pool_size_gib must be an integer")
         if pool_size_gib < 0:
             raise ValueError("memfabric_pool_size_gib must be >= 0")
@@ -1973,30 +1968,23 @@ class ExpertOffloadConfig:
             raise TypeError("memfabric_log_level must be an integer")
         if self.config["h2d_backend"] == "memfabric":
             if pool_size_gib == 0:
-                raise ValueError(
-                    "memfabric_pool_size_gib must be > 0 when "
-                    "h2d_backend='memfabric'")
-            if (self.config["enable_multi_card"]
-                    and not self.config["shard_per_rank"]):
-                raise ValueError(
-                    "multi-card MemFabric requires shard_per_rank=True")
+                raise ValueError("memfabric_pool_size_gib must be > 0 when h2d_backend='memfabric'")
+            if self.config["enable_multi_card"] and not self.config["shard_per_rank"]:
+                raise ValueError("multi-card MemFabric requires shard_per_rank=True")
         if not isinstance(self.config["expert_substitution_enabled"], bool):
             raise TypeError("expert_substitution_enabled must be a boolean")
-        if not isinstance(self.config["expert_substitution_threshold"],
-                          (int, float)):
+        if not isinstance(self.config["expert_substitution_threshold"], (int, float)):
             raise TypeError("expert_substitution_threshold must be a number")
         if self.config["expert_substitution_threshold"] < 0:
             raise ValueError("expert_substitution_threshold must be >= 0")
         # Validate the prefetch method against the expert predictor's registry
-        from vllm_ascend.expert_offload.expert_predictor import (
-            valid_predictor_names)
+        from vllm_ascend.expert_offload.expert_predictor import valid_predictor_names
+
         predictor = self.config["expert_predictor"]
         if not isinstance(predictor, str):
             raise TypeError("expert_predictor must be a string")
         if predictor not in valid_predictor_names():
-            raise ValueError(
-                f"unknown expert_predictor {predictor!r}; valid names: "
-                f"{valid_predictor_names()}")
+            raise ValueError(f"unknown expert_predictor {predictor!r}; valid names: {valid_predictor_names()}")
         ckpt = self.config["expert_predictor_ckpt"]
         if ckpt is not None and not isinstance(ckpt, str):
             raise TypeError("expert_predictor_ckpt must be a string or null")
@@ -2005,24 +1993,19 @@ class ExpertOffloadConfig:
             # without the prefetch pipeline it drives. Both are startup errors,
             # not runtime degradations.
             if not ckpt:
-                raise ValueError(
-                    f"expert_predictor={predictor!r} requires "
-                    "expert_predictor_ckpt")
+                raise ValueError(f"expert_predictor={predictor!r} requires expert_predictor_ckpt")
             if not (os.path.exists(ckpt) and os.access(ckpt, os.R_OK)):
-                raise ValueError(
-                    f"expert_predictor_ckpt not found or unreadable: {ckpt}")
+                raise ValueError(f"expert_predictor_ckpt not found or unreadable: {ckpt}")
             if not self.config["expert_prefetch_enabled"]:
-                raise ValueError(
-                    f"expert_predictor={predictor!r} requires "
-                    "expert_prefetch_enabled=true")
+                raise ValueError(f"expert_predictor={predictor!r} requires expert_prefetch_enabled=true")
         if not isinstance(self.config["expert_prefetch_wait_timing"], bool):
             raise TypeError("expert_prefetch_wait_timing must be a boolean")
-        if (self.config["expert_prefetch_wait_timing"]
-                and not self.config["expert_prefetch_enabled"]):
+        if self.config["expert_prefetch_wait_timing"] and not self.config["expert_prefetch_enabled"]:
             raise ValueError(
                 "expert_prefetch_wait_timing=true requires "
                 "expert_prefetch_enabled=true: with no prefetch there is no "
-                "join to measure")
+                "join to measure"
+            )
         if not isinstance(self.config["experts_pruning_enabled"], bool):
             raise TypeError("experts_pruning_enabled must be a boolean")
         thr = self.config["experts_pruning_threshold"]
@@ -2067,7 +2050,8 @@ class ActivationRoutingConfig:
                 "activation_routing must be a dict of config options, got "
                 f"{type(user_config).__name__}; to enable it write "
                 '"activation_routing": {"enabled": true} (or omit the section '
-                "to keep the feature disabled)")
+                "to keep the feature disabled)"
+            )
         self.config = self._defaults.copy()
         if user_config and isinstance(user_config, dict):
             for key, value in user_config.items():
@@ -2108,19 +2092,12 @@ class ActivationRoutingConfig:
         if not _is_int(self.config["protected_rows"]) or not (
             1 <= self.config["protected_rows"] <= self.config["verify_block_size"]
         ):
-            raise ValueError(
-                "activation_routing.protected_rows must be an int in "
-                "[1, verify_block_size]")
+            raise ValueError("activation_routing.protected_rows must be an int in [1, verify_block_size]")
         if not _is_int(self.config["suffix_pool_top_k"]) or self.config["suffix_pool_top_k"] < 1:
             raise ValueError("activation_routing.suffix_pool_top_k must be an int >= 1")
         rows = self.config["fused_rows"]
-        if (
-            not isinstance(rows, list)
-            or not rows
-            or any(not _is_int(v) or v <= 0 for v in rows)
-        ):
-            raise ValueError(
-                "activation_routing.fused_rows must be a non-empty list of positive ints")
+        if not isinstance(rows, list) or not rows or any(not _is_int(v) or v <= 0 for v in rows):
+            raise ValueError("activation_routing.fused_rows must be a non-empty list of positive ints")
         limit = self.config["trace_steps_per_bs"]
         if not _is_int(limit) or limit < 1:
             raise ValueError("activation_routing.trace_steps_per_bs must be an int >= 1")
@@ -2158,7 +2135,11 @@ def _is_ascend_config_initialized(config: AscendConfig | None) -> bool:
     """
     if config is None:
         return False
-    return hasattr(config, "ascend_compilation_config") and hasattr(config, "eplb_config") and hasattr(config, "expert_offload_config")
+    return (
+        hasattr(config, "ascend_compilation_config")
+        and hasattr(config, "eplb_config")
+        and hasattr(config, "expert_offload_config")
+    )
 
 
 def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:

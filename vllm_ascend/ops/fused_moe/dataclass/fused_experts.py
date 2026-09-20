@@ -104,8 +104,15 @@ def build_fused_experts_input(
     lora_context=None,
 ) -> MoEFusedExpertsInput:
     if num_local_experts is None:
-        num_local_experts = (layer.moe_config.num_local_experts if layer is not None
-                             else len(w1) if isinstance(w1, (list, tuple)) else w1.shape[0])
+        num_local_experts = (
+            layer.moe_config.num_local_experts
+            if layer is not None
+            else len(w1)
+            if isinstance(w1, (list, tuple))
+            else w1.shape[0]
+            if w1 is not None
+            else 0
+        )
     return MoEFusedExpertsInput(
         hidden_states=hidden_states,
         topk_weights=topk_weights,

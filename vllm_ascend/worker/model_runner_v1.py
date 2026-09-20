@@ -142,6 +142,11 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.dflash_topm_state import (
+    build_verify_segments,
+    resolve_activation_routing_config,
+    validate_activation_routing,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h import get_prebound_copy_sfa_slots
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
@@ -158,16 +163,16 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     reshape_kv_cache_tensors_for_sparse_kv_offload,
     update_sparse_kv_offload_metadata,
 )
-from vllm_ascend.dflash_topm_state import (
-    build_verify_segments,
-    resolve_activation_routing_config,
-    validate_activation_routing,
-)
-from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
+from vllm_ascend.expert_offload.decode_stats import get_decode_stats
+from vllm_ascend.expert_offload.expert_offload_manager import (
+    get_expert_offload_manager,
+    has_expert_offload_manager,
+    maybe_init_expert_offload_manager,
+)
 from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.models.deepseek_v41.cache_config import (
     is_deepseek_v41_cache,
@@ -175,12 +180,6 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
 from vllm_ascend.models.glm5next.cache_views import view_glm5_next_cache
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
 from vllm_ascend.ops.fused_moe.force_eplb import build_force_eplb_topk
-from vllm_ascend.expert_offload.expert_offload_manager import (
-    maybe_init_expert_offload_manager,
-    has_expert_offload_manager,
-    get_expert_offload_manager,
-)
-from vllm_ascend.expert_offload.decode_stats import get_decode_stats
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -516,10 +515,10 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.num_rejected_tokens_event = torch.npu.Event()
             self.num_rejected_tokens_copy_stream = torch.npu.Stream()
-            
+
         # pending record for deferred speculative-decoding statistics
         self._spec_stats_pending: tuple[list[int], int] | None = None
-        
+
         try:
             self.dcp_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
@@ -2621,6 +2620,7 @@ class NPUModelRunner(GPUModelRunner):
                 skip_compiled=has_encoder_input,
                 has_sinks=self._has_sinks,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                input_ids=model_kwargs.get("input_ids"),
                 dflash_verify_rows=dflash_verify_rows,
                 dflash_topm_state=self.dflash_topm_state,
             ),
@@ -2945,7 +2945,7 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
-        
+
         # Capture speculative-decoding acceptance for the end-of-run summary
         self._record_spec_decode_stats(spec_decode_metadata, valid_sampled_token_ids, invalid_req_indices)
 
@@ -3258,7 +3258,7 @@ class NPUModelRunner(GPUModelRunner):
             req_id_to_index_output_copy,
             invalid_req_indices,
         )
-        
+
     def _spec_stats_eligible(self, spec_decode_metadata, invalid_req_indices):
         """Rows that count toward this step's speculative-decoding sample.
 
@@ -3373,7 +3373,7 @@ class NPUModelRunner(GPUModelRunner):
             proposed=proposed_total,
             n_drafts=n_drafts,
         )
-        
+
     def _build_decode_stats_header(self) -> dict:
         """Run-configuration header for the statistics summary.
 
@@ -3393,20 +3393,25 @@ class NPUModelRunner(GPUModelRunner):
                 f"tp={self.parallel_config.tensor_parallel_size} "
                 f"max_num_seqs={self.max_num_reqs} "
                 f"max_model_len={self.max_model_len} "
-                f"mtp={'on(k=%d)' % self.num_spec_tokens if spec else 'off'}")
+                f"mtp={f'on(k={self.num_spec_tokens})' if spec else 'off'}")
         except Exception:
             pass
         manager = getattr(self, "offload_manager", None)
         if manager is not None:
             try:
                 config = manager.offload_config
+                prefetch_label = f"on(num={config.expert_prefetch_num})" if config.expert_prefetch_enabled else "off"
+                subst_label = (
+                    f"on({config.expert_substitution_threshold:.3f})"
+                    if config.expert_substitution_enabled else "off"
+                )
                 lines.append(
                     f"offload  : device_experts={manager.num_device_experts}"
                     f"/{manager.num_total_experts} topk={manager.topk} "
                     f"threshold={manager.offload_threshold} "
                     f"policy={'lrc' if config.cache_policy_enabled else 'off'} "
-                    f"prefetch={'on(num=%d)' % config.expert_prefetch_num if config.expert_prefetch_enabled else 'off'} "
-                    f"subst={'on(%.3f)' % config.expert_substitution_threshold if config.expert_substitution_enabled else 'off'} "
+                    f"prefetch={prefetch_label} "
+                    f"subst={subst_label} "
                     f"multi_card={config.enable_multi_card} "
                     f"debug={config.moe_offload_debug}")
                 # the decode/prefill split is decided on MoE token ROWS, and
@@ -3438,7 +3443,7 @@ class NPUModelRunner(GPUModelRunner):
         else:
             lines.append("offload  : disabled (spec-decode statistics only)")
         return {"lines": lines}
-    
+
     def shutdown(self) -> None:
         """Emit the decode-statistics summary, then hand off to the parent.
 
@@ -4649,6 +4654,7 @@ class NPUModelRunner(GPUModelRunner):
                 device_metadata_executor=active_device_metadata_executor,
                 has_sinks = self._has_sinks,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                input_ids=input_ids,
                 dflash_topm_state=self.dflash_topm_state,
             ):
                 if not is_graph_capturing and self.ascend_config.enable_force_eplb \
@@ -4810,14 +4816,14 @@ class NPUModelRunner(GPUModelRunner):
                 if "sink" in name:
                     self._has_sinks = True
                     break
-                
+
             # ReMoE Check: get_model() has now run load_weights (which applied the
             # gate override) AND process_weights_after_loading (which derived
             # gate.weight_fp32 from it). Assert the two agree here — a no-op unless
             # moe_gate_override_path is set
             from vllm_ascend.models.moe_gate_override import verify_moe_gate_override
             verify_moe_gate_override(self.model)
-                
+
             if hasattr(self, 'offload_manager'):
                 self._finalize_offload_setup()
             if self.drafter:
@@ -6653,21 +6659,6 @@ class NPUModelRunner(GPUModelRunner):
         finally:
             if hasattr(self, 'offload_manager'):
                 self.offload_manager._skip_prefill = False
-
-        reset_graph_params()
-
-        # NOTE: This is a serious problem that we maintain two extra copies of the KV cache as the instance
-        # variable of the attention layers, when they are local variables in the upstream vLLM code.
-        # We have to manually clear them here to release memory after profiling.
-        for layer in self.compilation_config.static_forward_context.values():
-            if hasattr(layer, "impl"):
-                if hasattr(layer.impl, "key_cache"):
-                    layer.impl.key_cache = None
-                if hasattr(layer.impl, "value_cache"):
-                    layer.impl.value_cache = None
-
-        gc.collect()
-        torch.accelerator.empty_cache()
 
         return result
 

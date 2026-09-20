@@ -66,9 +66,7 @@ def create_predictor(name: str, ckpt_path):
         return None
     cls = _REGISTRY.get(name)
     if cls is None:
-        raise ValueError(
-            f"unknown expert predictor {name!r}; valid names: "
-            f"{valid_predictor_names()}")
+        raise ValueError(f"unknown expert predictor {name!r}; valid names: {valid_predictor_names()}")
     return cls(ckpt_path)
 
 
@@ -93,12 +91,9 @@ class _LowRankHead:
     def __init__(self, params, device):
         missing = [k for k in self.PARAM_KEYS if k not in params]
         if missing:
-            raise ValueError(
-                f"lowrank checkpoint is missing params {missing}; "
-                f"found {sorted(params)}")
+            raise ValueError(f"lowrank checkpoint is missing params {missing}; found {sorted(params)}")
         for key in self.PARAM_KEYS:
-            setattr(self, key, params[key].to(
-                device=device, dtype=torch.bfloat16).contiguous())
+            setattr(self, key, params[key].to(device=device, dtype=torch.bfloat16).contiguous())
         self.width = int(self.b1.shape[-1])
         self.rank = int(self.Wd.shape[-1])
 
@@ -154,24 +149,30 @@ class _TrainedPredictor:
         self.num_hash_layers = 0
         self.arch = ""
 
-    def finalize(self, device, num_moe_layers: int, num_hash_layers: int,
-                 hidden_size: int, hc_mult, num_total_experts: int,
-                 model_top_k: int) -> None:
+    def finalize(
+        self,
+        device,
+        num_moe_layers: int,
+        num_hash_layers: int,
+        hidden_size: int,
+        hc_mult,
+        num_total_experts: int,
+        model_top_k: int,
+    ) -> None:
         """Load the checkpoint onto `device`. Called once, at offload finalize.
 
         Deferred to finalize because the device and the model geometry are only
         known once the model exists, and the head must be resident before graph
         capture.
         """
-        state = torch.load(self.ckpt_path, map_location="cpu",
-                           weights_only=False)
+        state = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
         meta = state["meta"]
         self.arch = str(meta["arch"])
         head_cls = _ARCH_HEADS.get(self.arch)
         if head_cls is None:
             raise ValueError(
-                f"{self.ckpt_path}: unsupported predictor arch {self.arch!r}; "
-                f"supported: {sorted(_ARCH_HEADS)}")
+                f"{self.ckpt_path}: unsupported predictor arch {self.arch!r}; supported: {sorted(_ARCH_HEADS)}"
+            )
         self.in_dim = int(meta["in_dim"])
         self.top_k = int(meta["top_k"])
         self.num_heads = int(meta["L"])
@@ -187,17 +188,23 @@ class _TrainedPredictor:
             logger.warning(
                 "[PREFETCH-AI] checkpoint expert space E=%d != model "
                 "num_total_experts=%d; predicted ids outside [0, %d) are "
-                "dropped", ckpt_experts, num_total_experts, num_total_experts)
+                "dropped",
+                ckpt_experts,
+                num_total_experts,
+                num_total_experts,
+            )
         if self.top_k != model_top_k:
             logger.warning(
-                "[PREFETCH-AI] checkpoint top_k=%d != model top_k=%d; the "
-                "prediction width differs from the router's", self.top_k,
-                model_top_k)
+                "[PREFETCH-AI] checkpoint top_k=%d != model top_k=%d; the prediction width differs from the router's",
+                self.top_k,
+                model_top_k,
+            )
         if not meta.get("bias_aware_select", True):
             logger.warning(
                 "[PREFETCH-AI] checkpoint was selected on the NO-BIAS cov@k "
                 "but inference ranks with e_score_correction_bias, as the "
-                "model's router does")
+                "model's router does"
+            )
 
         # The checkpoint covers the LAST `L` MoE layers: the study's dump drops
         # the leading table-routed layers. A mismatch here maps every head onto
@@ -206,12 +213,15 @@ class _TrainedPredictor:
         if self.layer_offset < 0:
             raise ValueError(
                 f"{self.ckpt_path}: checkpoint covers L={self.num_heads} "
-                f"layers but the model has only {num_moe_layers} MoE layers")
+                f"layers but the model has only {num_moe_layers} MoE layers"
+            )
         if self.layer_offset != num_hash_layers:
             logger.warning(
-                "[PREFETCH-AI] layer_offset=%d != num_hash_layers=%d; prefetch "
-                "coverage may be shifted by %d layers", self.layer_offset,
-                num_hash_layers, self.layer_offset - num_hash_layers)
+                "[PREFETCH-AI] layer_offset=%d != num_hash_layers=%d; prefetch coverage may be shifted by %d layers",
+                self.layer_offset,
+                num_hash_layers,
+                self.layer_offset - num_hash_layers,
+            )
 
         self.head = head_cls(state["params"], device)
         # mu/sd are [1, L, in_dim] when the study standardized inputs and
@@ -222,9 +232,18 @@ class _TrainedPredictor:
         logger.info(
             "[PREFETCH-AI] predictor=%s arch=%s L=%d layer_offset=%d "
             "layer_delta=%d in_dim=%d width=%d rank=%d E=%d top_k=%d ckpt=%s",
-            self.predictor_name, self.arch, self.num_heads, self.layer_offset,
-            self.LAYER_DELTA, self.in_dim, self.head.width, self.head.rank,
-            ckpt_experts, self.top_k, self.ckpt_path)
+            self.predictor_name,
+            self.arch,
+            self.num_heads,
+            self.layer_offset,
+            self.LAYER_DELTA,
+            self.in_dim,
+            self.head.width,
+            self.head.rank,
+            ckpt_experts,
+            self.top_k,
+            self.ckpt_path,
+        )
 
     def _prepare_stat(self, t: torch.Tensor, device) -> torch.Tensor:
         t = t.to(device=device, dtype=torch.float32)
@@ -232,10 +251,8 @@ class _TrainedPredictor:
             t = t[0]
         return t.expand(self.num_heads, self.in_dim).contiguous()
 
-    def _solve_dimensions(self, hidden_size: int, hc_mult,
-                          num_total_experts: int) -> None:
-        expect = (self.IN_FEATURES * hidden_size
-                  + self.E_FEATURES * num_total_experts)
+    def _solve_dimensions(self, hidden_size: int, hc_mult, num_total_experts: int) -> None:
+        expect = self.IN_FEATURES * hidden_size + self.E_FEATURES * num_total_experts
         if self.RES_FEATURES:
             per = self.RES_FEATURES * hidden_size
             rem = self.in_dim - expect
@@ -244,18 +261,21 @@ class _TrainedPredictor:
                     f"{self.ckpt_path}: in_dim={self.in_dim} is not "
                     f"{self.IN_FEATURES}*H + {self.E_FEATURES}*E + "
                     f"k*{self.RES_FEATURES}*H for H={hidden_size}, "
-                    f"E={num_total_experts}")
+                    f"E={num_total_experts}"
+                )
             res_streams = rem // per
             if hc_mult is not None and res_streams != hc_mult:
                 raise ValueError(
                     f"{self.ckpt_path}: in_dim={self.in_dim} implies "
                     f"{res_streams} hyper-connection streams but the model has "
-                    f"hc_mult={hc_mult} (H={hidden_size})")
+                    f"hc_mult={hc_mult} (H={hidden_size})"
+                )
         elif self.in_dim != expect:
             raise ValueError(
                 f"{self.ckpt_path}: in_dim={self.in_dim} != "
                 f"{self.IN_FEATURES}*H + {self.E_FEATURES}*E = {expect} "
-                f"for H={hidden_size}, E={num_total_experts}")
+                f"for H={hidden_size}, E={num_total_experts}"
+            )
 
     def head_index(self, target_idx: int):
         """TARGET MoE-layer index -> head index, or None when not covered.
@@ -271,8 +291,7 @@ class _TrainedPredictor:
         h = target_idx - self.layer_offset
         return h if 0 <= h < self.num_heads else None
 
-    def predict(self, head_idx: int, feat: torch.Tensor,
-                e_score_correction_bias, num_total_experts: int = 0):
+    def predict(self, head_idx: int, feat: torch.Tensor, e_score_correction_bias, num_total_experts: int = 0):
         """[n, in_dim] -> (ids [n, top_k] int32, scores [n, top_k] fp32).
 
         The head emits router LOGITS. Ranking then reproduces the study's
@@ -290,8 +309,7 @@ class _TrainedPredictor:
         logits = self.head.forward(head_idx, x_n)
         scores = F.softplus(logits).sqrt()
         if e_score_correction_bias is not None:
-            scores = scores + e_score_correction_bias.to(
-                torch.float32).unsqueeze(0)
+            scores = scores + e_score_correction_bias.to(torch.float32).unsqueeze(0)
         if 0 < num_total_experts < scores.shape[-1]:
             # A head wider than the model's expert space would index past the
             # per-layer CPU buffers inside the copy loop. Truncate on device so
@@ -375,11 +393,11 @@ class ExpertPredictorDriver:
         # inside mlp(T) and the slot is next reused at target T+2, whose staging
         # copy is after that join.
         self._feat = None
-        self._ids_h = None           # [mt, k] int32 pinned  — result landing
-        self._scores_h = None        # [mt, k] fp32 pinned
-        self._log2phy_h = None       # [L, E] int32 pinned, per-layer rows
+        self._ids_h = None  # [mt, k] int32 pinned  — result landing
+        self._scores_h = None  # [mt, k] fp32 pinned
+        self._log2phy_h = None  # [L, E] int32 pinned, per-layer rows
         self._log2phy_np = None
-        self._mask_h = None          # [mt] int32 pinned     — multi card only
+        self._mask_h = None  # [mt] int32 pinned     — multi card only
         # target_idx -> (n_tok, k, has_mask). Single-threaded by construction
         # and deliberately unlocked: both writers are the forward thread, and
         # the host callbacks read the pinned buffers, never this dict. A lock
@@ -424,24 +442,27 @@ class ExpertPredictorDriver:
             # space; another scoring function would rank the same logits in a
             # different space than the checkpoint was selected on.
             raise ValueError(
-                f"expert_predictor expects scoring_func='sqrtsoftplus'; the "
-                f"model declares {scoring_func!r}")
+                f"expert_predictor expects scoring_func='sqrtsoftplus'; the model declares {scoring_func!r}"
+            )
         if num_moe_layers != int(config.num_hidden_layers):
             raise ValueError(
                 f"expert_predictor needs every MoE layer registered: "
                 f"{num_moe_layers} registered vs num_hidden_layers="
-                f"{config.num_hidden_layers}")
+                f"{config.num_hidden_layers}"
+            )
         if not hasattr(torch.ops.vllm_ascend, "expert_predictor_launch"):
             # The decoder layer reaches launch() only through that op; without
             # it the capture site silently never fires.
             raise RuntimeError(
                 "torch.ops.vllm_ascend.expert_predictor_launch is not "
-                "registered — expert_predictor.py did not import cleanly")
+                "registered — expert_predictor.py did not import cleanly"
+            )
 
         # AllGather concatenates every DP rank's rows before the MoE, so the
         # count compared against offload_threshold is dp_size x the rows the
         # decoder layer sees. Multi-card gates on the comm type instead.
         from vllm.distributed.parallel_state import get_dp_group
+
         self._dp_size = get_dp_group().world_size
 
         device = next(model.parameters()).device
@@ -463,37 +484,38 @@ class ExpertPredictorDriver:
         # bf16 matches the layer input, so the staging copy is not a cast;
         # predict() upcasts to fp32 for the normalisation. Two slots — see
         # __init__.
-        self._feat = torch.zeros([2, mt, self.predictor.in_dim],
-                                 dtype=torch.bfloat16, device=device)
+        self._feat = torch.zeros([2, mt, self.predictor.in_dim], dtype=torch.bfloat16, device=device)
         # Deliberately NOT the manager's shared topk_ids_h / topk_weights_h:
         # those are written by the compute stream while these are written by
         # the prefetch stream. One slot suffices here — same-stream FIFO puts
         # each chain's host callback ahead of the next chain's D2H.
-        self._ids_h = torch.zeros([mt, k_land], dtype=torch.int32,
-                                  device="cpu", pin_memory=True)
-        self._scores_h = torch.zeros([mt, k_land], dtype=torch.float32,
-                                     device="cpu", pin_memory=True)
+        self._ids_h = torch.zeros([mt, k_land], dtype=torch.int32, device="cpu", pin_memory=True)
+        self._scores_h = torch.zeros([mt, k_land], dtype=torch.float32, device="cpu", pin_memory=True)
         # Per-layer log2phy rows, same reason. A row of a contiguous pinned 2-D
         # tensor is itself pinned and contiguous.
-        self._log2phy_h = torch.zeros([num_moe_layers, mgr.num_total_experts],
-                                      dtype=torch.int32, device="cpu",
-                                      pin_memory=True)
+        self._log2phy_h = torch.zeros(
+            [num_moe_layers, mgr.num_total_experts], dtype=torch.int32, device="cpu", pin_memory=True
+        )
         self._log2phy_np = self._log2phy_h.numpy()
-        self._mask_h = torch.zeros(mt, dtype=torch.int32, device="cpu",
-                                   pin_memory=True)
+        self._mask_h = torch.zeros(mt, dtype=torch.int32, device="cpu", pin_memory=True)
         self._pending = {}
         self.ready = True
 
-        covered = [i for i in range(num_moe_layers)
-                   if self.predictor.head_index(i) is not None]
+        covered = [i for i in range(num_moe_layers) if self.predictor.head_index(i) is not None]
         logger.info(
             "[PREFETCH-AI] armed: targets=%d layers=%s..%s layer_delta=%d "
             "multi_card=%s dp_size=%d rows_buffer=%d prefetch_tokens=%d "
             "prefetch_topk=%d (uncovered targets stay on the fate driver)",
-            len(covered), covered[0] if covered else None,
-            covered[-1] if covered else None, self.layer_delta,
-            mgr.enable_multi_card, self._dp_size, mt, mgr.prefetch_tokens,
-            mgr.prefetch_topk)
+            len(covered),
+            covered[0] if covered else None,
+            covered[-1] if covered else None,
+            self.layer_delta,
+            mgr.enable_multi_card,
+            self._dp_size,
+            mt,
+            mgr.prefetch_tokens,
+            mgr.prefetch_topk,
+        )
 
     # -- runtime --------------------------------------------------------- #
 
@@ -504,8 +526,7 @@ class ExpertPredictorDriver:
         hash layers and a layer-shifted head's uncovered leading layer keep the
         exact tid2eid / gate prediction instead of losing prefetch entirely.
         """
-        return (self.ready
-                and self.predictor.head_index(target_idx) is not None)
+        return self.ready and self.predictor.head_index(target_idx) is not None
 
     def has_pending(self, target_idx: int) -> bool:
         return target_idx in self._pending
@@ -560,9 +581,9 @@ class ExpertPredictorDriver:
             if not self._stale_warned:
                 self._stale_warned = True
                 logger.warning(
-                    "[PREFETCH-AI] launch found an unfinished predict for "
-                    "target(s) %s — a finish call site is missing",
-                    sorted(self._pending))
+                    "[PREFETCH-AI] launch found an unfinished predict for target(s) %s — a finish call site is missing",
+                    sorted(self._pending),
+                )
             # clear on BOTH paths.
             if not _EXTRA_CTX.capturing:
                 mgr._prefetch_stream.synchronize()
@@ -576,13 +597,11 @@ class ExpertPredictorDriver:
             feat_ready = torch_npu.npu.Event()
             torch_npu.npu.current_stream().record_event(feat_ready)
             # TARGET layer's bias: noaux_tc ranks with it, and it is per-layer.
-            bias = getattr(getattr(layer, "gate", None),
-                           "e_score_correction_bias", None)
+            bias = getattr(getattr(layer, "gate", None), "e_score_correction_bias", None)
             mc2_mask = _EXTRA_CTX.mc2_mask if mgr.enable_multi_card else None
             with torch_npu.npu.stream(mgr._prefetch_stream):
                 mgr._prefetch_stream.wait_event(feat_ready)
-                ids, scores = self.predictor.predict(
-                    head_idx, stage, bias, mgr.num_total_experts)
+                ids, scores = self.predictor.predict(head_idx, stage, bias, mgr.num_total_experts)
                 k = ids.shape[1]
                 # non_blocking into PINNED memory on the prefetch stream. In
                 # eager, finish() synchronizes this stream before any host read;
@@ -595,16 +614,14 @@ class ExpertPredictorDriver:
                 # not left stale: _prefetch_host_cb restores it on failure and
                 # the write-back replays regardless, so a stale row would
                 # publish residency for experts that were never loaded.
-                self._log2phy_h[target_idx].copy_(layer.log2phy,
-                                                  non_blocking=True)
+                self._log2phy_h[target_idx].copy_(layer.log2phy, non_blocking=True)
                 has_mask = mc2_mask is not None
                 if has_mask:
                     # int32, not bool: Ascend has no async bool D2H and a sync
                     # here would break capture. mask is [padded_num_tokens] with
                     # mask[:num_actual_tokens]=True and our rows are the
                     # pre-prepare() rows, so mask[:n_tok] aligns with them.
-                    self._mask_h[:n_tok].copy_(
-                        mc2_mask[:n_tok].to(torch.int32), non_blocking=True)
+                    self._mask_h[:n_tok].copy_(mc2_mask[:n_tok].to(torch.int32), non_blocking=True)
             self._pending[target_idx] = (n_tok, k, has_mask)
         except Exception:
             # No host Event is held on this path, so a failure cannot hang the
@@ -645,12 +662,15 @@ class ExpertPredictorDriver:
             # [_multi_card] is reached unchanged. Multi card consumes the pinned
             # log2phy tensor plus the mask and ignores the scores and the numpy
             # view; single card is the reverse.
-            staged = (self._ids_h[:n_tok, :k],
-                      self._scores_h[:n_tok, :k],
-                      self._log2phy_h[target_idx],
-                      self._log2phy_np[target_idx],
-                      layer, target_idx,
-                      self._mask_h[:n_tok] if has_mask else None)
+            staged = (
+                self._ids_h[:n_tok, :k],
+                self._scores_h[:n_tok, :k],
+                self._log2phy_h[target_idx],
+                self._log2phy_np[target_idx],
+                layer,
+                target_idx,
+                self._mask_h[:n_tok] if has_mask else None,
+            )
             mgr._dispatch_prefetch(staged, ready_event)
         except Exception:
             mgr._note_cb_failure("expert predictor finish")
@@ -667,8 +687,7 @@ def maybe_create_driver(manager):
     cfg = manager.offload_config
     if not (cfg.expert_offload and cfg.expert_prefetch_enabled):
         return None
-    predictor = create_predictor(cfg.expert_predictor,
-                                 cfg.expert_predictor_ckpt)
+    predictor = create_predictor(cfg.expert_predictor, cfg.expert_predictor_ckpt)
     if predictor is None:
         return None
     _DRIVER = ExpertPredictorDriver(manager, predictor)
@@ -700,10 +719,8 @@ def get_driver():
 # instead routes through auto_functionalized, which clones the mutated argument
 # and would send the staging write to the clone. Same pattern vLLM uses for
 # unified_attention, whose KV-cache write is also absent from its schema.
-@torch.library.custom_op("vllm_ascend::expert_predictor_launch",
-                         mutates_args=())
-def expert_predictor_launch(target_idx: int,
-                            hidden_states: torch.Tensor) -> torch.Tensor:
+@torch.library.custom_op("vllm_ascend::expert_predictor_launch", mutates_args=())
+def expert_predictor_launch(target_idx: int, hidden_states: torch.Tensor) -> torch.Tensor:
     """Clone the block input to `residual` AND start target_idx's prediction.
 
     The clone IS the atom (har at the first site, hfr at the second), so there
@@ -717,8 +734,7 @@ def expert_predictor_launch(target_idx: int,
 
 
 @expert_predictor_launch.register_fake
-def _expert_predictor_launch_fake(target_idx: int,
-                                  hidden_states: torch.Tensor) -> torch.Tensor:
+def _expert_predictor_launch_fake(target_idx: int, hidden_states: torch.Tensor) -> torch.Tensor:
     # Tracing only: shape, dtype, device and memory format of clone(). Must
     # never touch the driver — there is no live forward context here.
     return torch.empty_like(hidden_states)

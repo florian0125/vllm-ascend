@@ -18,6 +18,7 @@ import atexit
 import os
 import threading
 import time
+from contextlib import suppress
 from statistics import median
 
 from vllm.logger import logger
@@ -31,33 +32,31 @@ from vllm.logger import logger
 #   reduce   : 'mean' across contributing layers, or 'sum' over them
 #   in_csv   : whether it is a per-layer quantity worth a CSV column
 _METRICS = (
-    ("gsize",        "routed experts    |G| /layer",   "gsize",     "mean", True),
-    ("psize",        "predicted experts |P| /layer",   "psize",     "mean", True),
-    ("hit_post",     "cache hit rate (post-subst)",    "hit_post",  "mean", True),
-    ("hit_pre",      "cache hit rate (pre-subst)",     "hit_pre",   "mean", True),
-    ("loads",        "on-demand loads /layer/step",    "loads",     "mean", True),
-    ("loads_step",   "on-demand loads /step (total)",  "loads",     "sum",  False),
-    ("pf_loads",     "prefetch loads |N| /layer/step", "pf_loads",  "mean", True),
-    ("pf_loads_step","prefetch loads /step (total)",   "pf_loads",  "sum",  False),
-    ("pf_hit",       "loads avoided    |N&G| /layer",  "pf_hit",    "mean", True),
-    ("pf_hit_step",  "loads avoided /step (total)",    "pf_hit",    "sum",  False),
-    ("pf_waste",     "wasted transfers |N-G| /layer",  "pf_waste",  "mean", True),
-    ("pf_waste_step","wasted transfers /step (total)", "pf_waste",  "sum",  False),
-    ("subst",        "substituted experts /layer/step","subst",     "mean", True),
-    ("pred_prec",    "prediction correct   |P&G|/|P|", "pred_prec", "mean", True),
-    ("pred_acc",     "demand covered       |P&G|/|G|", "pred_acc",  "mean", True),
-    ("pf_in_lrc",    "predicted resident   |A|/|P|",   "pf_in_lrc", "mean", True),
-    ("pf_useful",    "prefetch useful    |N&G|/|N|",   "pf_useful", "mean", True),
-    ("pf_wait",      "prefetch stall  ms /layer",      "pf_wait",   "mean", True),
-    ("pf_wait_step", "prefetch stall  ms /step",       "pf_wait",   "sum",  False),
+    ("gsize", "routed experts    |G| /layer", "gsize", "mean", True),
+    ("psize", "predicted experts |P| /layer", "psize", "mean", True),
+    ("hit_post", "cache hit rate (post-subst)", "hit_post", "mean", True),
+    ("hit_pre", "cache hit rate (pre-subst)", "hit_pre", "mean", True),
+    ("loads", "on-demand loads /layer/step", "loads", "mean", True),
+    ("loads_step", "on-demand loads /step (total)", "loads", "sum", False),
+    ("pf_loads", "prefetch loads |N| /layer/step", "pf_loads", "mean", True),
+    ("pf_loads_step", "prefetch loads /step (total)", "pf_loads", "sum", False),
+    ("pf_hit", "loads avoided    |N&G| /layer", "pf_hit", "mean", True),
+    ("pf_hit_step", "loads avoided /step (total)", "pf_hit", "sum", False),
+    ("pf_waste", "wasted transfers |N-G| /layer", "pf_waste", "mean", True),
+    ("pf_waste_step", "wasted transfers /step (total)", "pf_waste", "sum", False),
+    ("subst", "substituted experts /layer/step", "subst", "mean", True),
+    ("pred_prec", "prediction correct   |P&G|/|P|", "pred_prec", "mean", True),
+    ("pred_acc", "demand covered       |P&G|/|G|", "pred_acc", "mean", True),
+    ("pf_in_lrc", "predicted resident   |A|/|P|", "pf_in_lrc", "mean", True),
+    ("pf_useful", "prefetch useful    |N&G|/|N|", "pf_useful", "mean", True),
+    ("pf_wait", "prefetch stall  ms /layer", "pf_wait", "mean", True),
+    ("pf_wait_step", "prefetch stall  ms /step", "pf_wait", "sum", False),
 )
 
 # The per-layer slots a single record_layer() call may fill.
-_LAYER_KEYS = tuple(
-    dict.fromkeys(source for _k, _l, source, _r, _c in _METRICS))
+_LAYER_KEYS = tuple(dict.fromkeys(source for _k, _l, source, _r, _c in _METRICS))
 
-_CSV_COLUMNS = tuple(
-    source for _k, _l, source, _r, in_csv in _METRICS if in_csv)
+_CSV_COLUMNS = tuple(source for _k, _l, source, _r, in_csv in _METRICS if in_csv)
 
 # watchdog cadence. Not a snapshot interval
 _WATCHDOG_TICK_SECONDS = 1.0
@@ -84,8 +83,7 @@ class DecodeStatsCollector:
     only reading that stays meaningful once layers are averaged out.
     """
 
-    def __init__(self, csv_enabled=False, out_path=None, flush_every=200,
-                 flush_seconds=30.0, rank=0):
+    def __init__(self, csv_enabled=False, out_path=None, flush_every=200, flush_seconds=30.0, rank=0):
         self._csv_enabled = csv_enabled
         self._out_path = out_path
         self._flush_every = flush_every
@@ -154,14 +152,16 @@ class DecodeStatsCollector:
         self._last_record = time.monotonic()
 
         if self._watchdog is None:
-            self._watchdog = threading.Thread(
-                target=self._watchdog_loop, name="decode-stats-watchdog",
-                daemon=True)
+            self._watchdog = threading.Thread(target=self._watchdog_loop, name="decode-stats-watchdog", daemon=True)
             self._watchdog.start()
-        logger.info("[DECODE-STATS] armed: collection is now live (snapshot every %d "
-                    "steps or %.0fs, and %.0fs after decoding stops; output dir %s)",
-                    self._flush_every, self._flush_seconds, _QUIET_SECONDS,
-                    self._out_path or "<none>")
+        logger.info(
+            "[DECODE-STATS] armed: collection is now live (snapshot every %d "
+            "steps or %.0fs, and %.0fs after decoding stops; output dir %s)",
+            self._flush_every,
+            self._flush_seconds,
+            _QUIET_SECONDS,
+            self._out_path or "<none>",
+        )
 
     def set_header(self, header) -> None:
         """Cache the run-configuration header for interim flushes.
@@ -185,7 +185,7 @@ class DecodeStatsCollector:
     # -------------------------------------------------------------- #
     #  Recording                                                     #
     # -------------------------------------------------------------- #
-    
+
     def set_step_kind(self, is_decode: bool) -> None:
         """Declare whether the forward about to run is a pure decode step.
 
@@ -211,11 +211,25 @@ class DecodeStatsCollector:
         with self._lock:
             self._shortfalls += 1
 
-    def record_layer(self, layer_idx: int, *, gsize=None, psize=None,
-                hit_post=None, hit_pre=None, loads=None, pf_loads=None,
-                pf_hit=None, pf_waste=None, subst=None, pred_acc=None,
-                pred_prec=None, pf_in_lrc=None, pf_useful=None,
-                pf_wait=None) -> None:
+    def record_layer(
+        self,
+        layer_idx: int,
+        *,
+        gsize=None,
+        psize=None,
+        hit_post=None,
+        hit_pre=None,
+        loads=None,
+        pf_loads=None,
+        pf_hit=None,
+        pf_waste=None,
+        subst=None,
+        pred_acc=None,
+        pred_prec=None,
+        pf_in_lrc=None,
+        pf_useful=None,
+        pf_wait=None,
+    ) -> None:
         """Record one MoE layer's reactive pass within the current decode step.
 
         ``None`` means "no sample for this metric on this layer this step" and is
@@ -236,16 +250,23 @@ class DecodeStatsCollector:
         values = {
             # gsize/psize/pf_loads/pred_prec added. Keys must match the
             # `source` column of _METRICS; nothing else keys off this dict.
-            "gsize": gsize, "psize": psize,
-            "hit_post": hit_post, "hit_pre": hit_pre,
-            "loads": loads, "pf_loads": pf_loads,
-            "pf_hit": pf_hit, "pf_waste": pf_waste,
-            "subst": subst, "pred_acc": pred_acc, "pred_prec": pred_prec,
-            "pf_in_lrc": pf_in_lrc, "pf_useful": pf_useful,
+            "gsize": gsize,
+            "psize": psize,
+            "hit_post": hit_post,
+            "hit_pre": hit_pre,
+            "loads": loads,
+            "pf_loads": pf_loads,
+            "pf_hit": pf_hit,
+            "pf_waste": pf_waste,
+            "subst": subst,
+            "pred_acc": pred_acc,
+            "pred_prec": pred_prec,
+            "pf_in_lrc": pf_in_lrc,
+            "pf_useful": pf_useful,
             # milliseconds the compute stream was blocked at this layer's prefetch join.
             "pf_wait": pf_wait,
         }
-        # This method runs inside the paging host callback, which blocks its stream until it returns, 
+        # This method runs inside the paging host callback, which blocks its stream until it returns,
         # so the summary formatting and two file writes were a decode stall that grew
         # with the run. _watchdog_loop owns snapshotting now.
         with self._lock:
@@ -263,16 +284,13 @@ class DecodeStatsCollector:
             # announce *after* the hash-layer return.
             if not self._announced_first:
                 self._announced_first = True
-                logger.info("[DECODE-STATS] first sample recorded (layer=%d) — "
-                            "collection is working", layer_idx)
+                logger.info("[DECODE-STATS] first sample recorded (layer=%d) — collection is working", layer_idx)
             for key, value in values.items():
                 if value is None:
                     continue
                 self._step_vals[key][layer_idx] = value
-                self._layer_sum[key][layer_idx] = (
-                    self._layer_sum[key].get(layer_idx, 0.0) + value)
-                self._layer_cnt[key][layer_idx] = (
-                    self._layer_cnt[key].get(layer_idx, 0) + 1)
+                self._layer_sum[key][layer_idx] = self._layer_sum[key].get(layer_idx, 0.0) + value
+                self._layer_cnt[key][layer_idx] = self._layer_cnt[key].get(layer_idx, 0) + 1
 
     def _maybe_due_locked(self, quiet: bool = False) -> bool:
         """Is a snapshot due? Caller holds _lock.
@@ -290,14 +308,12 @@ class DecodeStatsCollector:
         now = time.monotonic()
         # `quiet` is the third trigger — decoding has stopped, which is
         # the end of the workload and the moment the artifact must be complete
-        if (new_steps < self._flush_every
-                and now - self._time_at_last_flush < self._flush_seconds
-                and not quiet):
+        if new_steps < self._flush_every and now - self._time_at_last_flush < self._flush_seconds and not quiet:
             return False
         self._steps_at_last_flush = self._decode_steps
         self._time_at_last_flush = now
         return True
-    
+
     def _watchdog_loop(self) -> None:
         """Snapshot on a timer, off the paging callback's critical path.
 
@@ -328,15 +344,18 @@ class DecodeStatsCollector:
                 due = self._maybe_due_locked(quiet=quiet)
                 if now - heartbeat_at >= _HEARTBEAT_SECONDS:
                     heartbeat_at = now
-                    beat = (self._decode_steps, self._record_calls,
-                            self._flushes, len(self._spec_len))
+                    beat = (self._decode_steps, self._record_calls, self._flushes, len(self._spec_len))
             # both outside the lock: logging and file I/O must not serialise
             # against record_layer on the report thread.
             if beat is not None:
-                logger.debug("[DECODE-STATS] heartbeat: steps=%d records=%d "
-                            "snapshots=%d spec_samples=%d out=%s",
-                            beat[0], beat[1], beat[2], beat[3],
-                            self._out_path or "<none>")
+                logger.debug(
+                    "[DECODE-STATS] heartbeat: steps=%d records=%d snapshots=%d spec_samples=%d out=%s",
+                    beat[0],
+                    beat[1],
+                    beat[2],
+                    beat[3],
+                    self._out_path or "<none>",
+                )
             if due and not self._final:
                 self._flush(final=False)
 
@@ -365,8 +384,7 @@ class DecodeStatsCollector:
             if not layer_values:
                 continue  # no contributing layer this step: no sample, not 0.0
             total = sum(layer_values.values())
-            self._series[key].append(
-                total if reduce_kind == "sum" else total / len(layer_values))
+            self._series[key].append(total if reduce_kind == "sum" else total / len(layer_values))
         self._decode_steps += 1
         for slot in self._step_vals.values():
             slot.clear()
@@ -403,8 +421,7 @@ class DecodeStatsCollector:
                 # accumulators. The only way to get here now is a watchdog tick
                 # that decided it was due and then lost the lock to
                 # summarize() — expected at shutdown, and already written.
-                logger.debug("[DECODE-STATS] snapshot skipped: already "
-                             "finalized (steps=%d)", self._decode_steps)
+                logger.debug("[DECODE-STATS] snapshot skipped: already finalized (steps=%d)", self._decode_steps)
                 return
             if final:
                 self._close_step_locked()
@@ -437,8 +454,7 @@ class DecodeStatsCollector:
         else:
             # Periodic flushes log one line, not the whole table — the table is in
             # the file. Logging it every interval would bury serve.log.
-            logger.debug("[DECODE-STATS] flush #%d at %d decode steps -> %s",
-                        flush_no, steps, self._out_path)
+            logger.debug("[DECODE-STATS] flush #%d at %d decode steps -> %s", flush_no, steps, self._out_path)
         self._write_files(text, rows, final)
 
     def _write_files(self, text, rows, final: bool) -> None:
@@ -453,15 +469,12 @@ class DecodeStatsCollector:
             return
         try:
             os.makedirs(self._out_path, exist_ok=True)
-            path = os.path.join(
-                self._out_path,
-                f"decode_stats_summary_rank{self._rank}_{self._timestamp}.txt")
+            path = os.path.join(self._out_path, f"decode_stats_summary_rank{self._rank}_{self._timestamp}.txt")
             with open(path, "w") as handle:
                 handle.write(text)
                 handle.write("\n")
             if final:
-                logger.info("[DECODE-STATS] summary written to %s",
-                            os.path.abspath(path))
+                logger.info("[DECODE-STATS] summary written to %s", os.path.abspath(path))
         except Exception as exc:
             # Never take down a serving process over a statistics artifact.
             logger.warning("[DECODE-STATS] summary write failed: %s", exc)
@@ -481,7 +494,8 @@ class DecodeStatsCollector:
         lines.append(
             f"measured : decode steps={self._decode_steps}  "
             f"moe layers={moe_layers} (hash excluded={len(self._hash_layers)})  "
-            f"slot shortfalls={self._shortfalls}")
+            f"slot shortfalls={self._shortfalls}"
+        )
         # collector state, always. An empty table used to give no way to
         # tell "never armed" from "armed but never fed" from "finalized early".
         lines.append(
@@ -490,49 +504,47 @@ class DecodeStatsCollector:
             # forwards dropped as non-decode. decode_steps + non_decode
             # should equal the engine's total forward count
             f"non_decode={self._nondecode_steps} "
-            f"out={self._out_path or '<none>'}")
+            f"out={self._out_path or '<none>'}"
+        )
         if self._multi_card:
             lines.append(
                 "note     : multi-card offload path collects no per-layer "
-                "statistics; cache/prefetch rows below are empty by design.")
+                "statistics; cache/prefetch rows below are empty by design."
+            )
         if self._decode_steps == 0:
             lines.append(
                 "note     : no decode steps were measured (offload inactive, "
-                "prefill-only run, or statistics never armed).")
+                "prefill-only run, or statistics never armed)."
+            )
 
         lines.append("-" * width)
-        lines.append(f"{'metric':<32}{'mean':>10}{'median':>10}"
-                     f"{'min':>10}{'max':>10}{'steps':>8}")
+        lines.append(f"{'metric':<32}{'mean':>10}{'median':>10}{'min':>10}{'max':>10}{'steps':>8}")
         lines.append("-" * width)
         for key, label, _source, _reduce, _in_csv in _METRICS:
             stats = _summarize_series(self._series[key])
             if stats is None:
                 continue  # a section with no samples prints nothing
             mean, med, lo, hi, n = stats
-            lines.append(f"{label:<32}{mean:>10.4f}{med:>10.4f}"
-                         f"{lo:>10.4f}{hi:>10.4f}{n:>8d}")
+            lines.append(f"{label:<32}{mean:>10.4f}{med:>10.4f}{lo:>10.4f}{hi:>10.4f}{n:>8d}")
 
         spec_len = _summarize_series(self._spec_len)
         spec_rate = _summarize_series(self._spec_rate)
         if spec_len is not None and spec_rate is not None:
             lines.append("-" * width)
-            for label, stats in (("acceptance length (1+acc)", spec_len),
-                                 ("acceptance rate  acc/prop", spec_rate)):
+            for label, stats in (("acceptance length (1+acc)", spec_len), ("acceptance rate  acc/prop", spec_rate)):
                 mean, med, lo, hi, n = stats
-                lines.append(f"{label:<32}{mean:>10.4f}{med:>10.4f}"
-                             f"{lo:>10.4f}{hi:>10.4f}{n:>8d}")
+                lines.append(f"{label:<32}{mean:>10.4f}{med:>10.4f}{lo:>10.4f}{hi:>10.4f}{n:>8d}")
             # Ratio-of-sums, i.e. the aggregate form vLLM itself reports, so
             # these numbers are directly comparable with published ones. It
             # differs from the mean-of-per-step-means above whenever the number
             # of drafting requests varies across steps.
-            agg_rate = (self._spec_accepted / self._spec_proposed
-                        if self._spec_proposed else 0.0)
-            agg_len = (1.0 + self._spec_accepted / self._spec_drafts
-                       if self._spec_drafts else 0.0)
+            agg_rate = self._spec_accepted / self._spec_proposed if self._spec_proposed else 0.0
+            agg_len = 1.0 + self._spec_accepted / self._spec_drafts if self._spec_drafts else 0.0
             lines.append(
                 f"{'  ratio-of-sums':<32}rate={agg_rate:.4f}  "
                 f"length={agg_len:.4f}  drafts={self._spec_drafts}  "
-                f"accepted={self._spec_accepted}/{self._spec_proposed}")
+                f"accepted={self._spec_accepted}/{self._spec_proposed}"
+            )
 
         lines.append("=" * width)
         return "\n".join(lines)
@@ -552,9 +564,7 @@ class DecodeStatsCollector:
             row = {"layer": layer_idx}
             for column in _CSV_COLUMNS:
                 count = self._layer_cnt[column].get(layer_idx, 0)
-                row[column] = (
-                    f"{self._layer_sum[column][layer_idx] / count:.6f}"
-                    if count else "")
+                row[column] = f"{self._layer_sum[column][layer_idx] / count:.6f}" if count else ""
             rows.append(row)
         return rows
 
@@ -566,8 +576,7 @@ class DecodeStatsCollector:
         # because the timestamp is fixed at construction.
         directory = self._out_path or "."
         os.makedirs(directory, exist_ok=True)
-        path = os.path.join(
-            directory, f"decode_stats_rank{self._rank}_{self._timestamp}.csv")
+        path = os.path.join(directory, f"decode_stats_rank{self._rank}_{self._timestamp}.csv")
         columns = ["layer", *_CSV_COLUMNS]
         with open(path, "w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=columns)
@@ -576,7 +585,10 @@ class DecodeStatsCollector:
         if not quiet:
             logger.info(
                 "[EXPERT-OFFLOAD-CSV] wrote %d layer rows over %d decode steps to %s",
-                len(rows), self._decode_steps, os.path.abspath(path))
+                len(rows),
+                self._decode_steps,
+                os.path.abspath(path),
+            )
 
 
 _COLLECTOR = None
@@ -592,6 +604,7 @@ def get_decode_stats():
     if _COLLECTOR_RESOLVED:
         return _COLLECTOR
     from vllm_ascend.ascend_config import get_ascend_config
+
     try:
         config = get_ascend_config()
     except Exception:
@@ -600,8 +613,7 @@ def get_decode_stats():
     if not getattr(config, "decode_stats_enabled", False):
         # A None collector was indistinguishable from one that
         # existed and never recorded anything, which is half of every "no statistics" investigation.
-        logger.info("[DECODE-STATS] disabled by config "
-                    "(additional_config.decode_stats_enabled=false)")
+        logger.info("[DECODE-STATS] disabled by config (additional_config.decode_stats_enabled=false)")
         return None
     _COLLECTOR = DecodeStatsCollector(
         csv_enabled=config.decode_stats_csv,
@@ -612,10 +624,9 @@ def get_decode_stats():
     )
 
     def _atexit_summary():
-        try:
+        # Logging may be partially torn down at interpreter exit.
+        with suppress(Exception):
             _COLLECTOR.summarize(None)
-        except Exception:
-            pass  # logging may be partially torn down at interpreter exit
 
     atexit.register(_atexit_summary)
     return _COLLECTOR

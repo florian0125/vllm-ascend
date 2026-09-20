@@ -7,7 +7,6 @@ from typing import Any, Protocol
 
 import torch
 
-
 ONE_GIB = 1 << 30
 UINT32_MAX = (1 << 32) - 1
 
@@ -74,8 +73,7 @@ class TorchCopyH2DTransport:
 
     def copy_batch(self, tasks: list[H2DCopyTask]) -> None:
         for task in tasks:
-            task.destination.copy_(task.source,
-                                   non_blocking=task.non_blocking)
+            task.destination.copy_(task.source, non_blocking=task.non_blocking)
 
     @staticmethod
     def synchronize(stream) -> None:
@@ -107,9 +105,7 @@ class MemFabricLocalH2DTransport:
         offload_module=None,
     ) -> None:
         if pool_size_gib <= 0:
-            raise ValueError(
-                "MemFabric pool size must be positive; "
-                f"got {pool_size_gib} GiB")
+            raise ValueError(f"MemFabric pool size must be positive; got {pool_size_gib} GiB")
         if mf_module is None or offload_module is None:
             try:
                 import memfabric_hybrid as mf
@@ -137,8 +133,8 @@ class MemFabricLocalH2DTransport:
         ret = offload_module.initialize(config)
         if ret != 0:
             raise RuntimeError(
-                "MemFabric LOCAL initialization failed: "
-                f"device={device_id}, pool_size_gib={pool_size_gib}, ret={ret}")
+                f"MemFabric LOCAL initialization failed: device={device_id}, pool_size_gib={pool_size_gib}, ret={ret}"
+            )
         atexit.register(self.close)
 
     def _ensure_open(self) -> None:
@@ -152,9 +148,7 @@ class MemFabricLocalH2DTransport:
     @staticmethod
     def _int32_bits(value: int) -> int:
         if not 0 <= value <= UINT32_MAX:
-            raise ValueError(
-                "MemFabric sparse-copy length exceeds uint32: "
-                f"{value} bytes")
+            raise ValueError(f"MemFabric sparse-copy length exceeds uint32: {value} bytes")
         return value if value < (1 << 31) else value - (1 << 32)
 
     def copy_batch(self, tasks: list[H2DCopyTask]) -> None:
@@ -174,28 +168,18 @@ class MemFabricLocalH2DTransport:
             dst_values.append(dst_values[-1])
             length_values.append(0)
 
-        src_ptrs = torch.tensor(src_values,
-                                dtype=torch.int64,
-                                device=self.device)
-        dst_ptrs = torch.tensor(dst_values,
-                                dtype=torch.int64,
-                                device=self.device)
-        lengths = torch.tensor(length_values,
-                               dtype=torch.int32,
-                               device=self.device)
-        count = torch.tensor(len(src_values),
-                             dtype=torch.int32,
-                             device=self.device)
+        src_ptrs = torch.tensor(src_values, dtype=torch.int64, device=self.device)
+        dst_ptrs = torch.tensor(dst_values, dtype=torch.int64, device=self.device)
+        lengths = torch.tensor(length_values, dtype=torch.int32, device=self.device)
+        count = torch.tensor(len(src_values), dtype=torch.int32, device=self.device)
         with self._descriptor_lock:
             self._ensure_open()
-            ret = self._offload.sparse_copy(src_ptrs, dst_ptrs, lengths,
-                                            count, self.device)
+            ret = self._offload.sparse_copy(src_ptrs, dst_ptrs, lengths, count, self.device)
             if ret != 0:
                 raise RuntimeError(
-                    "MemFabric sparse_copy failed: "
-                    f"device={self.device_id}, tasks={len(tasks)}, ret={ret}")
-            self._inflight_descriptors.append(
-                (src_ptrs, dst_ptrs, lengths, count))
+                    f"MemFabric sparse_copy failed: device={self.device_id}, tasks={len(tasks)}, ret={ret}"
+                )
+            self._inflight_descriptors.append((src_ptrs, dst_ptrs, lengths, count))
 
     def synchronize(self, stream) -> None:
         with self._descriptor_lock:
@@ -229,15 +213,11 @@ class MemFabricSharedH2DTransport(MemFabricLocalH2DTransport):
         offload_module=None,
     ) -> None:
         if world_size <= 1:
-            raise ValueError(
-                "MemFabric SHARED world_size must be greater than one")
+            raise ValueError("MemFabric SHARED world_size must be greater than one")
         if not 0 <= rank_id < world_size:
-            raise ValueError(
-                f"Invalid MemFabric SHARED rank: {rank_id}/{world_size}")
+            raise ValueError(f"Invalid MemFabric SHARED rank: {rank_id}/{world_size}")
         if pool_size_gib <= 0:
-            raise ValueError(
-                "MemFabric pool size must be positive; "
-                f"got {pool_size_gib} GiB")
+            raise ValueError(f"MemFabric pool size must be positive; got {pool_size_gib} GiB")
         if mf_module is None or offload_module is None:
             try:
                 import memfabric_hybrid as mf
@@ -272,7 +252,8 @@ class MemFabricSharedH2DTransport(MemFabricLocalH2DTransport):
             raise RuntimeError(
                 "MemFabric SHARED initialization failed: "
                 f"device={device_id}, rank={rank_id}/{world_size}, "
-                f"pool_size_gib={pool_size_gib}, ret={ret}")
+                f"pool_size_gib={pool_size_gib}, ret={ret}"
+            )
         atexit.register(self.close)
 
 
