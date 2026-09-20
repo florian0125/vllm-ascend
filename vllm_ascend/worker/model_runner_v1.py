@@ -158,6 +158,12 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     reshape_kv_cache_tensors_for_sparse_kv_offload,
     update_sparse_kv_offload_metadata,
 )
+from vllm_ascend.dflash_topm_state import (
+    build_verify_segments,
+    resolve_activation_routing_config,
+    validate_activation_routing,
+)
+from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -678,6 +684,22 @@ class NPUModelRunner(GPUModelRunner):
             self.cudagraph_batch_sizes = sorted(self.compilation_config.cudagraph_capture_sizes)
         else:
             self.cudagraph_batch_sizes = []
+
+        self.dflash_topm_state = resolve_activation_routing_config(
+            get_ascend_config().activation_routing_config,
+            text_config=self.model_config.hf_text_config,
+            speculative_method=self.speculative_config.method if self.speculative_config else None,
+            uniform_decode_query_len=self.uniform_decode_query_len,
+        )
+        if self.dflash_topm_state is not None:
+            validate_activation_routing(
+                self.dflash_topm_state,
+                self.model_config,
+                self.speculative_config,
+                self.uniform_decode_query_len,
+                self.use_async_scheduling,
+            )
+
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: Any | None = None
         self._mamba_copy_bufs: Any | None = None
@@ -2565,6 +2587,19 @@ class NPUModelRunner(GPUModelRunner):
             get_pp_group().is_last_rank or self.broadcast_pp_output
         )
         active_device_metadata_executor = self._prepare_device_metadata_for_forward(cudagraph_mode)
+        dflash_verify_rows: tuple = ()
+        if self.dflash_topm_state is not None:
+            dflash_verify_rows, dflash_topm_segments = build_verify_segments(
+                scheduler_output,
+                self.input_batch,
+                num_scheduled_tokens_np,
+                spec_decode_metadata,
+            )
+            self.dflash_topm_state.prepare(
+                num_tokens_padded,
+                dflash_topm_segments,
+                self.device,
+            )
         # tell the statistics collector whether this forward is a decode step.
         _stats = get_decode_stats()
         if _stats is not None:
@@ -2586,6 +2621,8 @@ class NPUModelRunner(GPUModelRunner):
                 skip_compiled=has_encoder_input,
                 has_sinks=self._has_sinks,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                dflash_verify_rows=dflash_verify_rows,
+                dflash_topm_state=self.dflash_topm_state,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -4585,6 +4622,20 @@ class NPUModelRunner(GPUModelRunner):
             _stats = get_decode_stats()
             if _stats is not None:
                 _stats.set_step_kind(False)
+            if self.dflash_topm_state is not None:
+                dflash_topm_segments = []
+                if uniform_decode and not with_prefill:
+                    query_len = self.dflash_topm_state.verify_block_size
+                    dflash_topm_segments = [
+                        (req_idx * query_len, query_len)
+                        for req_idx in range(num_reqs)
+                        if (req_idx + 1) * query_len <= num_tokens_padded
+                    ]
+                self.dflash_topm_state.prepare(
+                    num_tokens_padded,
+                    dflash_topm_segments,
+                    self.device,
+                )
             with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -4598,6 +4649,7 @@ class NPUModelRunner(GPUModelRunner):
                 device_metadata_executor=active_device_metadata_executor,
                 has_sinks = self._has_sinks,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                dflash_topm_state=self.dflash_topm_state,
             ):
                 if not is_graph_capturing and self.ascend_config.enable_force_eplb \
                     and self.vllm_config.model_config.is_moe:
