@@ -22,6 +22,11 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
+from vllm_ascend.device.hardware_profile import (
+    HardwareCapability,
+    get_current_hardware_profile,
+)
+
 
 def get_kv_cache_compression_ratio(kv_cache_spec: KVCacheSpec) -> int:
     """Return the MLA compression ratio across vLLM cache-spec APIs."""
@@ -112,11 +117,18 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        return (
-            get_storage_block_size(self)
-            * self.num_kv_heads
-            * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
-        )
+        per_head_bytes = self.head_size * get_dtype_size(self.dtype)
+        if self.scale_dim:
+            scale_bytes = self.scale_dim * get_dtype_size(self.scale_dtype)
+            if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE):
+                # The fused indexer full-cache view packs each head as
+                # (head_size + scale_dim * scale_dtype_size) main-dtype
+                # elements (model_runner_v1 indexer_full_shape), so the scale
+                # bytes occupy scale_dim * scale_dtype_size main-dtype slots.
+                # The separate k/scale layout below keeps the raw byte count.
+                scale_bytes *= get_dtype_size(self.dtype)
+            per_head_bytes += scale_bytes
+        return get_storage_block_size(self) * self.num_kv_heads * per_head_bytes
 
     @property
     def unpadded_page_size_bytes(self) -> int:

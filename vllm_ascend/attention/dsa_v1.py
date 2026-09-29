@@ -2244,7 +2244,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             kv_plan.add_dsa_sparse_attn_extra_kwargs(attn_kwargs, cu_seqlens_cmp_kv=common_metadata.cu_cmp_seqlen_list)
 
         attn_kwargs.update(
-            ori_kv=swa_kv_cache,
+            ori_kv=kv_plan.view_quant_cache(swa_kv_cache),
             ori_block_table=swa_req_metadata.block_table,
             cu_seqlens_q=actual_seq_lengths_query,
             seqused_kv=actual_seq_lengths_key,
@@ -2271,7 +2271,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         else:
             assert compressor_metadata is not None
             attn_kwargs.update(
-                cmp_kv=compress_kv_cache,
+                cmp_kv=kv_plan.view_quant_cache(compress_kv_cache),
                 cmp_block_table=common_metadata.block_table,
                 cmp_mask_mode=3,
             )

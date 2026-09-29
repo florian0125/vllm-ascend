@@ -90,6 +90,19 @@ class DsaAttnKvPlan:
     def get_dsa_compressor_slot_mapping_format(self) -> int:
         return self.compressor_slot_mapping_format
 
+    @staticmethod
+    def view_quant_cache(cache: torch.Tensor) -> torch.Tensor:
+        """Reinterpret a raw uint8 quantized cache as fp8 for CANN custom ops.
+
+        vllm 0.30 maps the "fp8_e4m3" KV cache dtype string to torch.uint8
+        (raw-bytes storage), but the DSA custom ops (kv_compress_epilog,
+        kv_quant_sparse_attn_sharedkv) only accept INT8 / FLOAT8_E4M3FN
+        containers. Same element size, so the view is zero-copy.
+        """
+        if cache.dtype == torch.uint8:
+            return cache.view(torch.float8_e4m3fn)
+        return cache
+
     def format_dsa_slot_mapping(self, slot_mapping: torch.Tensor, block_size: int) -> torch.Tensor:
         if not self.requires_block_offset_slots:
             return slot_mapping
@@ -117,6 +130,7 @@ class DsaAttnKvPlan:
         if not self.uses_kv_compress_epilog:
             torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, slot_mapping, x)
             return
+        cache = self.view_quant_cache(cache)
         torch.ops._C_ascend.kv_compress_epilog(
             kv_compress_cache=cache.view(-1, 1, cache.shape[-1]),
             x=x.view(-1, x.shape[-1]),

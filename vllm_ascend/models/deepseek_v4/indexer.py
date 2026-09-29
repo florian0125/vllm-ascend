@@ -206,9 +206,15 @@ class AscendIndexerOps:
         metadata: typing.Any,
     ) -> torch.Tensor:
         wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(metadata.qli_metadata))
+        key = key_cache
+        if key_cache.dtype == torch.uint8:
+            # vllm 0.30 stores the fp8 indexer cache as raw uint8 bytes, but
+            # the CANN op requires a true FLOAT8_E4M3FN container for k to
+            # match the fp8-quantized q (same element size, zero-copy view).
+            key = key_cache.view(torch.float8_e4m3fn)
         topk_idxs, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
             query=query,
-            key=key_cache,
+            key=key,
             weights=self.device_operator.prepare_dsa_indexer_weights(weights),
             query_dequant_scale=self.device_operator.prepare_dsa_indexer_query_scale(query_scale),
             key_dequant_scale=self.device_operator.prepare_dsa_indexer_key_scale(scale_cache),
@@ -304,9 +310,16 @@ class DeepseekV4Indexer(nn.Module):
             prefix=f"{prefix}.weights_proj",
             return_bias=False,
         )
-        k_dtype = kv_cache_dtype_str_to_dtype(
-            self.vllm_config.attention_config.indexer_kv_dtype, vllm_config.model_config
-        )
+        indexer_kv_dtype = self.vllm_config.attention_config.indexer_kv_dtype
+        if indexer_kv_dtype == "auto" and get_current_hardware_profile().supports(
+            HardwareCapability.FP8_ATTENTION
+        ):
+            # A5 quantizes the indexer query to fp8 unconditionally
+            # (A5DeviceAdaptor.indexer_quantize_query) and the lightning
+            # indexer kernels only accept matched q/k dtypes, so the "auto"
+            # default must resolve to the quantized fp8 cache layout here.
+            indexer_kv_dtype = "fp8"
+        k_dtype = kv_cache_dtype_str_to_dtype(indexer_kv_dtype, vllm_config.model_config)
 
         if self.compress_ratio == 4:
             # TODO(cmq): change the dtype of cache
