@@ -190,6 +190,17 @@ class DSAAttention(nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         if self.compress_ratio <= 1:  # SWA part. Allocated separately as DeepseekV4SWACache.
             return None
+        # The spec is a pure function of per-run immutable fields, but it reads
+        # cache_config.block_size as a DSV4_BLOCK_SIZES table key. The engine
+        # core overwrites that field with the global min() over all
+        # prefix-cacheable groups after profiling (vllm/v1/engine/core.py),
+        # which lands on the compressor state granularity (2/4) for DSV4 — an
+        # invalid key. Rebuild calls (worker _get_layer_kv_cache_specs) must
+        # reproduce the profiling-time spec exactly, so build it once at
+        # profiling (key still valid) and reuse it.
+        cached_spec = getattr(self, "_built_kv_cache_spec", None)
+        if cached_spec is not None:
+            return cached_spec
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(self.kv_cache_dtype, vllm_config.model_config)
         use_bf16_kv = is_a5_bf16_kv_enabled(vllm_config)
         has_compressed_cache = get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
@@ -199,7 +210,7 @@ class DSAAttention(nn.Module, AttentionLayerBase):
         # vLLM #51718 replaced MLAAttentionSpec.compress_ratio with
         # AttentionSpec.tokens_per_state on main.
         ratio_kwargs: dict[str, Any] = {"tokens_per_state": self.compress_ratio}
-        return AscendMLAAttentionSpec(
+        spec = AscendMLAAttentionSpec(
             # The scheduler operates in raw-token units. Ascend kernels keep
             # using the compressed page exposed by storage_block_size.
             block_size=storage_block_size * self.compress_ratio,
@@ -210,3 +221,5 @@ class DSAAttention(nn.Module, AttentionLayerBase):
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
             **ratio_kwargs,
         )
+        self._built_kv_cache_spec = spec
+        return spec

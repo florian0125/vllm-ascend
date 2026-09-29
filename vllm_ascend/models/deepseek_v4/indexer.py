@@ -110,11 +110,20 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
         from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
         from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
 
+        # cache_config.block_size is used as a DSV4_BLOCK_SIZES table key here,
+        # but the engine core overwrites it with the global min() over all
+        # prefix-cacheable groups after profiling (vllm/v1/engine/core.py); for
+        # DSV4 that is the compressor state granularity (2/4), an invalid key.
+        # Build the spec once at profiling time (key still valid) and reuse it
+        # for the worker's rebuild calls, which must match it exactly.
+        cached_spec = getattr(self, "_built_kv_cache_spec", None)
+        if cached_spec is not None:
+            return cached_spec
         storage_block_size = DSV4_BLOCK_SIZES[vllm_config.cache_config.block_size][0][0]
         # vLLM #51718 replaced MLAAttentionSpec.compress_ratio with
         # AttentionSpec.tokens_per_state on main.
         ratio_kwargs = {"tokens_per_state": self.compress_ratio}
-        return AscendMLAAttentionSpec(
+        spec = AscendMLAAttentionSpec(
             block_size=storage_block_size * self.compress_ratio,
             num_kv_heads=1,
             head_size=self.head_dim,
@@ -127,6 +136,8 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
             else torch.float16,
             **ratio_kwargs,
         )
+        self._built_kv_cache_spec = spec
+        return spec
 
     def forward(self): ...
 

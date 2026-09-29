@@ -58,10 +58,19 @@ class AscendCompressorStateCache(CompressorStateCache):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         from vllm_ascend.models.layer.attention.layer import dsv4_block_sizes
 
+        # cache_config.block_size is used as a dsv4_block_sizes table key here,
+        # but the engine core overwrites it with the global min() over all
+        # prefix-cacheable groups after profiling (vllm/v1/engine/core.py); for
+        # DSV4 that is the compressor state granularity (2/4), an invalid key.
+        # Build the spec once at profiling time (key still valid) and reuse it
+        # for the worker's rebuild calls, which must match it exactly.
+        cached_spec = getattr(self, "_built_kv_cache_spec", None)
+        if cached_spec is not None:
+            return cached_spec
         pads = dsv4_block_sizes(vllm_config)[vllm_config.cache_config.block_size][1]
         page_size_padded = pads[0] if self.state_dim == 2 * 256 and self.compress_ratio == 4 else pads[1]
 
-        return AscendSlidingWindowMLASpec(
+        spec = AscendSlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.state_dim,
@@ -70,6 +79,8 @@ class AscendCompressorStateCache(CompressorStateCache):
             alignment=None,
             page_size_padded=page_size_padded,
         )
+        self._built_kv_cache_spec = spec
+        return spec
 
     def forward(self): ...
 
