@@ -26,10 +26,8 @@ import types
 import pytest
 import torch
 
-from vllm_ascend.ops.fused_moe.moe_stage_contracts import (
-    MoEMlpComputeInput,
-    MoEWeights,
-)
+from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
+from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights
 from vllm_ascend.expert_offload.prefill_split import (
     PrefillSplitCtx,
     _group_counts,
