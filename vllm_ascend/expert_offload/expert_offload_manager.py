@@ -19,6 +19,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.decode_stats import get_decode_stats
 from vllm_ascend.expert_offload.expert_predictor import maybe_create_driver
 from vllm_ascend.expert_offload.h2d_transfer import (
+    CopyDirection,
     H2DCopyTask,
     HostPointerSource,
     TorchCopyH2DTransport,
@@ -235,6 +236,11 @@ class ExpertOffloadManager:
         ExpertOffloadManager._instance = self
 
         self.load_stream = torch_npu.npu.Stream()
+        # Side stream for the prefill delta D2D tasks (decode slots -> pool):
+        # they write expert rows disjoint from the H2D batch on the load
+        # stream, so they run in parallel with it and join back before the
+        # fp32-scale refresh / host sync in _prefill_load_layer.
+        self._prefill_d2d_stream = torch_npu.npu.Stream()
         # MemFabric SHARED initialization is collective and needs the EP group,
         # so defer it until the first layer allocates Host expert buffers.
         self.h2d_transport = None
@@ -273,6 +279,35 @@ class ExpertOffloadManager:
         self._prefill_log2phy: torch.Tensor = None  # identity [0..127]
         self._prefill_initialized: bool = False
         self._skip_prefill: bool = False  # set during profile runs
+        # Prefill expert-paging state: expert weights are immutable after
+        # finalize, so a pool slot stays valid until a different model layer
+        # overwrites it (round-robin p = L % ndl).
+        # _prefill_pool_owner[p] = model layer_idx currently held by pool
+        # slot p, or -1 when the slot content is unknown.
+        self._prefill_pool_owner: list[int] = []
+        # Per-layer host copy of the decode-pool residency (int32 [ntotal],
+        # decode slot or -1), captured by the last prefill load of that layer
+        # and re-uploaded on demand for the split-GMM path.
+        self._prefill_residency_host: dict[int, torch.Tensor] = {}
+        # --- prefill load pipeline (prefill expert paging) ---
+        # 2-slot pipeline: compute / next-layer load.  Pending per-slot load
+        # events (pool slot H2D/D2D completed); a prefill layer joins its
+        # slot's event before the GMM reads the pool.
+        self._prefill_slot_load_done: dict[int, "torch_npu.npu.Event"] = {}
+        # Which layer each slot's pending load is for (consumer-side marker:
+        # cleared after the joining layer consumed it).
+        self._prefill_slot_load_target: dict[int, int] = {}
+        # --- prefill pipeline staging (see _prefill_pipe_update) ---
+        # update(L) stages layer L+1's residency D2H non-blockingly on the
+        # compute stream (overlapping GMM(L)); on_prefill_layer_done(L)
+        # waits it, publishes the mirror and kicks the next load.  A compute
+        # event recorded after the slot join is handed to that kick so the
+        # load stream cannot overwrite a slot the compute stream may still
+        # be reading.
+        self._pipe_stage_h: torch.Tensor | None = None  # pinned [ntotal]
+        self._pipe_stage_evt = None
+        self._pipe_stage_layer: int = -1
+        self._pipe_comp_evt = None
 
     def _init_prefetch_state(self) -> None:
         """Next-layer expert-prefetch infrastructure init."""
@@ -1354,6 +1389,7 @@ class ExpertOffloadManager:
         # valid data.  Subsequent _prefill_load_layer calls will
         # overwrite with the correct per-layer weights.
         self._init_prefill_pool_data(dev, ntotal, ndl)
+        self._prefill_pool_owner = [-1] * ndl
         self._prefill_initialized = True
         logger.info(
             "[PREFILL_POOL] allocated %d layers × %d experts, w13[0].shape=%s w2[0].shape=%s",
@@ -1525,34 +1561,403 @@ class ExpertOffloadManager:
             self._synchronize_h2d()
 
     def _prefill_load_layer(self, layer_idx: int, log2phy: torch.Tensor):
-        """Load ALL experts for model layer layer_idx into the prefill pool.
+        """Load experts for model layer layer_idx into the prefill pool.
 
         For W8A8: loads into normal-format scratch, then casts to NZ.
         For unquantized: loads directly into pool tensors via copy_().
-        Full-overwrite into pool_slot = layer_idx % ndl.  No slot_owner
-        tracking needed — log2phy is set to identity for prefill.
+        Pool slot = layer_idx % ndl.  No slot_owner tracking needed —
+        log2phy is set to identity for prefill.
+
+        With ``prefill_delta_load`` / ``prefill_split_gmm``
+        (prefill expert paging) the load becomes residency-aware:
+
+        * experts resident in the decode pool (``log2phy[eid] >= 0``) are
+          copied D2D from their decode slot (split mode: not loaded at all —
+          the split GMM reads them in place);
+        * experts already held by this pool slot from an earlier forward of
+          the SAME layer are skipped entirely (weights are immutable);
+        * everything else is H2D from the pinned CPU buffers.
+
+        NOTE: Do NOT modify the layer's own log2phy here — decode path
+        relies on it staying with 32-expert mapping.  Prefill path in
+        apply() explicitly uses self._prefill_log2phy instead.
         """
         ndl = self.num_device_layers
         pool_slot = layer_idx % ndl
         ntotal = self.num_total_experts
         is_w8a8 = self._prefill_w13[pool_slot].dtype == torch.int8
 
+        split = self.offload_config.prefill_split_gmm
+        delta = self.offload_config.prefill_delta_load or split
+
         if self._debug:
             logger.info(
-                "[PREFILL_LOAD] layer=%d pool_slot=%d ntotal=%d is_w8a8=%s", layer_idx, pool_slot, ntotal, is_w8a8
+                "[PREFILL_LOAD] layer=%d pool_slot=%d ntotal=%d is_w8a8=%s delta=%s split=%s",
+                layer_idx, pool_slot, ntotal, is_w8a8, delta, split,
             )
 
+        # Split mode reads the decode slots LIVE during the GMM, so the
+        # residency must be re-captured every forward even when the pool
+        # itself is already up to date (decode LRC may have swapped experts
+        # between prefill forwards).  FUSED_MC2 fuses dispatch+MLP+combine
+        # and cannot be row-split — fall back to a full (non-holey) pool.
+        if split:
+            from vllm_ascend.ascend_forward_context import MoECommType
+
+            if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
+                split = False
+                delta = delta and self.offload_config.prefill_delta_load
+
+        owner_hit = delta and self._prefill_pool_owner[pool_slot] == layer_idx
+        residency = None
+        if delta and (split or not owner_hit):
+            # Decode-pool residency for THIS layer, host side.  log2phy
+            # tracks the decode slots (hot-expert preload initially, LRC
+            # swaps when decode runs on this card); on a PD-split P node it
+            # stays at the initial hot set.  One small synchronous D2H per
+            # layer per forward, on the already-synchronizing load path.
+            residency = log2phy.detach().to("cpu", non_blocking=False)
+            self._prefill_residency_host[layer_idx] = residency
+
+        if owner_hit:
+            # Same model layer re-loaded into the same pool slot: expert
+            # weights are immutable, so every pool expert is already in
+            # place — zero copies (scales included).
+            if self._debug:
+                logger.info(
+                    "[PREFILL_DELTA] layer=%d pool=%d all %d experts already resident, no copies",
+                    layer_idx, pool_slot, ntotal,
+                )
+            return
+
+        tasks, n_h2d, n_d2d, n_skip = self._build_prefill_load_tasks(layer_idx, pool_slot, residency)
+        # Split the batch by direction: the resident-expert D2D copies
+        # (decode slots -> pool) go to a side stream and overlap the
+        # pinned H2D copies on the load stream.  The two sets write
+        # disjoint expert rows of the same pool slot, so the only ordering
+        # needed is the join below, ahead of the fp32-scale refresh and
+        # the host sync.
+        d2d_tasks = [t for t in tasks if t.direction == CopyDirection.D2D]
+        h2d_tasks = [t for t in tasks if t.direction != CopyDirection.D2D]
+        d2d_evt = None
+        if d2d_tasks:
+            # Anchor the D2D stream at the load stream's current queue
+            # position so anything the load stream was already ordered
+            # after also orders these decode-slot reads.
+            entry_evt = torch_npu.npu.Event()
+            self.load_stream.record_event(entry_evt)
+            with torch_npu.npu.stream(self._prefill_d2d_stream):
+                self._prefill_d2d_stream.wait_event(entry_evt)
+                self._get_h2d_transport().copy_batch(d2d_tasks)
+                d2d_evt = torch_npu.npu.Event()
+                self._prefill_d2d_stream.record_event(d2d_evt)
         with torch_npu.npu.stream(self.load_stream):
-            tasks = []
-            for eid in range(ntotal):
-                tasks.extend(self._build_prefill_h2d_tasks(layer_idx, pool_slot, eid, eid))
-            self._get_h2d_transport().copy_batch(tasks)
+            if d2d_evt is not None:
+                self.load_stream.wait_event(d2d_evt)
+            self._get_h2d_transport().copy_batch(h2d_tasks)
             self._refresh_prefill_fp32_scale(pool_slot, ntotal)
             self._synchronize_h2d()
+        self._prefill_pool_owner[pool_slot] = layer_idx
 
-        # NOTE: Do NOT modify the layer's own log2phy here — decode path
-        # relies on it staying with 32-expert mapping.  Prefill path in
-        # apply() explicitly uses self._prefill_log2phy instead.
+        if self._debug:
+            logger.info(
+                "[PREFILL_DELTA] layer=%d pool=%d h2d=%d d2d=%d skip_resident=%d split=%s par_d2d=%s",
+                layer_idx, pool_slot, n_h2d, n_d2d, n_skip, split, d2d_evt is not None,
+            )
+
+    def _build_prefill_load_tasks(self, layer_idx: int, pool_slot: int, residency):
+        """Build the (delta-aware) copy tasks that fill pool_slot for
+        layer_idx.  Returns (tasks, n_h2d, n_d2d, n_skip)."""
+        ntotal = self.num_total_experts
+        split = self.offload_config.prefill_split_gmm
+        tasks = []
+        n_h2d = n_d2d = n_skip = 0
+        for eid in range(ntotal):
+            src_slot = int(residency[eid]) if residency is not None else -1
+            if src_slot >= 0:
+                if split:
+                    # Split mode: resident experts are read in place from
+                    # their decode slots by GMM-1; the pool keeps a hole at
+                    # this id (group_list count 0 keeps the GMM away).
+                    n_skip += 1
+                    continue
+                tasks.extend(self._build_prefill_local_d2d_tasks(layer_idx, pool_slot, src_slot, eid, eid))
+                n_d2d += 1
+                continue
+            tasks.extend(self._build_prefill_h2d_tasks(layer_idx, pool_slot, eid, eid))
+            n_h2d += 1
+        return tasks, n_h2d, n_d2d, n_skip
+
+    def _build_prefill_local_d2d_tasks(
+        self,
+        layer_idx: int,
+        pool_slot: int,
+        source_slot: int,
+        destination_slot: int,
+        expert_id: int,
+    ) -> list[H2DCopyTask]:
+        """Build same-rank prefill copies without typed weight ``copy_``.
+
+        The 950DT aclnn-only runtime rejects ``Tensor.copy_`` when the weight
+        tensor carries an internal format.  The single-card path avoids that
+        dispatch by copying the raw weight storages.  Keep the same
+        representation for the resident-expert D2D; quantization metadata
+        remains ordinary-format typed tensors.
+        """
+        layer = self.moe_layers[layer_idx]
+        tasks = []
+        weight_specs = (
+            ("w13", self._prefill_w13, self.w13_expert_size_bytes),
+            ("w2", self._prefill_w2, self.w2_expert_size_bytes),
+        )
+        for name, prefill_buffers, nbytes in weight_specs:
+            start = destination_slot * nbytes
+            source = self._expert_device_storage(layer, source_slot, name)
+            destination = prefill_buffers[pool_slot].untyped_storage()[start : start + nbytes]
+            tasks.append(
+                H2DCopyTask(
+                    source=source,
+                    destination=destination,
+                    nbytes=nbytes,
+                    name=(
+                        f"prefill-local-d2d-{name}[L{layer_idx},"
+                        f"E{expert_id},S{source_slot}->P{pool_slot}:"
+                        f"E{destination_slot}]"
+                    ),
+                    direction=CopyDirection.D2D,
+                )
+            )
+
+        for name, source, destination in self._prefill_device_components(
+            layer_idx, pool_slot, source_slot, destination_slot, include_weights=False
+        ):
+            tasks.append(
+                H2DCopyTask(
+                    source=source,
+                    destination=destination,
+                    nbytes=source.numel() * source.element_size(),
+                    name=(
+                        f"prefill-local-d2d-{name}[L{layer_idx},"
+                        f"E{expert_id},S{source_slot}->P{pool_slot}:"
+                        f"E{destination_slot}]"
+                    ),
+                    direction=CopyDirection.D2D,
+                )
+            )
+        return tasks
+
+    def _expert_device_storage(self, layer, slot: int, which: str):
+        """Return one decode slot's raw device bytes without changing layout."""
+        size = self.w13_expert_size_bytes if which == "w13" else self.w2_expert_size_bytes
+        start = slot * size
+        return _expert_weight(layer, f"{which}_weight").data.untyped_storage()[start : start + size]
+
+    def _prefill_device_components(
+        self,
+        layer_idx: int,
+        pool_slot: int,
+        source_slot: int,
+        destination_slot: int,
+        *,
+        include_weights: bool = True,
+    ) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
+        """Return matching typed views for local prefill copies."""
+        layer = self.moe_layers[layer_idx]
+        components = []
+        if include_weights:
+            components.extend(
+                [
+                    (
+                        "w13",
+                        _expert_weight(layer, "w13_weight").data[source_slot],
+                        self._prefill_w13[pool_slot][destination_slot],
+                    ),
+                    (
+                        "w2",
+                        _expert_weight(layer, "w2_weight").data[source_slot],
+                        self._prefill_w2[pool_slot][destination_slot],
+                    ),
+                ]
+            )
+        quant_specs = (
+            ("w13_weight_scale", self._prefill_w13_scale),
+            ("w2_weight_scale", self._prefill_w2_scale),
+            ("w13_weight_offset", self._prefill_w13_offset),
+            ("w2_weight_offset", self._prefill_w2_offset),
+            ("w13_scale_bias", self._prefill_w13_scale_bias),
+            ("w2_scale_bias", self._prefill_w2_scale_bias),
+        )
+        for attr_name, prefill_buffers in quant_specs:
+            source = getattr(layer, attr_name, None)
+            if source is None or pool_slot >= len(prefill_buffers):
+                continue
+            components.append(
+                (attr_name, source.data[source_slot], prefill_buffers[pool_slot][destination_slot])
+            )
+        for name, source, destination in components:
+            if source.shape != destination.shape or source.dtype != destination.dtype:
+                raise RuntimeError(
+                    "Prefill copies require matching expert tensors: "
+                    f"layer={layer_idx}, name={name}, "
+                    f"source={tuple(source.shape)}/{source.dtype}, "
+                    f"destination={tuple(destination.shape)}/{destination.dtype}"
+                )
+        return components
+
+    def get_prefill_resident_slots(self, layer_idx: int) -> torch.Tensor:
+        """Device int32 [ntotal]: decode slot index per expert, -1 if the
+        expert is not in this layer's decode pool.  Consumed by the split-GMM
+        path (prefill_split.PrefillSplitCtx) to partition dispatch rows.
+
+        Uses the host residency captured by the last delta prefill load of
+        this layer; falls back to reading the live log2phy when the layer was
+        loaded by the legacy full-overwrite path.
+        """
+        host = self._prefill_residency_host.get(layer_idx)
+        if host is None:
+            layer = self.moe_layers[layer_idx]
+            host = layer.log2phy.detach().to("cpu", non_blocking=False)
+            self._prefill_residency_host[layer_idx] = host
+        dev = self._prefill_w13[layer_idx % self.num_device_layers].device
+        return host.to(device=dev, dtype=torch.int32, non_blocking=True)
+
+    # ------------------------------------------------------------------ #
+    #  Prefill load pipeline: slot events, blocking fallback, async kick  #
+    # ------------------------------------------------------------------ #
+    def _prefill_join_load(self, layer_idx: int) -> bool:
+        """Join the pending async pool load for this layer's slot, if this
+        exact layer was prefetched into it.  True => pool ready."""
+        pool_slot = layer_idx % self.num_device_layers
+        if self._prefill_slot_load_target.get(pool_slot) != layer_idx:
+            return False
+        evt = self._prefill_slot_load_done.get(pool_slot)
+        if evt is not None:
+            torch_npu.npu.current_stream().wait_event(evt)
+        self._prefill_slot_load_target[pool_slot] = -1
+        return True
+
+    def _prefill_residency_for(self, layer_idx: int):
+        """Host residency mirror for layer_idx; D2H once and cache."""
+        host = self._prefill_residency_host.get(layer_idx)
+        if host is None:
+            layer = self.moe_layers[layer_idx]
+            host = layer.log2phy.detach().to("cpu", non_blocking=False)
+            self._prefill_residency_host[layer_idx] = host
+        return host
+
+    def _prefill_pipe_active(self) -> bool:
+        """Pipelined prefill loads are available whenever the prefill pool
+        is in use: _prefill_kick_load relies only on the slot-event table."""
+        return self._prefill_initialized and not self._skip_prefill
+
+    def _prefill_pipe_update(self, layer_idx: int) -> None:
+        """update_weights prefill branch, pipelined.
+
+        Nothing here may block the host: stage the NEXT layer's residency
+        D2H non-blockingly (submitted before the slot join so the tiny copy
+        is not parked behind the whole load window), record a compute event
+        for the next kick's overwrite safety, then join this layer's slot
+        event (or fall back to the blocking load on cold start / pipeline
+        break).  The next load is kicked from on_prefill_layer_done(layer_idx)
+        — after the GMM is submitted — so the kick's host work (task build
+        + copy submission) overlaps the GMM execution instead of stalling
+        the layer boundary.
+        """
+        next_idx = layer_idx + 1
+        if next_idx < len(self.moe_layers):
+            # Fresh residency: the decode LRC may have swapped slots since
+            # any cached mirror was written (e.g. across chunked prefill
+            # chunks), so the D2H is mandatory — staged BEFORE the slot
+            # join (else the compute-stream wait would park this tiny copy
+            # behind the whole load window) and blocking-deferred to the
+            # post-GMM hook.
+            self._prefill_stage_residency(next_idx)
+        comp_evt = torch_npu.npu.Event()
+        torch_npu.npu.current_stream().record_event(comp_evt)
+        self._pipe_comp_evt = comp_evt
+        if not self._prefill_join_load(layer_idx):
+            if self._debug:
+                logger.info("[PREFILL_PIPE] layer=%d not prefetched, blocking fallback", layer_idx)
+            self._prefill_load_layer(layer_idx, self.moe_layers[layer_idx].log2phy)
+
+    def _prefill_stage_residency(self, layer_idx: int) -> None:
+        """Stage layer_idx's decode-pool residency D2H non-blockingly on
+        the current (compute) stream; on_prefill_layer_done consumes it
+        (event wait + mirror publish) before kicking the next load."""
+        if self._pipe_stage_h is None:
+            self._pipe_stage_h = torch.zeros(
+                self.num_total_experts, dtype=torch.int32, device="cpu", pin_memory=True
+            )
+        if self._pipe_stage_evt is not None:
+            # A previous stage may still be in flight (its consumer hook
+            # never ran, e.g. an aborted forward); retire it before reuse.
+            self._pipe_stage_evt.synchronize()
+        self._pipe_stage_h.copy_(self.moe_layers[layer_idx].log2phy, non_blocking=True)
+        evt = torch_npu.npu.Event()
+        torch_npu.npu.current_stream().record_event(evt)
+        self._pipe_stage_evt = evt
+        self._pipe_stage_layer = layer_idx
+
+    def _prefill_kick_load(self, layer_idx: int, wait_event=None) -> None:
+        """Asynchronously fill pool_slot for layer_idx on the load stream.
+
+        Delta-aware (same task builder as the blocking path).  ``wait_event``
+        (a compute event recorded after the consuming layer's slot join) is
+        joined on the load stream so this load cannot overwrite a pool slot
+        the compute stream may still be reading.
+        """
+        pool_slot = layer_idx % self.num_device_layers
+        residency = self._prefill_residency_for(layer_idx)
+        with torch_npu.npu.stream(self.load_stream):
+            if wait_event is not None:
+                self.load_stream.wait_event(wait_event)
+            tasks, _, _, _ = self._build_prefill_load_tasks(layer_idx, pool_slot, residency)
+            self._get_h2d_transport().copy_batch(tasks)
+            self._refresh_prefill_fp32_scale(pool_slot, self.num_total_experts)
+            evt = torch_npu.npu.Event()
+            self.load_stream.record_event(evt)
+        self._prefill_slot_load_done[pool_slot] = evt
+        self._prefill_slot_load_target[pool_slot] = layer_idx
+        self._prefill_pool_owner[pool_slot] = layer_idx
+        if self._debug:
+            logger.info("[PREFILL_PIPE] kicked load layer=%d slot=%d", layer_idx, pool_slot)
+
+    def on_prefill_layer_done(self, layer) -> None:
+        """Post-GMM hook (called by the quant methods after the prefill GMM
+        submitted).  Publish the staged next-layer residency (its D2H ran
+        under the GMM submit) and kick the NEXT layer's load here —
+        post-GMM-submit — so the kick's host work overlaps the GMM
+        execution instead of stalling the layer boundary."""
+        try:
+            layer_idx = self.moe_layers.index(layer)
+        except ValueError:
+            return
+        if not self._prefill_pipe_active():
+            return
+        # Plain pipeline: the staged D2H (submitted in _prefill_pipe_update
+        # before the slot join) has by now executed under the GMM submit;
+        # publish the mirror and kick the next load.
+        next_idx = layer_idx + 1
+        if next_idx >= len(self.moe_layers):
+            return
+        if self._pipe_stage_layer == next_idx and self._pipe_stage_evt is not None:
+            self._pipe_stage_evt.synchronize()
+            self._prefill_residency_host[next_idx] = self._pipe_stage_h.clone()
+            self._pipe_stage_layer = -1
+            self._pipe_stage_evt = None
+        elif next_idx not in self._prefill_residency_host:
+            # Stage missed (hook ordering surprise): fresh blocking D2H.
+            next_layer = self.moe_layers[next_idx]
+            self._prefill_residency_host[next_idx] = next_layer.log2phy.detach().to(
+                "cpu", non_blocking=False
+            )
+        comp_evt = self._pipe_comp_evt
+        self._pipe_comp_evt = None
+        # comp_evt covers everything the compute stream had done before this
+        # layer's slot join — including the previous GMM that read the pool
+        # slot this kick is about to overwrite.
+        self._prefill_kick_load(next_idx, wait_event=comp_evt)
+
 
     # ------------------------------------------------------------------ #
     #  Multi-card prefill: per-rank EP shard into the prefill pool        #
@@ -1856,10 +2261,16 @@ class ExpertOffloadManager:
             return 0
         num_tokens = topk_ids.size(0)
         if num_tokens > self.offload_threshold:
-            # Prefill: layerwise reuse + full-overwrite of all experts
+            # Prefill: layerwise reuse + (delta-aware) expert paging
             if self._prefill_initialized and not self._skip_prefill:
                 # reuse the layer_idx resolved above
-                self._prefill_load_layer(layer_idx, log2phy)
+                if self._prefill_pipe_active():
+                    # Pipelined: consume the prefetch or fall back, then
+                    # kick the next layer's load so it overlaps this layer's
+                    # GMM (compute hidden inside the next load window).
+                    self._prefill_pipe_update(layer_idx)
+                else:
+                    self._prefill_load_layer(layer_idx, log2phy)
                 return 0
             else:
                 # Profile run or pool not ready — bail out gracefully

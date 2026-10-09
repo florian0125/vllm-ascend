@@ -14,6 +14,65 @@ from vllm_ascend.expert_offload.expert_offload_manager import ExpertOffloadManag
 from vllm_ascend.ops.fused_moe.moe_comm_method import _map_logical_ids_to_phy
 
 
+def _build_prefill_split_ctx(mgr, layer, layer_idx: int):
+    """Stage the split-GMM context: decode-slot weights per quant scheme.
+
+    The weight conventions mirror what each quant method itself feeds the
+    MLP stage (list-wrapped for the int8 dynamic schemes, raw tensors for
+    mxfp4/unquantized).  ``decode_layer`` carries the ORIGINAL layer: the
+    main0928 quant methods read weights from ``mlp_compute_input.layer``.
+    Returns None for schemes without a known convention (split disabled).
+    """
+    from vllm_ascend.expert_offload.prefill_split import PrefillSplitCtx
+    from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights
+    from vllm_ascend.quantization.quant_type import QuantType
+
+    qt = getattr(layer.quant_method, "quant_type", QuantType.NONE)
+    if qt == QuantType.W4A8MXFP:
+        weights = MoEWeights(
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+        )
+        num_slots = layer.w13_weight.shape[0]
+    elif qt == QuantType.W4A8:
+        weights = MoEWeights(
+            w1=[layer.w13_weight],
+            w2=[layer.w2_weight],
+            w1_scale=[layer.w13_weight_scale],
+            w2_scale=[layer.w2_weight_scale],
+            w1_scale_bias=[layer.w13_scale_bias.detach()] if hasattr(layer, "w13_scale_bias") else None,
+            w2_scale_bias=[layer.w2_scale_bias.detach()] if hasattr(layer, "w2_scale_bias") else None,
+        )
+        num_slots = layer.w13_weight.shape[0]
+    elif qt == QuantType.W8A8:
+        weights = MoEWeights(
+            w1=[layer.w13_weight],
+            w2=[layer.w2_weight],
+            w1_scale=[layer.w13_weight_scale_fp32],
+            w2_scale=[layer.w2_weight_scale],
+        )
+        num_slots = layer.w13_weight.shape[0]
+    elif qt == QuantType.NONE:
+        weights = MoEWeights(
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
+        )
+        num_slots = layer.w13_weight.shape[0]
+    else:
+        return None
+    return PrefillSplitCtx(
+        resident_slots=mgr.get_prefill_resident_slots(layer_idx),
+        decode_weights=weights,
+        decode_layer=layer,
+        num_slots=num_slots,
+        layer_idx=layer_idx,
+    )
+
+
 def _set_view_tensor(view, name, tensor):
     # A shallow Module view must not mutate the original parameter dictionary.
     view._parameters.pop(name, None)
@@ -112,14 +171,28 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
             topk_weights = topk_weights.to(hidden_states.dtype)
         if not use_prefill and num_tokens <= mgr.offload_threshold:
             mgr.trigger_next_layer_prefetch(layer, hidden_states)
-        result = layer.quant_method.apply(
-            layer=view,
-            x=hidden_states,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            shared_experts=None,
-            shared_experts_input=None,
-        )
+        _split_ctx = None
+        if use_prefill and mgr.offload_config.prefill_split_gmm is True:
+            layer_idx = mgr.moe_layers.index(layer)
+            _split_ctx = _build_prefill_split_ctx(mgr, layer, layer_idx)
+        if _split_ctx is not None:
+            _EXTRA_CTX.expert_offload_prefill_split = _split_ctx
+        try:
+            result = layer.quant_method.apply(
+                layer=view,
+                x=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                shared_experts=None,
+                shared_experts_input=None,
+            )
+        finally:
+            if _split_ctx is not None:
+                _EXTRA_CTX.expert_offload_prefill_split = None
+        if use_prefill:
+            # Prefill load pipeline: publish the staged next-layer residency
+            # and kick the next load post-GMM-submit so it overlaps the GMM.
+            mgr.on_prefill_layer_done(layer)
     finally:
         for name, value in saved.items():
             setattr(dispatcher, name, value)
