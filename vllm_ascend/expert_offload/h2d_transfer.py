@@ -3,6 +3,7 @@
 import atexit
 import threading
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Protocol
 
 import torch
@@ -11,15 +12,26 @@ ONE_GIB = 1 << 30
 UINT32_MAX = (1 << 32) - 1
 
 
+class CopyDirection(str, Enum):
+    """Direction of one byte-preserving expert-weight transfer."""
+
+    H2D = "h2d"
+    D2H = "d2h"
+    D2D = "d2d"
+
+
 @dataclass(frozen=True)
 class H2DCopyTask:
-    """One byte-preserving host-to-device copy.
+    """One byte-preserving expert copy.
 
     ``source`` and ``destination`` intentionally accept both tensors and
     untyped-storage slices. Expert weights use storage slices to preserve their
     packed/NZ byte layout, while quantization attributes use shaped tensors.
     ``nbytes`` is carried explicitly so pointer-based backends can consume the
-    same task without inferring sizes from tensor metadata.
+    same task without inferring sizes from tensor metadata.  The historical
+    class name is retained for compatibility; ``direction`` distinguishes H2D,
+    D2H and D2D operations (the torch backend's ``copy_`` handles all three
+    uniformly on the current stream).
     """
 
     source: Any
@@ -27,10 +39,16 @@ class H2DCopyTask:
     nbytes: int
     name: str = ""
     non_blocking: bool = True
+    direction: CopyDirection = CopyDirection.H2D
 
     def __post_init__(self) -> None:
         if self.nbytes <= 0:
             raise ValueError(f"H2D copy size must be positive; got {self.nbytes}")
+        if not isinstance(self.direction, CopyDirection):
+            try:
+                object.__setattr__(self, "direction", CopyDirection(self.direction))
+            except ValueError as exc:
+                raise ValueError(f"Unsupported expert copy direction: {self.direction}") from exc
 
 
 @dataclass(frozen=True)

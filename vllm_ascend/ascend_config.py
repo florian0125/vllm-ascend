@@ -1793,6 +1793,17 @@ class ExpertOffloadConfig:
         "expert_predictor_ckpt": None,
         # Measure the stall the prefetch path adds to the compute stream
         "expert_prefetch_wait_timing": False,
+        # Prefill expert-paging integration (single-card replicated only):
+        # - prefill_delta_load: the prefill pool load becomes residency-aware.
+        #   Decode-pool-resident experts are D2D-copied from their decode
+        #   slots instead of PCIe H2D, and a pool slot already holding the
+        #   SAME model layer from an earlier forward is left untouched.
+        # - prefill_split_gmm: on top of the delta load, decode-resident
+        #   experts are not loaded into the pool at all; the MLP stage runs
+        #   two GMMs (decode slots in place + pool) and reassembles rows
+        #   (expert_offload/prefill_split.py).  Implies delta-load semantics.
+        "prefill_delta_load": False,
+        "prefill_split_gmm": False,
     }
 
     def __init__(self, user_config: dict | None = None):

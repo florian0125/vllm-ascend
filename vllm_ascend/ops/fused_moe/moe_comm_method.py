@@ -145,7 +145,19 @@ class MoECommMethod(ABC):
             token_dispatch_output=token_dispatch_output,
             moe_config=self.moe_config,
         )
-        if quant_method is None:
+        # expert_offload prefill split-GMM: when the quant method staged a
+        # PrefillSplitCtx, resident experts are computed in place from their
+        # decode slots and the rest from the prefill pool (two GMMs).
+        _split_ctx = _EXTRA_CTX.expert_offload_prefill_split
+        if _split_ctx is not None:
+            from vllm_ascend.expert_offload.prefill_split import prefill_split_apply
+
+            if quant_method is None:
+                mlp_fn = self._apply_mlp
+            else:
+                mlp_fn = lambda inp: apply_moe_mlp(inp, quant_method)
+            mlp_output, before_gmm2_evt = prefill_split_apply(mlp_compute_input, _split_ctx, mlp_fn)
+        elif quant_method is None:
             # Legacy path (310P): the comm method overrides ``_apply_mlp`` with
             # its own MLP implementation.
             mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)

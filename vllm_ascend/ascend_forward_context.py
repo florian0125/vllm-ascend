@@ -592,6 +592,11 @@ class _ExtraForwardContextProxy:
         "padded_num_tokens",
         "sinks",
         "eplb_heat_collection_status",
+        # expert_offload prefill split-GMM (PrefillSplitCtx or None).  Set by
+        # the quant method's apply() when the offload prefill path wants the
+        # MLP stage split into decode-slot GMM + pool GMM; consumed and
+        # cleared inside MoECommMethod.fused_experts.
+        "expert_offload_prefill_split",
     )
 
     def check_extra_attr(self, name: str):

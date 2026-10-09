@@ -79,6 +79,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Per-layer row-count debug prints for the expert-offload prefill
+    # split-GMM path (expert_offload/prefill_split.py). "1" enables.
+    "VLLM_ASCEND_PREFILL_SPLIT_DEBUG": lambda: os.getenv("VLLM_ASCEND_PREFILL_SPLIT_DEBUG", "0"),
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
