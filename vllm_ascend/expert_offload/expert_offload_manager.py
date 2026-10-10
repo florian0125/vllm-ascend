@@ -1932,6 +1932,11 @@ class ExpertOffloadManager:
             layer_idx = self.moe_layers.index(layer)
         except ValueError:
             return
+        if torch.npu.is_current_stream_capturing():
+            # Capture dummy run: consuming the staged D2H (event sync) or
+            # kicking the next load would operate on a capturing stream.
+            # Leave pipe state pending; the next eager forward resumes it.
+            return
         if not self._prefill_pipe_active():
             return
         # Plain pipeline: the staged D2H (submitted in _prefill_pipe_update
@@ -2261,8 +2266,16 @@ class ExpertOffloadManager:
             return 0
         num_tokens = topk_ids.size(0)
         if num_tokens > self.offload_threshold:
-            # Prefill: layerwise reuse + (delta-aware) expert paging
-            if self._prefill_initialized and not self._skip_prefill:
+            # Prefill: layerwise reuse + (delta-aware) expert paging.
+            # Graph-capture dummy runs exceed offload_threshold once
+            # cudagraph sizes grow past it (max_num_seqs > threshold);
+            # the paging path issues blocking D2H/H2D which is illegal
+            # on a capturing stream — bail like the pool-not-ready case.
+            if (
+                self._prefill_initialized
+                and not self._skip_prefill
+                and not torch.npu.is_current_stream_capturing()
+            ):
                 # reuse the layer_idx resolved above
                 if self._prefill_pipe_active():
                     # Pipelined: consume the prefetch or fall back, then

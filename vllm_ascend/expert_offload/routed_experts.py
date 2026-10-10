@@ -129,7 +129,11 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
         prefill_regime = _EXTRA_CTX.moe_comm_type != MoECommType.MC2
     else:
         mgr.update_weights(layer, topk_ids, layer.log2phy, topk_weights, hidden_states=hidden_states, **routing)
-        prefill_regime = num_tokens > mgr.offload_threshold
+        # Capture dummy runs can exceed offload_threshold (cudagraph sizes
+        # scale with max_num_seqs); the prefill pool path is eager-only
+        # (blocking D2H/H2D + stream-event choreography) — keep captured
+        # graphs on the decode path, mirroring the update_weights guard.
+        prefill_regime = num_tokens > mgr.offload_threshold and not torch.npu.is_current_stream_capturing()
     use_prefill = prefill_regime and mgr._prefill_initialized and (layer.enable_multi_card or not mgr._skip_prefill)
     dispatcher = comm.token_dispatcher
     saved = {}
