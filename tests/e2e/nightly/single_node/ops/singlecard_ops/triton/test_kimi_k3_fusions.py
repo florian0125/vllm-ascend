@@ -1,4 +1,3 @@
-#
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,28 +33,65 @@ pytestmark = [
 
 
 @torch.inference_mode()
-def test_kimi_k3_attention_residual_triton_matches_reference():
+@pytest.mark.parametrize(
+    ("num_tokens", "num_blocks", "block_capacity"),
+    [
+        pytest.param(7, 4, 7, id="partial-capacity"),
+        pytest.param(512, 8, 8, id="profile-shape"),
+    ],
+)
+def test_kimi_k3_attention_residual_triton_matches_reference(
+    num_tokens,
+    num_blocks,
+    block_capacity,
+):
     torch.manual_seed(1)
-    num_tokens = 7
     hidden_size = 7168
-    num_blocks = 4
     eps = 1e-6
-    prefix_sum = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="npu")
-    block_residual = torch.randn(
-        (num_tokens, num_blocks, hidden_size),
+    prefix_sum = torch.randn(
+        (num_tokens, hidden_size),
         dtype=torch.bfloat16,
         device="npu",
     )
-    projection = SimpleNamespace(weight=torch.randn((1, hidden_size), dtype=torch.bfloat16, device="npu"))
-    norm = SimpleNamespace(weight=torch.randn((hidden_size,), dtype=torch.bfloat16, device="npu"), variance_epsilon=eps)
+    block_residual = torch.randn(
+        (num_tokens, block_capacity, hidden_size),
+        dtype=torch.bfloat16,
+        device="npu",
+    )
+    projection = SimpleNamespace(
+        weight=torch.randn(
+            (1, hidden_size),
+            dtype=torch.bfloat16,
+            device="npu",
+        )
+    )
+    norm = SimpleNamespace(
+        weight=torch.randn(
+            (hidden_size,),
+            dtype=torch.bfloat16,
+            device="npu",
+        ),
+        variance_epsilon=eps,
+    )
 
-    actual = apply_attn_res(prefix_sum, block_residual, projection, norm)
+    actual = apply_attn_res(
+        prefix_sum,
+        block_residual,
+        projection,
+        norm,
+        num_blocks,
+    )
 
-    values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1).float()
+    values = torch.cat((block_residual[:, :num_blocks, :], prefix_sum.unsqueeze(1)), dim=1).float()
     normalized = values * torch.rsqrt(values.square().mean(dim=-1, keepdim=True) + eps)
     score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
     scores = (normalized * score_weight).sum(dim=-1)
     probabilities = scores.softmax(-1).unsqueeze(1)
     expected = torch.matmul(probabilities, values).squeeze(1).to(prefix_sum.dtype)
 
-    torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(
+        actual.cpu(),
+        expected.cpu(),
+        rtol=1e-2,
+        atol=1e-2,
+    )

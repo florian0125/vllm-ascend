@@ -6,6 +6,8 @@ vLLM-Ascend now supports prefill-decode (PD) disaggregation. This guide provides
 
 Using the Qwen2.5-VL-7B-Instruct model as an example, use vLLM-Ascend {{vllm_ascend_version}} (with vLLM {{vllm_version}}) on 1 Atlas 800T A2 server to deploy the "1P1D" architecture (one Prefiller and one Decoder on the same node). Assume the IP address is 192.0.0.1.
 
+For P/D transfer priority settings, see [QoS Configuration](pd_disaggregation_mooncake_multi_node.md#qos-configuration).
+
 ## Verify Communication Environment
 
 ### Verification Process
@@ -222,7 +224,7 @@ We can run the following scripts to launch a server on the prefiller/decoder NPU
       }'
     ```
 
-If you want to run "2P1D", please set ASCEND_RT_VISIBLE_DEVICES and port to different values for each P process.
+If you want to run "2P1D" (two Prefiller and one Decoder), please set ASCEND_RT_VISIBLE_DEVICES and port to different values for each P process.
 
 ## Example Proxy for Deployment
 
@@ -240,9 +242,9 @@ python load_balance_proxy_server_example.py \
 
 |Parameter  | Meaning |
 | --- | --- |
-| --port | Port of proxy |
-| --prefiller-port | All ports of prefill |
-| --decoder-ports | All ports of decoder |
+| --port | Proxy port |
+| --prefiller-port | All prefiller ports |
+| --decoder-ports | All decoder ports |
 
 ## Verification
 

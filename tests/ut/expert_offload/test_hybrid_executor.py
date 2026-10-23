@@ -4,7 +4,6 @@ from vllm_ascend.expert_offload.hybrid_executor import HybridExpertExecutor
 
 
 class _CompletedTask:
-
     def __init__(self, output: torch.Tensor) -> None:
         self.output = output
 
@@ -13,7 +12,6 @@ class _CompletedTask:
 
 
 class _RecordingBackend:
-
     def __init__(self, max_num_tokens=16) -> None:
         self.call = None
         self.max_num_tokens = max_num_tokens
@@ -58,20 +56,16 @@ def test_prepare_splits_cpu_and_npu_routes_by_log2phy():
     )
     assert backend.call["layer_idx"] == 4
     assert backend.call["hidden_states"] is hidden_states
-    torch.testing.assert_close(
-        backend.call["topk_ids"],
-        torch.tensor([[-1, 2, -1], [-1, 1, 2]]))
+    torch.testing.assert_close(backend.call["topk_ids"], torch.tensor([[-1, 2, -1], [-1, 1, 2]]))
 
 
 def test_finish_adds_token_major_cpu_output():
     npu_output = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
     cpu_output = torch.tensor([[0.5, 1.0], [1.5, 2.0]])
 
-    output = HybridExpertExecutor.finish(
-        npu_output, _CompletedTask(cpu_output))
+    output = HybridExpertExecutor.finish(npu_output, _CompletedTask(cpu_output))
 
-    torch.testing.assert_close(
-        output, torch.tensor([[1.5, 3.0], [4.5, 6.0]]))
+    torch.testing.assert_close(output, torch.tensor([[1.5, 3.0], [4.5, 6.0]]))
 
 
 def test_finish_rejects_wrong_output_shape():
@@ -86,7 +80,7 @@ def test_finish_rejects_wrong_output_shape():
         raise AssertionError("expected shape validation to fail")
 
 
-def test_prepare_falls_back_when_backend_capacity_is_exceeded():
+def test_prepare_falls_back_on_backend_capacity_overflow():
     from vllm_ascend.expert_offload.hybrid_executor import (
         attach_hybrid_expert_executor,
         maybe_prepare_hybrid_routes,
@@ -102,8 +96,31 @@ def test_prepare_falls_back_when_backend_capacity_is_exceeded():
         topk_ids=torch.tensor([[0, 1], [1, 0]]),
         topk_weights=torch.tensor([[0.6, 0.4], [0.7, 0.3]]),
         log2phy=torch.tensor([0, -1], dtype=torch.int32),
-        max_tokens=8,
     )
-
     assert plan is None
+
     assert backend.call is None
+
+
+def test_device_owned_graph_transfer_returns_cpu_output_without_deferred_join():
+    backend = _RecordingBackend()
+    class TransferTask:
+        graph = True
+        def wait_for_weights(self, cpu_task):
+            self.cpu_task = cpu_task
+    class Transfer:
+        device_owned = True
+        def prepare(self, topk_ids, log2phy):
+            self.task = TransferTask()
+            return self.task
+    transfer = Transfer()
+    plan = HybridExpertExecutor(backend, layer_idx=4).prepare(
+        hidden_states=torch.ones(1, 8),
+        topk_ids=torch.tensor([[0, 1]]),
+        topk_weights=torch.tensor([[0.6, 0.4]]),
+        log2phy=torch.tensor([0, -1], dtype=torch.int32),
+        weight_transfer=transfer,
+    )
+    assert not backend.call.get('defer_graph_join', False)
+    assert transfer.task.cpu_task is plan.cpu_task
+    torch.testing.assert_close(backend.call['topk_ids'], torch.tensor([[-1, 1]]))

@@ -599,7 +599,9 @@ __aicore__ inline void VFProcessGroupIndex(const LocalTensor<T>& yLocal, const L
     uint16_t fourLoopCount = loopCount / FOUR_UNFOLD;
     uint16_t tailLoopNum = loopCount % FOUR_UNFOLD;
     uint32_t tailReminder = curColNum - fourLoopCount * vlLen * FOUR_UNFOLD;
-    if (loopCount < FOUR_UNFOLD) {
+    // Temporary workaround: mask all group counts up to 256 int64 entries.
+    constexpr uint16_t MAX_MASKED_GROUP_INDEX_LOOPS = 8;
+    if (loopCount <= MAX_MASKED_GROUP_INDEX_LOOPS) {
         __VEC_SCOPE__
         {
             RegTensor<T> x;

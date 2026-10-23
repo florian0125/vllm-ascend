@@ -1,21 +1,14 @@
-import os
-import threading
-from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
-import torch
 
 from vllm_ascend.expert_offload.h2d_transfer import (
-    CopyDirection,
+    ONE_GIB,
     H2DCopyTask,
     MemFabricLocalH2DTransport,
     MemFabricSharedH2DTransport,
-    ONE_GIB,
     TorchCopyH2DTransport,
-    TorchSharedCPUH2DTransport,
-    TorchSharedCPUWeightPool,
     create_h2d_transport,
 )
 
@@ -41,33 +34,12 @@ def test_torch_transport_preserves_task_order_and_non_blocking_flags():
 
     TorchCopyH2DTransport().copy_batch(tasks)
 
-    assert first_destination.copy_.call_args_list == [
-        call("w13-source", non_blocking=True)]
-    assert second_destination.copy_.call_args_list == [
-        call("scale-source", non_blocking=False)]
+    assert first_destination.copy_.call_args_list == [call("w13-source", non_blocking=True)]
+    assert second_destination.copy_.call_args_list == [call("scale-source", non_blocking=False)]
 
 
 def test_torch_transport_accepts_an_empty_batch():
     TorchCopyH2DTransport().copy_batch([])
-
-
-def test_torch_transport_accepts_all_expert_copy_directions():
-    destinations = [MagicMock(), MagicMock(), MagicMock()]
-    tasks = [
-        H2DCopyTask(
-            source=f"source-{direction.value}",
-            destination=destination,
-            nbytes=4,
-            direction=direction,
-        )
-        for direction, destination in zip(CopyDirection, destinations)
-    ]
-
-    TorchCopyH2DTransport().copy_batch(tasks)
-
-    for direction, destination in zip(CopyDirection, destinations):
-        destination.copy_.assert_called_once_with(
-            f"source-{direction.value}", non_blocking=True)
 
 
 def test_torch_transport_allocates_pinned_host_tensor():
@@ -79,199 +51,10 @@ def test_torch_transport_allocates_pinned_host_tensor():
         result = TorchCopyH2DTransport().allocate_host_tensor((2, 3), "dtype")
 
     assert result is expected
-    empty.assert_called_once_with(
-        (2, 3), dtype="dtype", device="cpu", pin_memory=True)
-
-
-def test_torch_shared_transport_stages_until_sync_then_reuses_buffer():
-    transport = TorchSharedCPUH2DTransport()
-    source = MagicMock()
-    destination = MagicMock()
-    staging = MagicMock()
-    staging_storage = MagicMock()
-    staging.untyped_storage.return_value = staging_storage
-    task = H2DCopyTask(source, destination, 16)
-
-    with patch(
-        "vllm_ascend.expert_offload.h2d_transfer.torch.empty",
-        return_value=staging,
-    ) as empty:
-        transport.copy_batch([task])
-        assert transport._inflight_staging[0][1] is staging
-
-        stream = MagicMock()
-        transport.synchronize(stream)
-        assert transport._inflight_staging == []
-
-        transport.copy_batch([task])
-
-    empty.assert_called_once_with(
-        (16,), dtype=torch.uint8, device="cpu", pin_memory=True)
-    assert staging_storage.copy_.call_args_list == [call(source), call(source)]
-    assert destination.copy_.call_args_list == [
-        call(staging_storage, non_blocking=True),
-        call(staging_storage, non_blocking=True),
-    ]
-    assert transport._inflight_staging[0][1] is staging
-
-    stream.synchronize.assert_called_once_with()
-
-
-def test_torch_shared_transport_reuses_normal_staging_across_inference_mode():
-    transport = TorchSharedCPUH2DTransport()
-    source = torch.tensor([1.0, 2.0])
-    destination = torch.empty_like(source)
-    task = H2DCopyTask(source, destination, source.nbytes)
-    stream = MagicMock()
-    real_empty = torch.empty
-
-    def allocate_without_pinning(*args, **kwargs):
-        # Keep the regression test portable to CPU-only test environments.
-        kwargs["pin_memory"] = False
-        return real_empty(*args, **kwargs)
-
-    with patch(
-        "vllm_ascend.expert_offload.h2d_transfer.torch.empty",
-        side_effect=allocate_without_pinning,
-    ) as empty:
-        with torch.inference_mode():
-            transport.copy_batch([task])
-            transport.synchronize(stream)
-
-        key = ("tensor", tuple(source.shape), source.dtype)
-        staging = transport._free_staging[key][0]
-        assert not torch.is_inference(staging)
-
-        source.add_(2.0)
-        errors = []
-
-        def copy_from_host_callback():
-            try:
-                assert not torch.is_inference_mode_enabled()
-                transport.copy_batch([task])
-            except Exception as error:  # pragma: no cover - assertion aid
-                errors.append(error)
-
-        callback_thread = threading.Thread(target=copy_from_host_callback)
-        callback_thread.start()
-        callback_thread.join(timeout=5)
-        assert not callback_thread.is_alive()
-
-    assert errors == []
-    assert torch.equal(destination, source)
-    assert transport._inflight_staging[0][1] is staging
-    empty.assert_called_once_with(
-        source.shape, dtype=source.dtype, device="cpu", pin_memory=True)
-    stream.synchronize.assert_called_once_with()
-
-
-class _FakeCollectives:
-
-    def __init__(self, world_size):
-        self.world_size = world_size
-        self.barriers = 0
-
-    def all_gather_object(self, output, value, group):
-        del group
-        for rank in range(self.world_size):
-            output[rank] = value
-
-    def barrier(self, group):
-        del group
-        self.barriers += 1
-
-
-def test_torch_shared_weight_pool_maps_and_unlinks_backing_file(tmp_path):
-    collectives = _FakeCollectives(world_size=2)
-    scalar = MagicMock()
-    scalar.element_size.return_value = 4
-    mapped = MagicMock()
-    expected = object()
-    mapped.reshape.return_value = expected
-    with (
-        patch(
-            "vllm_ascend.expert_offload.h2d_transfer.torch.empty",
-            return_value=scalar,
-        ),
-        patch(
-            "vllm_ascend.expert_offload.h2d_transfer.torch.from_file",
-            return_value=mapped,
-        ) as from_file,
-    ):
-        pool = TorchSharedCPUWeightPool(
-            str(tmp_path), 2, 0, object(), dist_module=collectives)
-        result = pool.allocate("layer/0:w13", (2, 3), "dtype")
-
-    assert result is expected
-    path = from_file.call_args.args[0]
-    from_file.assert_called_once_with(
-        path, shared=True, size=6, dtype="dtype")
-    assert not os.path.exists(path)
-    assert collectives.barriers == 1
-    run_dir = pool.run_dir
-
-    pool.close()
-
-    assert not os.path.exists(run_dir)
-
-
-def test_torch_shared_weight_pool_reads_deleted_mapping_pss():
-    pool = TorchSharedCPUWeightPool.__new__(TorchSharedCPUWeightPool)
-    pool.run_dir = "/dev/shm/vllm-ascend-torch-shared-test"
-    smaps = (
-        "1000-3000 rw-s 00000000 00:01 10 "
-        f"{pool.run_dir}/00000-w13.bin (deleted)\n"
-        "Size:                  8 kB\n"
-        "Rss:                   8 kB\n"
-        "Pss:                   4 kB\n"
-        "SwapPss:               1 kB\n"
-        "3000-4000 rw-p 00000000 00:00 0 [heap]\n"
-        "Size:                  4 kB\n"
-        "Rss:                   4 kB\n"
-        "Pss:                   4 kB\n"
-        "SwapPss:               0 kB\n"
-        "4000-5000 rw-s 00000000 00:01 11 "
-        f"{pool.run_dir}/00001-w2.bin (deleted)\n"
-        "Size:                  4 kB\n"
-        "Rss:                   4 kB\n"
-        "Pss:                   2 kB\n"
-        "SwapPss:               0 kB\n"
-    )
-
-    with patch("builtins.open", return_value=StringIO(smaps)):
-        snapshot = pool.mapping_memory_snapshot()
-
-    assert snapshot == {
-        "size_bytes": 12 * 1024,
-        "rss_bytes": 12 * 1024,
-        "pss_bytes": 6 * 1024,
-        "swap_pss_bytes": 1024,
-        "mapping_count": 2,
-    }
-
-
-def test_torch_shared_weight_pool_reports_unavailable_smaps():
-    pool = TorchSharedCPUWeightPool.__new__(TorchSharedCPUWeightPool)
-    pool.run_dir = "/dev/shm/vllm-ascend-torch-shared-test"
-
-    with patch("builtins.open", side_effect=PermissionError):
-        assert pool.mapping_memory_snapshot() is None
-
-
-def test_factory_selects_torch_shared_staging_transport():
-    transport = create_h2d_transport(
-        "torch",
-        device_id=0,
-        memfabric_pool_size_gib=0,
-        memfabric_log_level=3,
-        enable_torch_shared_cpu=True,
-    )
-
-    assert isinstance(transport, TorchSharedCPUH2DTransport)
+    empty.assert_called_once_with((2, 3), dtype="dtype", device="cpu", pin_memory=True)
 
 
 class _FakeDescriptor:
-
     def __init__(self, values, dtype, device):
         self.values = values
         self.dtype = dtype
@@ -375,8 +158,7 @@ def test_memfabric_transport_pads_odd_sparse_copy_batch_and_retires_descriptors(
         destination.data_ptr.return_value = 200 + index
     tasks = [
         H2DCopyTask(source, destination, index + 1)
-        for index, (source, destination) in enumerate(
-            zip(sources, destinations))
+        for index, (source, destination) in enumerate(zip(sources, destinations))
     ]
     descriptors = []
 
@@ -395,8 +177,7 @@ def test_memfabric_transport_pads_odd_sparse_copy_batch_and_retires_descriptors(
     assert descriptors[1].values == [200, 201, 202, 202]
     assert descriptors[2].values == [1, 2, 3, 0]
     assert descriptors[3].values == 4
-    offload_module.sparse_copy.assert_called_once_with(
-        *descriptors, "npu:fake")
+    offload_module.sparse_copy.assert_called_once_with(*descriptors, "npu:fake")
     assert len(transport._inflight_descriptors) == 1
 
     stream = MagicMock()
@@ -407,26 +188,11 @@ def test_memfabric_transport_pads_odd_sparse_copy_batch_and_retires_descriptors(
 
 
 def test_memfabric_transport_preserves_uint32_length_bits():
-    assert MemFabricLocalH2DTransport._int32_bits((1 << 31) - 1) == \
-        (1 << 31) - 1
+    assert MemFabricLocalH2DTransport._int32_bits((1 << 31) - 1) == (1 << 31) - 1
     assert MemFabricLocalH2DTransport._int32_bits(1 << 31) == -(1 << 31)
     assert MemFabricLocalH2DTransport._int32_bits((1 << 32) - 1) == -1
     with pytest.raises(ValueError, match="exceeds uint32"):
         MemFabricLocalH2DTransport._int32_bits(1 << 32)
-
-
-def test_memfabric_transport_rejects_non_h2d_copy_directions():
-    transport, _, offload_module = _make_memfabric_transport()
-    task = H2DCopyTask(
-        MagicMock(), MagicMock(), 4,
-        name="victim-d2h",
-        direction=CopyDirection.D2H,
-    )
-
-    with pytest.raises(RuntimeError, match="supports H2D only.*d2h"):
-        transport.copy_batch([task])
-
-    offload_module.sparse_copy.assert_not_called()
 
 
 def test_memfabric_transport_reports_sparse_copy_failure():
@@ -437,8 +203,7 @@ def test_memfabric_transport_reports_sparse_copy_failure():
     with (
         patch(
             "vllm_ascend.expert_offload.h2d_transfer.torch.tensor",
-            side_effect=lambda values, dtype, device: _FakeDescriptor(
-                values, dtype, device),
+            side_effect=lambda values, dtype, device: _FakeDescriptor(values, dtype, device),
         ),
         pytest.raises(RuntimeError, match="sparse_copy failed.*ret=9"),
     ):

@@ -1,16 +1,22 @@
+import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from vllm_ascend import ascend_forward_context as afc
 from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.device.hardware import AscendDeviceType
+from vllm_ascend.device.hardware_profile import get_hardware_profile
+from vllm_ascend.quantization.quant_type import QuantType
 
 
 @pytest.fixture(autouse=True)
 def reset_mc2_tokens_capacity(monkeypatch):
     monkeypatch.setattr(afc, "_mc2_tokens_capacity", None)
+    monkeypatch.setattr(afc, "_USE_V2_EXTRA_KWARGS", False)
     monkeypatch.setattr(
         afc,
         "get_ascend_config",
@@ -33,23 +39,21 @@ def _make_vllm_config(
     tensor_parallel_size: int = 1,
     num_experts: int = 128,
     quant_type: str | None = None,
-    top_k_experts: int | None = 1,
+    top_k_experts: int = 1,
     num_experts_per_tok: int | None = None,
-    num_experts_per_token: int | None = None,
     cudagraph_capture_sizes: list[int] | None = None,
     max_cudagraph_capture_size: int = 0,
     max_num_batched_tokens: int = 0,
     hidden_size: int = 2048,
+    kv_connector: str | None = None,
+    kv_role: str | None = None,
+    recompute_scheduler_enable: bool = False,
 ):
-    hf_text_config_attrs: dict[str, object] = {}
-    if top_k_experts is not None:
-        hf_text_config_attrs["top_k_experts"] = top_k_experts
+    hf_text_config_attrs: dict[str, object] = {"top_k_experts": top_k_experts}
     if quant_type is not None:
         hf_text_config_attrs["quantize"] = quant_type
     if num_experts_per_tok is not None:
         hf_text_config_attrs["num_experts_per_tok"] = num_experts_per_tok
-    if num_experts_per_token is not None:
-        hf_text_config_attrs["num_experts_per_token"] = num_experts_per_token
     hf_text_config_attrs["hidden_size"] = hidden_size
 
     model_config = SimpleNamespace(
@@ -66,12 +70,20 @@ def _make_vllm_config(
         cudagraph_capture_sizes=cudagraph_capture_sizes or [],
         max_cudagraph_capture_size=max_cudagraph_capture_size,
     )
-    scheduler_config = SimpleNamespace(max_num_batched_tokens=max_num_batched_tokens)
+    kv_transfer_config = (
+        SimpleNamespace(kv_connector=kv_connector, kv_role=kv_role)
+        if kv_connector is not None or kv_role is not None
+        else None
+    )
     return SimpleNamespace(
         model_config=model_config,
         parallel_config=parallel_config,
         compilation_config=compilation_config,
-        scheduler_config=scheduler_config,
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=max_num_batched_tokens,
+            recompute_scheduler_enable=recompute_scheduler_enable,
+        ),
+        kv_transfer_config=kv_transfer_config,
     )
 
 
@@ -82,19 +94,18 @@ def _patch_select_moe_comm_method_deps(
     capacity: int = 128,
     ep_world_size: int = 8,
     enable_fused_mc2: int = 0,
-    enable_prefill_mc2: int = 0,
     is_moe: bool = True,
 ):
     monkeypatch.setattr(afc, "is_moe_model", lambda _: is_moe)
     monkeypatch.setattr(afc, "get_mc2_tokens_capacity", lambda: capacity)
-    monkeypatch.setattr(afc, "get_ascend_device_type", lambda: device_type)
+    monkeypatch.setattr(afc, "get_current_hardware_profile", lambda: get_hardware_profile(device_type))
     monkeypatch.setattr(afc, "get_ep_group", lambda: SimpleNamespace(world_size=ep_world_size))
     monkeypatch.setattr(
         afc,
         "get_ascend_config",
         lambda: SimpleNamespace(
             enable_fused_mc2=enable_fused_mc2,
-            enable_prefill_mc2=enable_prefill_mc2,
+            enable_prefill_mc2=False,
             expert_offload_config=SimpleNamespace(
                 expert_offload=False,
                 enable_multi_card=False,
@@ -138,17 +149,8 @@ def test_should_skip_compiled_for_multi_card_offload(
     assert afc._should_skip_compiled_for_multi_card_offload(moe_comm_type) is expected
 
 
-@pytest.mark.parametrize(
-    ("moe_comm_type", "expected_skip_compiled"),
-    [
-        (MoECommType.ALLTOALL, True),
-        (MoECommType.MC2, False),
-    ],
-)
-def test_set_forward_context_compiles_only_mc2_for_multi_card_offload(
+def test_set_forward_context_skips_compiled_alltoall_for_multi_card_offload(
     monkeypatch,
-    moe_comm_type,
-    expected_skip_compiled,
 ):
     forward_context = SimpleNamespace(skip_compiled=False, dp_metadata=None)
 
@@ -172,7 +174,7 @@ def test_set_forward_context_compiles_only_mc2_for_multi_card_offload(
     monkeypatch.setattr(
         afc,
         "select_moe_comm_method",
-        lambda *_: moe_comm_type,
+        lambda *_: MoECommType.ALLTOALL,
     )
     monkeypatch.setattr(afc, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(afc, "is_moe_model", lambda _: False)
@@ -190,7 +192,58 @@ def test_set_forward_context_compiles_only_mc2_for_multi_card_offload(
         vllm_config=SimpleNamespace(),
         num_tokens=8192,
     ):
-        assert forward_context.skip_compiled is expected_skip_compiled
+        assert forward_context.skip_compiled is True
+
+
+def test_deepseek_v4_forward_passes_input_ids_to_layers(monkeypatch):
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    from vllm_ascend.models.deepseek_v4 import model as deepseek_v4
+
+    monkeypatch.setattr(afc, "_USE_V2_EXTRA_KWARGS", True)
+    monkeypatch.setattr(
+        deepseek_v4,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+
+    layer = MagicMock()
+    layer.layer_idx = 0
+    layer.side_effect = lambda _positions, hidden_states, *_args, **_kwargs: (hidden_states, None)
+    model = SimpleNamespace(
+        hc_mult=1,
+        use_sequence_parallel_moe=False,
+        layers=[layer],
+        start_layer=0,
+        end_layer=1,
+        aux_hidden_state_layers=set(),
+        _needs_mtp_hidden_states=True,
+        _mtp_hidden_buffer=torch.empty(3, 4),
+        hc_head=lambda hidden_states, *_: hidden_states.squeeze(1),
+        hc_head_fn=None,
+        hc_head_scale=None,
+        hc_head_base=None,
+        norm=lambda hidden_states: hidden_states,
+    )
+    input_ids = torch.tensor([11, 22, 33])
+    forward_context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={},
+        additional_kwargs={},
+    )
+
+    with override_forward_context(forward_context):
+        deepseek_v4.DeepseekV4Model.forward(
+            model,
+            input_ids,
+            positions=torch.arange(input_ids.numel()),
+            intermediate_tensors=None,
+            inputs_embeds=torch.randn(input_ids.numel(), 4),
+        )
+
+    assert layer.call_args.kwargs["input_ids"] is input_ids
+    assert "input_ids" not in forward_context.additional_kwargs
 
 
 def test_set_mc2_tokens_capacity_without_cudagraph_aligns_per_tp_rank():
@@ -201,11 +254,21 @@ def test_set_mc2_tokens_capacity_without_cudagraph_aligns_per_tp_rank():
     assert afc.get_mc2_tokens_capacity() == 600
 
 
-def test_set_mc2_tokens_capacity_with_cudagraph_uses_capture_size_and_aligns():
+def test_set_mc2_tokens_capacity_with_cudagraph_uses_capture_size_and_aligns(monkeypatch):
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(
+            enable_prefill_mc2=False,
+            enable_fused_mc2=0,
+            scheduler_config=SimpleNamespace(recompute_scheduler_enable=True),
+        ),
+    )
     vllm_config = _make_vllm_config(
         tensor_parallel_size=8,
         cudagraph_capture_sizes=[1, 2],
         max_cudagraph_capture_size=257,
+        kv_role="kv_consumer",
     )
 
     afc.set_mc2_tokens_capacity(vllm_config, max_num_reqs=16, uniform_decode_query_len=1)
@@ -226,10 +289,62 @@ def test_set_mc2_tokens_capacity_prefill_mc2_uses_max_num_batched_tokens(monkeyp
     assert afc.get_mc2_tokens_capacity() == 520
 
 
+def test_is_decode_only_node_false_without_kv_transfer():
+    assert afc._is_decode_only_node(_make_vllm_config()) is False
+
+
+def test_is_decode_only_node_true_for_decode_bench_connector(monkeypatch):
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(
+            enable_fused_mc2=0,
+            scheduler_config=SimpleNamespace(recompute_scheduler_enable=True),
+        ),
+    )
+    vllm_config = _make_vllm_config(kv_connector="DecodeBenchConnector", kv_role="kv_both")
+
+    assert afc._is_decode_only_node(vllm_config) is True
+
+
+def test_is_decode_only_node_true_for_kv_consumer(monkeypatch):
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(
+            enable_fused_mc2=0,
+            scheduler_config=SimpleNamespace(recompute_scheduler_enable=True),
+        ),
+    )
+    vllm_config = _make_vllm_config(kv_role="kv_consumer")
+
+    assert afc._is_decode_only_node(vllm_config) is True
+
+
+def test_is_decode_only_node_false_without_recompute_scheduler(monkeypatch):
+    # With recompute scheduling disabled, prefill runs locally on the
+    # decode node, so it is not a decode-only node.
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(
+            enable_fused_mc2=0,
+            scheduler_config=SimpleNamespace(recompute_scheduler_enable=False),
+        ),
+    )
+    vllm_config = _make_vllm_config(
+        kv_connector="DecodeBenchConnector",
+        kv_role="kv_both",
+        recompute_scheduler_enable=False,
+    )
+
+    assert afc._is_decode_only_node(vllm_config) is False
+
+
 def test_select_moe_comm_method_returns_none_for_non_moe(monkeypatch):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
-        device_type=afc.AscendDeviceType.A3,
+        device_type=AscendDeviceType.A3,
         is_moe=False,
     )
 
@@ -250,7 +365,7 @@ def test_select_moe_comm_method_uses_allgather_without_effective_expert_parallel
 ):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
-        device_type=afc.AscendDeviceType.A3,
+        device_type=AscendDeviceType.A3,
         ep_world_size=ep_world_size,
     )
     vllm_config = _make_vllm_config(enable_expert_parallel=enable_expert_parallel)
@@ -259,17 +374,17 @@ def test_select_moe_comm_method_uses_allgather_without_effective_expert_parallel
 
 
 @pytest.mark.parametrize(
-    ("hf_text_config", "num_tokens", "expected"),
+    ("hf_config", "num_tokens", "expected"),
     [
         (SimpleNamespace(num_experts_per_tok=2), 2, MoECommType.MC2),
         (SimpleNamespace(num_experts_per_tok=2), 3, MoECommType.ALLTOALL),
         (
-            SimpleNamespace(num_experts_per_token=4),
+            SimpleNamespace(text_config=SimpleNamespace(num_experts_per_token=4)),
             1,
             MoECommType.MC2,
         ),
         (
-            SimpleNamespace(num_experts_per_token=4),
+            SimpleNamespace(text_config=SimpleNamespace(num_experts_per_token=4)),
             2,
             MoECommType.ALLTOALL,
         ),
@@ -277,7 +392,7 @@ def test_select_moe_comm_method_uses_allgather_without_effective_expert_parallel
 )
 def test_multi_card_offload_capacity_supports_deepseek_and_kimi_k3(
     monkeypatch,
-    hf_text_config,
+    hf_config,
     num_tokens,
     expected,
 ):
@@ -302,48 +417,9 @@ def test_multi_card_offload_capacity_supports_deepseek_and_kimi_k3(
         ),
     )
     vllm_config = _make_vllm_config()
-    vllm_config.model_config.hf_text_config = hf_text_config
+    vllm_config.model_config.hf_config = hf_config
 
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
-
-
-def test_multi_card_offload_kimi_k3_ignores_stale_top_level_topk(
-    monkeypatch,
-):
-    _patch_select_moe_comm_method_deps(
-        monkeypatch,
-        device_type=afc.AscendDeviceType.A3,
-        capacity=8,
-        ep_world_size=8,
-    )
-    offload_config = SimpleNamespace(
-        expert_offload=True,
-        enable_multi_card=True,
-        moe_offload_debug=True,
-        shard_per_rank=True,
-        h2d_backend="torch",
-        shared_cpu_weights=False,
-        num_device_experts_list=[192],
-        num_device_experts_for_rank=lambda _layer, ep_size: 192 // ep_size,
-    )
-    monkeypatch.setattr(
-        afc,
-        "get_ascend_config",
-        lambda: SimpleNamespace(expert_offload_config=offload_config),
-    )
-    vllm_config = _make_vllm_config(
-        top_k_experts=None,
-        num_experts_per_token=16,
-    )
-    vllm_config.model_config.hf_text_config.model_type = "kimi_linear"
-    vllm_config.model_config.hf_text_config.num_experts_per_tok = 32
-    vllm_config.model_config.hf_config = SimpleNamespace(
-        num_experts_per_tok=32,
-        text_config=SimpleNamespace(num_experts_per_token=16),
-    )
-
-    assert afc.get_moe_topk(vllm_config) == 16
-    assert afc.select_moe_comm_method(1, vllm_config) == MoECommType.MC2
 
 
 @pytest.mark.parametrize(
@@ -384,96 +460,31 @@ def test_multi_card_torch_offload_admission_uses_owner_capacity_when_sharded(
         lambda: SimpleNamespace(expert_offload_config=offload_config),
     )
     vllm_config = _make_vllm_config()
-    vllm_config.model_config.hf_config = SimpleNamespace(
-        num_experts_per_tok=2)
+    vllm_config.model_config.hf_config = SimpleNamespace(num_experts_per_tok=2)
 
     with patch.object(afc.logger, "info") as log_info:
         selected = afc.select_moe_comm_method(num_tokens, vllm_config)
 
     assert selected == expected
-    admission = next(
-        call for call in log_info.call_args_list
-        if call.args[0].startswith("[MC_ADMISSION]"))
-    assert admission.args[1] == (
-        "sharded" if shard_per_rank else "replicated")
-    assert admission.args[2:5] == (
-        "torch", "owner" if shard_per_rank else "global", num_tokens)
-    assert admission.args[5:11] == (
-        2, 2, 8, 4 if shard_per_rank else 8,
-        num_tokens * 2, 128)
+    admission = next(call for call in log_info.call_args_list if call.args[0].startswith("[MC_ADMISSION]"))
+    assert admission.args[1] == ("sharded" if shard_per_rank else "replicated")
+    assert admission.args[2:5] == ("torch", "owner" if shard_per_rank else "global", num_tokens)
+    assert admission.args[5:11] == (2, 2, 8, 4 if shard_per_rank else 8, num_tokens * 2, 128)
     assert admission.args[12] == expected.name
-    assert admission.args[13] == (
-        "fits" if expected == MoECommType.MC2 else "expert_slots")
+    assert admission.args[13] == ("fits" if expected == MoECommType.MC2 else "expert_slots")
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "expected", "reason"),
+    ("h2d_backend", "is_draft_model", "expected", "admission_slots", "placement_scope"),
     [
-        (3, MoECommType.MC2, "fits"),
-        (115, MoECommType.ALLTOALL, "expert_slots"),
+        ("torch", False, MoECommType.ALLTOALL, 6, "owner"),
+        ("memfabric", False, MoECommType.MC2, 48, "global"),
+        ("memfabric", True, MoECommType.ALLTOALL, 6, "owner"),
     ],
 )
-def test_exclusive_sharded_torch_offload_uses_mc2_decode_and_alltoall_prefill(
-    monkeypatch,
-    num_tokens,
-    expected,
-    reason,
-):
-    _patch_select_moe_comm_method_deps(
-        monkeypatch,
-        device_type=afc.AscendDeviceType.A3,
-        capacity=128,
-        ep_world_size=2,
-    )
-    offload_config = SimpleNamespace(
-        expert_offload=True,
-        enable_multi_card=True,
-        moe_offload_debug=True,
-        storage_partition_mode="exclusive_dynamic",
-        shard_per_rank=True,
-        h2d_backend="torch",
-        shared_cpu_weights=False,
-        num_device_experts_list=[78],
-        num_device_experts_for_rank=lambda _layer, ep_size: 78 // ep_size,
-    )
-    monkeypatch.setattr(
-        afc,
-        "get_ascend_config",
-        lambda: SimpleNamespace(expert_offload_config=offload_config),
-    )
-    vllm_config = _make_vllm_config()
-    vllm_config.model_config.hf_config = SimpleNamespace(
-        num_experts_per_tok=6)
-
-    with patch.object(afc.logger, "info") as log_info:
-        selected = afc.select_moe_comm_method(num_tokens, vllm_config)
-
-    assert selected == expected
-    admission = next(
-        call for call in log_info.call_args_list
-        if call.args[0].startswith("[MC_ADMISSION]"))
-    assert admission.args[1:11] == (
-        "sharded", "torch", "owner", num_tokens, 6, 2, 78, 39,
-        num_tokens * 6, 128)
-    assert admission.args[12] == expected.name
-    assert admission.args[13] == reason
-
-
-@pytest.mark.parametrize(
-    ("h2d_backend", "shared_cpu_weights", "is_draft_model", "expected",
-     "admission_slots", "placement_scope"),
-    [
-        ("torch", False, False, MoECommType.ALLTOALL, 6, "owner"),
-        ("torch", True, False, MoECommType.MC2, 48, "global"),
-        ("torch", True, True, MoECommType.ALLTOALL, 6, "owner"),
-        ("memfabric", False, False, MoECommType.MC2, 48, "global"),
-        ("memfabric", False, True, MoECommType.ALLTOALL, 6, "owner"),
-    ],
-)
-def test_multi_card_shared_h2d_admission_uses_global_target_capacity(
+def test_multi_card_memfabric_admission_uses_global_target_capacity(
     monkeypatch,
     h2d_backend,
-    shared_cpu_weights,
     is_draft_model,
     expected,
     admission_slots,
@@ -491,7 +502,6 @@ def test_multi_card_shared_h2d_admission_uses_global_target_capacity(
         moe_offload_debug=True,
         shard_per_rank=True,
         h2d_backend=h2d_backend,
-        shared_cpu_weights=shared_cpu_weights,
         num_device_experts_list=[48],
         num_device_experts_for_rank=lambda _layer, ep_size: 48 // ep_size,
     )
@@ -501,23 +511,16 @@ def test_multi_card_shared_h2d_admission_uses_global_target_capacity(
         lambda: SimpleNamespace(expert_offload_config=offload_config),
     )
     vllm_config = _make_vllm_config()
-    vllm_config.model_config.hf_config = SimpleNamespace(
-        num_experts_per_tok=6)
+    vllm_config.model_config.hf_config = SimpleNamespace(num_experts_per_tok=6)
 
     with patch.object(afc.logger, "info") as log_info:
-        selected = afc.select_moe_comm_method(
-            3, vllm_config, is_draft_model=is_draft_model)
+        selected = afc.select_moe_comm_method(3, vllm_config, is_draft_model=is_draft_model)
 
     assert selected == expected
-    admission = next(
-        call for call in log_info.call_args_list
-        if call.args[0].startswith("[MC_ADMISSION]"))
-    assert admission.args[1:11] == (
-        "sharded", h2d_backend, placement_scope,
-        3, 6, 8, 48, admission_slots, 18, 128)
+    admission = next(call for call in log_info.call_args_list if call.args[0].startswith("[MC_ADMISSION]"))
+    assert admission.args[1:11] == ("sharded", h2d_backend, placement_scope, 3, 6, 8, 48, admission_slots, 18, 128)
     assert admission.args[12] == expected.name
-    assert admission.args[13] == (
-        "fits" if expected == MoECommType.MC2 else "expert_slots")
+    assert admission.args[13] == ("fits" if expected == MoECommType.MC2 else "expert_slots")
 
 
 @pytest.mark.parametrize(
@@ -530,25 +533,13 @@ def test_multi_card_shared_h2d_admission_uses_global_target_capacity(
 def test_select_moe_comm_method_a2_uses_mc2_within_capacity(monkeypatch, num_tokens, expected):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
-        device_type=afc.AscendDeviceType.A2,
+        device_type=AscendDeviceType.A2,
         capacity=128,
         ep_world_size=16,
     )
     vllm_config = _make_vllm_config(world_size=16, num_experts=128)
 
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
-
-
-def test_select_moe_comm_method_a2_uses_allgather_for_more_than_512_experts(monkeypatch):
-    _patch_select_moe_comm_method_deps(
-        monkeypatch,
-        device_type=afc.AscendDeviceType.A2,
-        capacity=128,
-        ep_world_size=64,
-    )
-    vllm_config = _make_vllm_config(world_size=64, num_experts=896)
-
-    assert afc.select_moe_comm_method(128, vllm_config) == MoECommType.ALLGATHER
 
 
 @pytest.mark.parametrize(
@@ -568,7 +559,7 @@ def test_select_moe_comm_method_a3_enable_fused_mc2_mode_1(
 ):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
-        device_type=afc.AscendDeviceType.A3,
+        device_type=AscendDeviceType.A3,
         capacity=128,
         ep_world_size=ep_world_size,
         enable_fused_mc2=1,
@@ -593,9 +584,8 @@ def test_select_moe_comm_method_a3_without_fused_mc2(
 ):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
-        device_type=afc.AscendDeviceType.A3,
+        device_type=AscendDeviceType.A3,
         capacity=128,
-        enable_prefill_mc2=1,
     )
     vllm_config = _make_vllm_config()
 
@@ -616,11 +606,10 @@ def test_select_moe_comm_method_a3_quant_w4a16(
 ):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
-        device_type=afc.AscendDeviceType.A3,
+        device_type=AscendDeviceType.A3,
         capacity=128,
         ep_world_size=ep_world_size,
         enable_fused_mc2=1,
-        enable_prefill_mc2=1,
     )
 
     vllm_config = _make_vllm_config(quant_type="w4a16")
@@ -642,11 +631,10 @@ def test_select_moe_comm_method_a3_quant_w4a8(
 ):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
-        device_type=afc.AscendDeviceType.A3,
+        device_type=AscendDeviceType.A3,
         capacity=128,
         ep_world_size=ep_world_size,
         enable_fused_mc2=1,
-        enable_prefill_mc2=1,
     )
 
     vllm_config = _make_vllm_config(quant_type="w4a8")
@@ -668,33 +656,15 @@ def test_select_moe_comm_method_a3_quant_w8a8(
 ):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
-        device_type=afc.AscendDeviceType.A3,
+        device_type=AscendDeviceType.A3,
         capacity=128,
         ep_world_size=ep_world_size,
         enable_fused_mc2=1,
-        enable_prefill_mc2=1,
     )
 
     vllm_config = _make_vllm_config(quant_type="w8a8")
 
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
-
-
-@pytest.mark.parametrize(
-    ("quant_type", "expected"),
-    [
-        ("w4a8", True),
-        ("w8a8", True),
-        ("w8a16", False),
-    ],
-)
-def test_cann_megamoe_supported_by_config_quant_type(
-    quant_type,
-    expected,
-):
-    vllm_config = _make_vllm_config(quant_type=quant_type)
-
-    assert afc._cann_megamoe_supported_by_config(vllm_config) == expected
 
 
 @pytest.mark.parametrize(
@@ -711,11 +681,10 @@ def test_select_moe_comm_method_a3_mc2_invalid_hidden_size(
 ):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
-        device_type=afc.AscendDeviceType.A3,
+        device_type=AscendDeviceType.A3,
         capacity=128,
         ep_world_size=ep_world_size,
         enable_fused_mc2=1,
-        enable_prefill_mc2=0,
     )
 
     vllm_config = _make_vllm_config(quant_type="w4a8", hidden_size=512)
@@ -724,53 +693,220 @@ def test_select_moe_comm_method_a3_mc2_invalid_hidden_size(
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "world_size", "ep_world_size", "top_k_experts", "expected"),
+    ("num_tokens", "world_size", "top_k_experts", "expected"),
     [
-        (128, 4, 4, 2, MoECommType.MC2),
-        (129, 2, 2, 4, MoECommType.ALLGATHER),
-        (129, 8, 8, 4, MoECommType.ALLTOALL),
-        (129, 32, 8, 16, MoECommType.ALLGATHER),
+        (128, 4, 2, MoECommType.MC2),
+        (129, 2, 4, MoECommType.ALLGATHER),
+        (129, 8, 4, MoECommType.ALLTOALL),
     ],
 )
-def test_select_moe_comm_method_a5(
-    monkeypatch,
-    num_tokens,
-    world_size,
-    ep_world_size,
-    top_k_experts,
-    expected,
-):
+def test_select_moe_comm_method_a5(monkeypatch, num_tokens, world_size, top_k_experts, expected):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
-        device_type=afc.AscendDeviceType.A5,
+        device_type=AscendDeviceType.A5,
         capacity=128,
-        ep_world_size=ep_world_size,
     )
     vllm_config = _make_vllm_config(world_size=world_size, top_k_experts=top_k_experts)
 
     assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
 
 
-def test_select_moe_comm_method_a5_uses_kimi_k3_top_k(monkeypatch):
+@pytest.mark.parametrize("num_tokens", [128, 4096])
+def test_select_moe_comm_method_a5_uses_megamoe_when_enabled(monkeypatch, num_tokens):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
-        device_type=afc.AscendDeviceType.A5,
+        device_type=AscendDeviceType.A5,
         capacity=128,
-        ep_world_size=8,
+        enable_fused_mc2=1,
     )
-    vllm_config = _make_vllm_config(
-        world_size=32,
-        top_k_experts=None,
-        num_experts_per_token=16,
-    )
+    monkeypatch.setattr(afc, "is_mega_moe_supported", lambda: True)
+    vllm_config = _make_vllm_config(world_size=8, top_k_experts=8)
 
-    assert afc.select_moe_comm_method(129, vllm_config) == MoECommType.ALLGATHER
+    assert afc.select_moe_comm_method(num_tokens, vllm_config) == MoECommType.FUSED_MC2
+
+
+@pytest.mark.parametrize("num_tokens", [128, 4096])
+@pytest.mark.parametrize("draft_quant", [QuantType.NONE, QuantType.W8A8MXFP, QuantType.W4A8MXFP, QuantType.W4A4MXFP])
+def test_select_moe_comm_method_a5_preserves_draft_quant_guard(monkeypatch, num_tokens, draft_quant):
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=AscendDeviceType.A5,
+        capacity=128,
+        enable_fused_mc2=1,
+    )
+    monkeypatch.setattr(afc, "is_mega_moe_supported", lambda: True)
+    vllm_config = _make_vllm_config(world_size=8, top_k_experts=4)
+    expected = MoECommType.FUSED_MC2
+    if draft_quant == QuantType.NONE:
+        expected = MoECommType.MC2 if num_tokens <= 128 else MoECommType.ALLTOALL
+    assert (
+        afc.select_moe_comm_method(num_tokens, vllm_config, is_draft_model=True, draft_moe_quant_type=draft_quant)
+        == expected
+    )
 
 
 def test_select_moe_comm_method_310p_uses_allgather(monkeypatch):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
-        device_type=afc.AscendDeviceType._310P,
+        device_type=AscendDeviceType._310P,
     )
 
     assert afc.select_moe_comm_method(128, _make_vllm_config()) == MoECommType.ALLGATHER
+
+
+@pytest.mark.parametrize("model_owned", [False, True])
+def test_set_ascend_forward_context_pins_current_vllm_config(monkeypatch, model_owned):
+    vllm_config = _make_vllm_config()
+    seen: dict[str, object] = {"config": None, "inside": False}
+
+    @contextmanager
+    def fake_set_current(config):
+        seen["config"] = config
+        seen["inside"] = True
+        try:
+            yield
+        finally:
+            seen["inside"] = False
+
+    @contextmanager
+    def fake_set_forward_context(**_kwargs):
+        yield
+
+    forward_context = SimpleNamespace(dp_metadata=None)
+
+    monkeypatch.setattr(afc, "set_current_vllm_config", fake_set_current)
+    monkeypatch.setattr(afc, "set_forward_context", fake_set_forward_context)
+    monkeypatch.setattr(afc, "get_forward_context", lambda: forward_context)
+    monkeypatch.setattr(afc, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(afc, "get_dp_group", lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(afc, "has_layer_idx", lambda _model: False)
+    monkeypatch.setattr(afc, "select_moe_comm_method", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(afc, "get_mc2_mask", lambda: None)
+    monkeypatch.setattr(afc, "use_v2_model_runner", lambda _cfg: True)
+
+    legacy_method = object()
+    target_method = object()
+    draft_method = object()
+    moe_mod_name = "vllm_ascend.ops.fused_moe.moe_comm_method"
+    if moe_mod_name in sys.modules:
+        monkeypatch.setattr(sys.modules[moe_mod_name], "get_moe_comm_method", lambda _t: legacy_method)
+    else:
+        monkeypatch.setitem(sys.modules, moe_mod_name, SimpleNamespace(get_moe_comm_method=lambda _t: legacy_method))
+
+    for expected in (target_method, draft_method, target_method):
+        model = SimpleNamespace(moe_comm_methods={None: expected}) if model_owned else None
+        with afc.set_ascend_forward_context(None, vllm_config, num_tokens=4, model_instance=model):
+            assert seen["inside"] is True
+            assert seen["config"] is vllm_config
+            assert forward_context.moe_comm_method is (expected if model_owned else legacy_method)
+            assert afc._USE_V2_EXTRA_KWARGS is True
+
+    assert seen["inside"] is False
+
+
+def test_sync_v2_extra_kwargs_caches_actual_bool(monkeypatch):
+    monkeypatch.setattr(afc, "use_v2_model_runner", lambda _cfg: True)
+    afc.sync_v2_extra_kwargs(SimpleNamespace())
+    assert afc._USE_V2_EXTRA_KWARGS is True
+
+    monkeypatch.setattr(afc, "use_v2_model_runner", lambda _cfg: False)
+    afc.sync_v2_extra_kwargs(SimpleNamespace())
+    assert afc._USE_V2_EXTRA_KWARGS is False
+
+    monkeypatch.setattr(afc, "use_v2_model_runner", lambda _cfg: MagicMock())
+    afc.sync_v2_extra_kwargs(SimpleNamespace())
+    assert afc._USE_V2_EXTRA_KWARGS is False
+
+
+def test_extra_ctx_getattr_does_not_call_use_v2_model_runner(monkeypatch):
+    monkeypatch.setattr(afc, "_USE_V2_EXTRA_KWARGS", True)
+
+    def _boom(_cfg=None):
+        raise AssertionError("compiled extra-ctx must not call use_v2_model_runner")
+
+    monkeypatch.setattr(afc, "use_v2_model_runner", _boom)
+    forward_context = SimpleNamespace(additional_kwargs={}, capturing=True)
+    monkeypatch.setattr(afc, "get_forward_context", lambda: forward_context)
+
+    assert afc._EXTRA_CTX.capturing is None
+    afc._EXTRA_CTX.capturing = False
+    assert forward_context.additional_kwargs["capturing"] is False
+
+
+def test_extra_ctx_default_v2_hides_gpu_capturing_flag(monkeypatch):
+    # GPU V2 ForwardContext has no vllm_config. Isolation follows the
+    # eager-cached _USE_V2_EXTRA_KWARGS flag, not ctx.vllm_config.
+    monkeypatch.setattr(afc, "_USE_V2_EXTRA_KWARGS", True)
+    forward_context = SimpleNamespace(
+        additional_kwargs={},
+        capturing=True,
+    )
+    monkeypatch.setattr(afc, "get_forward_context", lambda: forward_context)
+
+    assert afc._EXTRA_CTX.capturing is None
+    afc._EXTRA_CTX.capturing = False
+    assert afc._EXTRA_CTX.capturing is False
+    assert forward_context.capturing is True
+    assert forward_context.additional_kwargs["capturing"] is False
+
+
+def test_extra_ctx_v1_stores_capturing_on_context(monkeypatch):
+    monkeypatch.setattr(afc, "_USE_V2_EXTRA_KWARGS", False)
+    forward_context = SimpleNamespace(
+        additional_kwargs={},
+        capturing=False,
+    )
+    monkeypatch.setattr(afc, "get_forward_context", lambda: forward_context)
+
+    afc._EXTRA_CTX.capturing = True
+    assert afc._EXTRA_CTX.capturing is True
+    assert forward_context.capturing is True
+    assert "capturing" not in forward_context.additional_kwargs
+
+
+def test_extra_ctx_v1_override_uses_context_capturing_flag(monkeypatch):
+    monkeypatch.setattr(afc, "_USE_V2_EXTRA_KWARGS", False)
+    forward_context = SimpleNamespace(
+        additional_kwargs={},
+        capturing=False,
+    )
+    monkeypatch.setattr(afc, "get_forward_context", lambda: forward_context)
+
+    afc._EXTRA_CTX.capturing = True
+    assert forward_context.capturing is True
+    assert "capturing" not in forward_context.additional_kwargs
+
+
+def test_extra_ctx_magicmock_forward_context_stays_on_v1_attrs(monkeypatch):
+    monkeypatch.setattr(afc, "_USE_V2_EXTRA_KWARGS", False)
+    forward_context = MagicMock(capturing=False)
+    monkeypatch.setattr(afc, "get_forward_context", lambda: forward_context)
+
+    assert afc._EXTRA_CTX.capturing is False
+    afc._EXTRA_CTX.capturing = True
+    assert forward_context.capturing is True
+
+
+def test_extra_ctx_unset_vllm_config_stays_on_v1_attrs(monkeypatch):
+    monkeypatch.setattr(afc, "_USE_V2_EXTRA_KWARGS", False)
+    forward_context = MagicMock(capturing=False)
+    monkeypatch.setattr(afc, "get_forward_context", lambda: forward_context)
+
+    assert afc._EXTRA_CTX.capturing is False
+    afc._EXTRA_CTX.capturing = True
+    assert forward_context.capturing is True
+
+
+def test_extra_ctx_env_true_uses_additional_kwargs(monkeypatch):
+    monkeypatch.setattr(afc, "_USE_V2_EXTRA_KWARGS", True)
+    forward_context = SimpleNamespace(
+        additional_kwargs={},
+        capturing=True,
+    )
+    monkeypatch.setattr(afc, "get_forward_context", lambda: forward_context)
+
+    assert afc._EXTRA_CTX.capturing is None
+    afc._EXTRA_CTX.capturing = False
+    assert afc._EXTRA_CTX.capturing is False
+    assert forward_context.capturing is True
+    assert forward_context.additional_kwargs["capturing"] is False

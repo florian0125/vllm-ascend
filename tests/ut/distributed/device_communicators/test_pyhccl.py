@@ -1,5 +1,4 @@
 import os
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -7,11 +6,6 @@ from vllm.distributed.utils import StatelessProcessGroup
 
 from tests.ut.base import TestBase
 from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
-from vllm_ascend.distributed.device_communicators.pyhccl_wrapper import (
-    hcclComm_t,
-    hcclDataTypeEnum,
-    hcclSendRecvTypeEnum,
-)
 
 
 class MockHcclLib:
@@ -75,61 +69,61 @@ class TestPyHcclCommunicator(TestBase):
         self.assertFalse(comm.available)
         self.assertTrue(comm.disabled)
 
-    def test_batch_send_recv_passes_raw_buffers_and_stream(self):
+    @patch("vllm_ascend.distributed.device_communicators.pyhccl.torch.npu.synchronize")
+    @patch("vllm_ascend.distributed.device_communicators.pyhccl.torch.npu.device")
+    def test_close_synchronizes_and_destroys_once(self, _mock_device, synchronize):
         comm = PyHcclCommunicator.__new__(PyHcclCommunicator)
+        comm.available = True
         comm.disabled = False
-        comm.rank = 0
-        comm.world_size = 2
-        comm.device = torch.device("cpu")
-        comm.comm = hcclComm_t(99)
+        comm.device = "npu:0"
         comm.hccl = MagicMock()
-        comm.hccl.supports_batch_send_recv = True
-        send = torch.arange(8, dtype=torch.uint8)
-        recv = torch.zeros(12, dtype=torch.uint8)
-        stream = SimpleNamespace(npu_stream=77)
-
-        comm.batch_send_recv({1: send}, {1: recv}, stream=stream)
-
-        items, actual_comm, actual_stream = (
-            comm.hccl.hcclBatchSendRecv.call_args.args)
-        self.assertEqual(len(items), 2)
-        self.assertEqual(
-            items[0].sendRecvType, hcclSendRecvTypeEnum.hcclSend)
-        self.assertEqual(items[0].buf, send.data_ptr())
-        self.assertEqual(items[0].count, send.numel())
-        self.assertEqual(
-            items[0].dataType, hcclDataTypeEnum.hcclUint8)
-        self.assertEqual(items[0].remoteRank, 1)
-        self.assertEqual(
-            items[1].sendRecvType, hcclSendRecvTypeEnum.hcclRecv)
-        self.assertEqual(items[1].buf, recv.data_ptr())
-        self.assertEqual(actual_comm, comm.comm)
-        self.assertEqual(actual_stream.value, stream.npu_stream)
-
-    def test_batch_send_recv_rejects_nonzero_storage_offset(self):
-        comm = PyHcclCommunicator.__new__(PyHcclCommunicator)
-        comm.disabled = False
-        comm.rank = 0
-        comm.world_size = 2
-        comm.device = torch.device("cpu")
-        comm.comm = hcclComm_t(99)
-        comm.hccl = MagicMock()
-        comm.hccl.supports_batch_send_recv = True
-        offset_view = torch.empty(9, dtype=torch.uint8)[1:]
-
-        with self.assertRaisesRegex(ValueError, "zero-offset"):
-            comm.batch_send_recv({1: offset_view}, {})
-
-        comm.hccl.hcclBatchSendRecv.assert_not_called()
-
-    def test_close_destroys_communicator_once(self):
-        comm = PyHcclCommunicator.__new__(PyHcclCommunicator)
-        comm.disabled = False
-        comm.comm = hcclComm_t(99)
-        comm.hccl = MagicMock()
+        comm.comm = MagicMock()
+        tensor = MagicMock(device=comm.device, dtype=torch.float32)
+        tensor.data_ptr.return_value = 1
+        tensor.numel.return_value = 1
+        comm.broadcast(tensor, src=0, stream=MagicMock(npu_stream=1234))
+        calls = MagicMock()
+        calls.attach_mock(synchronize, "synchronize")
+        calls.attach_mock(comm.hccl.hcclCommDestroy, "destroy")
 
         comm.close()
         comm.close()
 
+        synchronize.assert_called_once_with(comm.device)
         comm.hccl.hcclCommDestroy.assert_called_once_with(comm.comm)
+        self.assertEqual([call[0] for call in calls.mock_calls], ["synchronize", "destroy"])
+        self.assertFalse(comm.available)
+        for collective in (lambda: comm.broadcast(tensor, src=0), lambda: comm.all_reduce(tensor)):
+            with self.assertRaisesRegex(RuntimeError, "closed"):
+                collective()
+
+    def test_close_disabled_communicator(self):
+        comm = PyHcclCommunicator(group=StatelessProcessGroup(0, 1, None, None), device="npu:0")
+        comm.close()
+        comm.close()
         self.assertTrue(comm.disabled)
+
+    @patch("vllm_ascend.distributed.device_communicators.pyhccl.torch.npu.synchronize")
+    @patch("vllm_ascend.distributed.device_communicators.pyhccl.torch.npu.device")
+    def test_close_failure_propagates_without_retry(self, _mock_device, synchronize):
+        for operation in ("synchronize", "destroy"):
+            with self.subTest(operation=operation):
+                synchronize.reset_mock(side_effect=True)
+                comm = PyHcclCommunicator.__new__(PyHcclCommunicator)
+                comm.available = True
+                comm.device = "npu:0"
+                comm.hccl = MagicMock()
+                comm.comm = MagicMock()
+                failing_call = synchronize if operation == "synchronize" else comm.hccl.hcclCommDestroy
+                failing_call.side_effect = RuntimeError("close failed")
+
+                with self.assertRaisesRegex(RuntimeError, "close failed"):
+                    comm.close()
+                comm.close()
+
+                synchronize.assert_called_once_with(comm.device)
+                if operation == "synchronize":
+                    comm.hccl.hcclCommDestroy.assert_not_called()
+                else:
+                    comm.hccl.hcclCommDestroy.assert_called_once_with(comm.comm)
+                self.assertFalse(comm.available)

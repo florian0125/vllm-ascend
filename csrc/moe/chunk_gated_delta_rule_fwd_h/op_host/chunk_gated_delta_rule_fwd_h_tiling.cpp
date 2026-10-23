@@ -141,7 +141,7 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdH(gert::TilingContext *context)
     // Newer arches use keys 1/2 to select TileShapes128/256.
     uint32_t tilingKey = TILING_KEY_DEFAULT;
     if (ascendcPlatform.GetSocVersion() != platform_ascendc::SocVersion::ASCEND310P) {
-        tilingKey = plainTiling.vHeadDim > V_DIM_128 ? TILING_KEY_V256 : TILING_KEY_V128;
+        tilingKey = plainTiling.vHeadDim > V_DIM_128 ? TILING_KEY_V256 : TILING_KEY_V128;  // gitleaks:allow
     }
     context->SetTilingKey(tilingKey);
     OP_LOGD(context->GetNodeName(), "tilingKey: %u (vHeadDim=%ld)", tilingKey, plainTiling.vHeadDim);

@@ -42,6 +42,8 @@ class CPUExpertBackend(Protocol):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        defer_graph_join: bool = False,
+        graph_transfer=None,
     ) -> CPUExpertTask:
         """Submit the CPU-owned routes without blocking NPU execution.
 
@@ -49,6 +51,12 @@ class CPUExpertBackend(Protocol):
         for routes owned by NPU.  The backend must skip negative ids.  It owns
         any D2H transfer and must apply each non-zero routing weight exactly
         once before reducing expert outputs into token-major order.
+        With ``defer_graph_join``, submit records a submission event but leaves
+        graph drain/output copies to wait(), after NPU work has been recorded.
+        This must never defer the CPU computation itself.
+        ``graph_transfer`` optionally supplies a transfer coordinator and
+        device map. That path receives full routes, masks them on CPU using
+        the updated map, and records a combined map/weight readiness wait.
         """
         ...
 
@@ -74,6 +82,7 @@ class HybridExpertExecutor:
             raise ValueError(f"layer_idx must be non-negative; got {layer_idx}")
         self.backend = backend
         self.layer_idx = layer_idx
+        self._weight_transfer = None
 
     def prepare(
         self,
@@ -82,52 +91,87 @@ class HybridExpertExecutor:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         log2phy: torch.Tensor,
+        weight_transfer=None,
     ) -> HybridExpertPlan:
         """Submit CPU misses and produce a safe zero-weight NPU route.
 
-        Logical ids remain unchanged.  The existing Ascend communication path
-        maps them through ``log2phy`` and clamps unmapped ids to physical slot
-        zero.  Zeroing their weights makes that placeholder slot contribute
-        nothing while keeping every routed id valid for NPU operators.
+        Valid logical ids remain unchanged. Pruned/zero-weight routes are
+        marked -1 before any mapping lookup or optional weight transfer.
+        The existing dispatcher excludes unmapped routes; their NPU weights
+        are also zero. The CPU backend skips -1 routes unconditionally.
         """
         if topk_ids.shape != topk_weights.shape:
             raise ValueError(
                 "topk ids and weights must have the same shape; "
                 f"got ids={tuple(topk_ids.shape)}, "
-                f"weights={tuple(topk_weights.shape)}")
+                f"weights={tuple(topk_weights.shape)}"
+            )
         if topk_ids.ndim != 2:
-            raise ValueError(
-                f"topk routing must be rank 2; got rank={topk_ids.ndim}")
+            raise ValueError(f"topk routing must be rank 2; got rank={topk_ids.ndim}")
         if log2phy.ndim != 1:
-            raise ValueError(
-                f"log2phy must be rank 1; got rank={log2phy.ndim}")
+            raise ValueError(f"log2phy must be rank 1; got rank={log2phy.ndim}")
 
-        physical_ids = log2phy[topk_ids]
-        npu_route_mask = physical_ids >= 0
-        zero = torch.zeros((), dtype=topk_weights.dtype,
-                           device=topk_weights.device)
-        npu_topk_weights = torch.where(
-            npu_route_mask, topk_weights, zero)
-        cpu_topk_weights = torch.where(
-            npu_route_mask, zero, topk_weights)
-        if topk_ids.dtype not in (torch.int8, torch.int16, torch.int32,
-                                  torch.int64):
+        valid = (topk_ids >= 0) & (topk_ids < log2phy.numel()) & (topk_weights != 0)
+        topk_ids = torch.where(valid, topk_ids, -1)
+        if log2phy.numel() == 0:
+            raise ValueError("log2phy must not be empty")
+        if topk_ids.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
             raise TypeError(
-                "topk ids must use a signed integer dtype so -1 can mark "
-                f"NPU-owned routes; got {topk_ids.dtype}")
+                f"topk ids must use a signed integer dtype so -1 can mark NPU-owned routes; got {topk_ids.dtype}"
+            )
+        cpu_task = None
+        transfer_task = None
+        if weight_transfer is not None:
+            from vllm_ascend.expert_offload.cpu_backend.kt_kernel_backend import _graph_capture_active
+
+            if getattr(weight_transfer, "device_owned", False):
+                transfer_task = weight_transfer.prepare(topk_ids, log2phy)
+            elif _graph_capture_active():
+                # CPU selects placement and submits the reduced CPU routes.
+                # This returns after recording one map+weights dependency;
+                # device routing below therefore observes the new mapping.
+                cpu_task = self.backend.submit(
+                    layer_idx=self.layer_idx,
+                    hidden_states=hidden_states,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    defer_graph_join=True,
+                    graph_transfer=(weight_transfer, log2phy),
+                )
+            else:
+                transfer_task = weight_transfer.prepare(topk_ids, log2phy)
+        valid_routes = (topk_ids >= 0) & (topk_ids < log2phy.numel()) & (topk_weights != 0)
+        safe_ids = topk_ids.clamp(min=0, max=log2phy.numel() - 1).long()
+        physical_ids = log2phy[safe_ids]
+        npu_route_mask = valid_routes & (physical_ids >= 0)
+        cpu_route_mask = valid_routes & (physical_ids < 0)
+        zero = torch.zeros((), dtype=topk_weights.dtype, device=topk_weights.device)
+        npu_topk_weights = torch.where(npu_route_mask, topk_weights, zero)
+        cpu_topk_weights = torch.where(cpu_route_mask, topk_weights, zero)
         cpu_topk_ids = torch.where(
-            npu_route_mask,
-            torch.full((), -1, dtype=topk_ids.dtype,
-                       device=topk_ids.device),
+            cpu_route_mask,
             topk_ids,
+            torch.full((), -1, dtype=topk_ids.dtype, device=topk_ids.device),
         )
 
-        cpu_task = self.backend.submit(
-            layer_idx=self.layer_idx,
-            hidden_states=hidden_states,
-            topk_ids=cpu_topk_ids,
-            topk_weights=cpu_topk_weights,
-        )
+        submission_options = {}
+        # Only host-driven weight transfers need the callback dispatcher free
+        # until their weight callback has run. Device-owned copies have no host
+        # weight callback: drain CPU work and return its output concurrently with
+        # NPU work instead of scheduling a second callback after npu_done.
+        if (transfer_task is not None and transfer_task.graph
+                and not getattr(weight_transfer, "device_owned", False)):
+            submission_options["defer_graph_join"] = True
+        if cpu_task is None:
+            cpu_task = self.backend.submit(
+                layer_idx=self.layer_idx,
+                hidden_states=hidden_states,
+                topk_ids=cpu_topk_ids,
+                topk_weights=cpu_topk_weights,
+                **submission_options,
+            )
+        if transfer_task is not None:
+            transfer_task.wait_for_weights(cpu_task)
         return HybridExpertPlan(
             npu_topk_ids=topk_ids,
             npu_topk_weights=npu_topk_weights,
@@ -149,7 +193,8 @@ class HybridExpertExecutor:
             raise ValueError(
                 "CPU and NPU routed outputs must have the same shape; "
                 f"cpu={tuple(cpu_routed_out.shape)}, "
-                f"npu={tuple(npu_routed_out.shape)}")
+                f"npu={tuple(npu_routed_out.shape)}"
+            )
         cpu_routed_out = cpu_routed_out.to(
             device=npu_routed_out.device,
             dtype=npu_routed_out.dtype,
@@ -165,36 +210,57 @@ def maybe_prepare_hybrid_routes(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     log2phy: torch.Tensor,
-    max_tokens: int | None = None,
+    transfer_manager=None,
 ) -> HybridExpertPlan | None:
     """Split this layer's routes onto CPU and NPU, if a backend owns it.
 
-    Returns ``None`` when the layer has no attached executor, or when the step
-    is larger than ``max_tokens`` -- the caller must then run the existing
-    weight-paging path instead.  A returned plan and paging are mutually
-    exclusive: ``update_weights`` rewrites the very ``log2phy`` this split is
-    derived from, so doing both lets the CPU and NPU halves disagree about who
-    owns a route.  A route both halves skip contributes nothing to the output
-    and raises nothing.
+    Attached executors handle normal forwards within their token capacity.
+    Startup memory profiling alone retains the existing NPU path.
+    Larger batches retain the existing NPU paging/layerwise path.
+    A returned plan replaces paging, which must not rewrite the residency map
+    after CPU/NPU ownership has been determined.
     """
     executor = get_hybrid_expert_executor(layer)
     if executor is None:
         return None
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if is_forward_context_available() and getattr(get_forward_context(), "in_profile_run", False):
+        return None
     backend_max_tokens = executor.backend.max_num_tokens
     if backend_max_tokens <= 0:
-        raise ValueError(
-            "CPU expert backend max_num_tokens must be positive; "
-            f"got {backend_max_tokens}")
-    effective_max_tokens = backend_max_tokens
-    if max_tokens is not None:
-        effective_max_tokens = min(max_tokens, backend_max_tokens)
-    if topk_ids.shape[0] > effective_max_tokens:
+        raise ValueError(f"CPU expert backend max_num_tokens must be positive; got {backend_max_tokens}")
+    if hidden_states.shape[0] > backend_max_tokens or topk_ids.shape[0] > backend_max_tokens:
         return None
+    # Threshold pruning belongs to routing, not to the paging operation that
+    # hybrid execution replaces. Use the final pruned routes for both devices.
+    if transfer_manager is not None and getattr(transfer_manager.offload_config, "experts_pruning_enabled", False):
+        valid = (topk_ids >= 0) & (topk_ids < log2phy.numel())
+        topk_ids = torch.where(valid, topk_ids, -1)
+        topk_weights = torch.where(valid, topk_weights, 0)
+        from vllm_ascend.ops.fused_moe.experts_selector import maybe_prune_topk_experts
+
+        topk_weights, topk_ids, _ = maybe_prune_topk_experts(topk_weights, topk_ids, log2phy=log2phy)
+    weight_transfer = None
+    if transfer_manager is not None and transfer_manager.offload_config.cpu_moe.transfer_one_expert:
+        if executor._weight_transfer is None:
+            from vllm_ascend.expert_offload.hybrid_transfer import (
+                HybridExpertTransfer,
+            )
+
+            if getattr(transfer_manager.offload_config.cpu_moe, "transfer_scheduler", "cpu") == "npu":
+                from vllm_ascend.expert_offload.device_transfer import DeviceExpertTransfer
+
+                executor._weight_transfer = DeviceExpertTransfer(transfer_manager, layer)
+            else:
+                executor._weight_transfer = HybridExpertTransfer(transfer_manager, layer)
+        weight_transfer = executor._weight_transfer
     return executor.prepare(
         hidden_states=hidden_states,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
         log2phy=log2phy,
+        weight_transfer=weight_transfer,
     )
 
 

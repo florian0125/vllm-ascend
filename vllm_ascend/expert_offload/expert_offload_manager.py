@@ -1,46 +1,42 @@
 """Expert Offload Manager — manages CPU-side expert weights and NPU paging."""
 
-import hashlib
+import ctypes
+import json
 import logging
-import math
 import os
 import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
-from dataclasses import dataclass
 
 import torch
-import torch_npu
 import torch.nn.functional as F
+import torch_npu
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_moe_topk
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.expert_offload.decode_stats import get_decode_stats
+from vllm_ascend.expert_offload.expert_predictor import maybe_create_driver
 from vllm_ascend.expert_offload.h2d_transfer import (
     CopyDirection,
     H2DCopyTask,
     HostPointerSource,
     TorchCopyH2DTransport,
-    TorchSharedCPUWeightPool,
     create_h2d_transport,
 )
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
+from vllm_ascend.expert_offload.native_mxfp4_h2d import NativeExpertUploadTask, NativeMXFP4H2DTransport
 from vllm_ascend.ops.fused_moe.experts_selector import (
     commit_expert_substitutions,
+    maybe_prune_topk_experts,
     plan_expert_substitutions,
-    substitute_experts,
+    substitute_experts_device,
 )
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
-
 _SUBSCRIBED_COMPUTE_STREAMS = set()
-_EXCLUSIVE_PREFILL_P2P_CHUNK_BYTES = 128 * 1024 * 1024
-_FLOAT_CHECKSUM_NAN = 2_147_483_647
-_FLOAT_CHECKSUM_POS_INF = 2_147_483_646
-_FLOAT_CHECKSUM_NEG_INF = -2_147_483_646
 
 
 def get_subscribed_compute_streams() -> set:
@@ -56,35 +52,13 @@ def _stable_int_checksum(values) -> int:
     distinction between the ``-1`` log2phy sentinel and physical slot zero.
     """
     flat = values.reshape(-1).tolist() if hasattr(values, "reshape") else values
-    return sum((index + 1) * (int(value) + 2)
-               for index, value in enumerate(flat))
+    return sum((index + 1) * (int(value) + 2) for index, value in enumerate(flat))
 
 
 def _stable_float_checksum(values, scale: int = 1_000_000) -> int:
-    """Deterministic fixed-point checksum for cross-rank debug comparison.
-
-    Router scores are diagnostic inputs and may already contain NaN/Inf when
-    the model produces a non-finite activation. Debug logging must report that
-    condition instead of raising while converting it to an integer.
-    """
+    """Deterministic fixed-point checksum for cross-rank debug comparison."""
     flat = values.reshape(-1).tolist() if hasattr(values, "reshape") else values
-    checksum = 0
-    for index, value in enumerate(flat):
-        number = float(value)
-        if math.isnan(number):
-            quantized = _FLOAT_CHECKSUM_NAN
-        elif math.isinf(number):
-            quantized = (_FLOAT_CHECKSUM_POS_INF if number > 0 else
-                         _FLOAT_CHECKSUM_NEG_INF)
-        else:
-            scaled = number * scale
-            if math.isinf(scaled):
-                quantized = (_FLOAT_CHECKSUM_POS_INF if scaled > 0 else
-                             _FLOAT_CHECKSUM_NEG_INF)
-            else:
-                quantized = round(scaled)
-        checksum += (index + 1) * quantized
-    return checksum
+    return sum((index + 1) * round(float(value) * scale) for index, value in enumerate(flat))
 
 
 def _expert_weight(layer, name: str):
@@ -101,34 +75,11 @@ def _expert_weight(layer, name: str):
     return getattr(layer, name)
 
 
-@dataclass(frozen=True)
-class _PrefillPeerComponent:
-    """One deterministic component in a peer communication buffer.
-
-    Internal-format weights use raw storage. Quantization metadata retains
-    its typed tensor views so local pack/unpack copies preserve non-contiguous
-    logical layouts while HCCL still sees only the enclosing uint8 buffer.
-    """
-
-    name: str
-    source: object
-    destination: object
-    nbytes: int
-    dtype: torch.dtype | None = None
-    shape: tuple[int, ...] | None = None
-    element_size: int = 1
-
-    @property
-    def uses_typed_copy(self) -> bool:
-        return self.dtype is not None
-
-
 class ExpertOffloadManager:
     """Singleton manager for expert weight offloading.
 
-    In legacy mode, stores all expert weights on CPU and pages the needed
-    experts to NPU.  In ``exclusive_dynamic`` mode, CPU and NPU instead own
-    disjoint canonical expert sets and misses are served by two-way swaps.
+    Stores all expert weights on CPU and pages the needed experts to NPU
+    during forward based on routing topk_ids.
     """
 
     _instance: "ExpertOffloadManager | None" = None
@@ -149,8 +100,6 @@ class ExpertOffloadManager:
     # _finalize_offload, so small models do not need intermediate progress.
     _LOAD_PROGRESS_LOG_EVERY = 4096
     _DEBUG_EXPERT_SAMPLE_LIMIT = 16
-    _SHARED_CPU_PSS_RATIO_TOLERANCE = 0.05
-    _SHARED_CPU_MAPPING_SIZE_TOLERANCE = 0.01
 
     @classmethod
     def get_instance(cls) -> "ExpertOffloadManager":
@@ -161,15 +110,34 @@ class ExpertOffloadManager:
         from vllm_ascend.ascend_config import get_ascend_config
 
         self.offload_config = get_ascend_config().expert_offload_config
+        if get_ascend_config().benchmark_route_stats_enabled is True:
+            if getattr(vllm_config.scheduler_config, "async_scheduling", False) is True:
+                raise ValueError("benchmark_route_stats_enabled currently requires --no-async-scheduling for exact final-step acceptance")
+            if self.offload_config.expert_prefetch_enabled:
+                raise ValueError("benchmark_route_stats_enabled currently requires expert_prefetch_enabled=False for an unambiguous pre-migration residency snapshot")
+        cpu_config = self.offload_config.cpu_moe
+        self._native_shared_weights = cpu_config.enabled and cpu_config.weight_format == "native_mxfp4"
+        self._native_owners = {}
+        self._native_loaded = {}
+        self._native_tp_size = vllm_config.parallel_config.tensor_parallel_size
+        if self._native_shared_weights and (
+            self.offload_config.enable_multi_card
+            or self._native_tp_size != 1 or cpu_config.threadpool_count != 1
+        ):
+            raise ValueError("Shared native MXFP4 requires single-card offload and one NUMA pool")
         # The minimum capacity is the conservative global dispatch threshold;
         # actual weight and placement sizes are resolved per MoE layer.
-        self.num_device_experts = min(
-            self.offload_config.num_device_experts_list)
-        # Match the FusedMoE layer, which is built from hf_text_config. A
-        # multimodal top-level config may retain a different, stale TopK.
-        self.topk = get_moe_topk(vllm_config)
-        assert self.topk, ("offload: cannot find num_experts_per_tok/num_experts_per_token "
-                           "on hf_text_config")
+        self.num_device_experts = min(self.offload_config.num_device_experts_list)
+        # topk: 标准 MoE 用 num_experts_per_tok;Kimi-K3 用 num_experts_per_token(在 text_config)
+        _hf = vllm_config.model_config.hf_config
+        _tc = getattr(_hf, "text_config", None)
+        self.topk = (
+            getattr(_hf, "num_experts_per_tok", None)
+            or getattr(_hf, "num_experts_per_token", None)
+            or getattr(_tc, "num_experts_per_tok", None)
+            or getattr(_tc, "num_experts_per_token", None)
+        )
+        assert self.topk, "offload: cannot find num_experts_per_tok/num_experts_per_token on hf_config/text_config"
         self.topk = int(self.topk)
         self.offload_threshold = self.num_device_experts // self.topk
 
@@ -190,7 +158,7 @@ class ExpertOffloadManager:
         # Two-timescale LRU: per-step local freq tracking + every-N-step gloo
         # all_reduce -> global hotness. Stable-slot placement uses prev_log2phy
         # (keep experts on same rank in their slot) + hotness (order new experts).
-        self._mc_prev_log2phy = {}      # layer_idx -> prev step's log2phy (CPU)
+        self._mc_prev_log2phy = {}  # layer_idx -> prev step's log2phy (CPU)
         # LRC hotness policy (same one single-card uses: recent freq + EMA +
         # age), fed the GLOBAL active set each step. Built lazily in
         # _gather_global_counts_and_hotness. Replaces the old crude local-freq
@@ -203,7 +171,12 @@ class ExpertOffloadManager:
         # [1, topk]; >topk has no extra effect since the router selects at
         # most topk experts per token.
         self.expert_prefetch_num = self.offload_config.expert_prefetch_num
+        # Single-card transfer cap only. _update_weights_multi_card never reads
+        # it: multi-card re-plans the layer's whole global placement and loads
+        # whatever that implies, so it has no per-layer transfer budget.
         self.prefetch_topk = max(1, min(self.topk, self.expert_prefetch_num))
+        # How many tokens to predict from
+        self.prefetch_tokens = max(1, self.offload_config.expert_prefetch_tokens)
 
         # CPU weight buffers (post-transpose format, matching device after
         # process_weights_after_loading):
@@ -222,47 +195,6 @@ class ExpertOffloadManager:
         self.offset_cpu_buffers: dict[str, list[list[torch.Tensor]]] = {}
         self.scale_bias_cpu_buffers: dict[str, list[list[torch.Tensor]]] = {}
 
-        # Dynamic exclusive ownership. Every expert has exactly one canonical
-        # location per layer: a compact CPU slot or an NPU physical slot.
-        # Single-card uses private pinned CPU tensors. Multi-card either uses
-        # one same-node mmap plus a global physical-slot namespace, or private
-        # rank-local CPU/NPU partitions whose union is that rank's EP shard.
-        # Runtime swaps update all four inverse maps only after D2H + H2D have
-        # synchronized successfully.
-        self._cpu_slot_to_eid: list[list[int]] = []
-        self._eid_to_cpu_slot: list[list[int]] = []
-        self._npu_slot_to_eid: list[list[int]] = []
-        self._eid_to_npu_slot: list[list[int]] = []
-        self._exclusive_layer_locks: list[threading.RLock] = []
-        # Multi-card exclusive mode maps one compact shared CPU pool on every
-        # rank. Checkpoint writes are divided by compact CPU slot so each
-        # canonical CPU expert is initialized exactly once.
-        self._exclusive_shared_local_cpu_slots: list[list[int]] = []
-        self._exclusive_shared_cpu_slot_to_local: list[dict[int, int]] = []
-        # Global shared-exclusive mode uses the same initialization discipline
-        # as rank-local exclusive mode: initial NPU owners are checkpointed into
-        # a temporary rank-local CPU suffix, pass through the same weight/quant
-        # post-processing as compact shared-CPU owners, and are then copied to
-        # this rank's NPU slots.  The suffix is released before runtime memory
-        # accounting, preserving one global canonical CPU+NPU model.
-        self._exclusive_shared_bootstrap_layers: set[int] = set()
-        # Rank-local exclusive mode must put the initial NPU owners through the
-        # same CPU post-processing path as later H2D misses.  During checkpoint
-        # loading each layer therefore appends one temporary CPU tensor per
-        # initial NPU slot after its compact canonical CPU tensors.  Finalize
-        # materializes those processed bytes on the local NPU and immediately
-        # drops the temporary suffix, restoring CPU + NPU == one local shard.
-        self._exclusive_sharded_bootstrap_layers: set[int] = set()
-        # Cross-rank prefill transfers cannot pass internal-format expert
-        # slices through torch.distributed because those views commonly have
-        # a non-zero storage_offset and ProcessGroupHCCL owns a separate
-        # communication stream. Serialize buffer reuse and use a dedicated
-        # raw-pointer PyHCCL communicator on the manager's load stream.
-        self._exclusive_prefill_comm_lock = threading.Lock()
-        self._exclusive_prefill_comm_buffers: dict[
-            tuple[str, int], torch.Tensor] = {}
-        self._exclusive_prefill_pyhccl = None
-
         # Temporary per-expert storage for w13 scale/offset shard assembly.
         # Key: (layer_moe_idx, expert_id, attr_name), value: first shard.
         # Scale/offset arrive as w1 + w3 shards; we stash one until the
@@ -278,11 +210,25 @@ class ExpertOffloadManager:
         self.cache_calls: list[int] = []
         self.last_hit_experts: list[list[int]] = []
         self.last_miss_experts: list[list[int]] = []
+        # decode-statistics collector, resolved in _finalize_offload.
+        self._stats = None
+        self._benchmark_route_counters = None
+        spec_config = vllm_config.speculative_config
+        self._benchmark_service_config = {
+            "model": vllm_config.model_config.model,
+            "speculative_method": getattr(spec_config, "method", None),
+            "num_speculative_tokens": getattr(spec_config, "num_speculative_tokens", 0),
+        }
+        # prefetch -> reactive handoff for the prefetch-accuracy fractions.
+        self._prefetch_stats_pending: dict[int, tuple] = {}
+
         # Master debug switch for expert-offload diagnostics — UPDATE-W cache
         # trace, per-prefill-load logs, prefetch/update slot shortfalls.
         # Flipping it on surfaces them at info level (no need for global
         # VLLM_LOGGING_LEVEL=DEBUG).
         self._debug = self.offload_config.moe_offload_debug
+        self._prune_activity_logged = False
+        self._prune_debug = self.offload_config.experts_pruning_debug
         # Graph/collective diagnostics. Host callbacks may execute on report
         # threads, so keep the counters under a small CPU-only lock. These
         # fields are touched only when moe_offload_debug is enabled and never
@@ -293,19 +239,6 @@ class ExpertOffloadManager:
         self._mc_debug_collective_seq = 0
         self._mc_debug_active_callbacks = 0
         self._mc_debug_layer_calls: dict[tuple[int, bool], int] = {}
-        # Decode graph callbacks must not share the EP CPU process group with
-        # prefill.  ALLTOALL prefill uses the ordinary EP cpu_group for D2D
-        # completion barriers; under sustained batching it can start while a
-        # previous MC2 graph replay is still draining host callbacks.  Mixing
-        # those barriers with callback all-reduces on one Gloo group can pair
-        # different collectives across ranks and block both workers forever.
-        # A dedicated group isolates the two protocols, while a one-thread
-        # executor keeps every decode-side Gloo call ordered and moves it off
-        # the ACL host-callback/report thread.
-        self._mc_runtime_cpu_group = None
-        self._mc_collective_executor: ThreadPoolExecutor | None = None
-        self._mc_collective_thread_id: int | None = None
-        self._mc_graph_callbacks_registered = False
 
         # Diagnostic: wall time of the parallel weight-load phase (safetensors
         # → pinned CPU buffers). Logged in _finalize_offload.
@@ -327,27 +260,24 @@ class ExpertOffloadManager:
         ExpertOffloadManager._instance = self
 
         self.load_stream = torch_npu.npu.Stream()
+        # Side stream for the prefill delta D2D tasks (decode slots -> pool):
+        # they write expert rows disjoint from the H2D batch on the load
+        # stream, so they run in parallel with it and join back before the
+        # fp32-scale refresh / host sync in _prefill_load_layer.
+        self._prefill_d2d_stream = torch_npu.npu.Stream()
         # MemFabric SHARED initialization is collective and needs the EP group,
         # so defer it until the first layer allocates Host expert buffers.
         self.h2d_transport = None
-        if not (self.offload_config.h2d_backend == "memfabric"
-                and self.enable_multi_card):
+        if not (self.offload_config.h2d_backend == "memfabric" and self.enable_multi_card):
             self.h2d_transport = self._create_h2d_transport()
         self._shared_h2d_sources = {}
         self._shared_h2d_sources_ready = False
-        self._torch_shared_cpu_pool = None
-        self._torch_shared_cpu_buffers: dict[
-            tuple[int, str], torch.Tensor] = {}
-        self._torch_shared_cpu_sources_ready = False
-        self._torch_shared_cpu_ready_layers: set[int] = set()
         logger.info(
-            "[EXPERT-OFFLOAD-H2D] backend=%s mode=%s "
-            "memfabric_pool_size_gib=%d",
+            "[EXPERT-OFFLOAD-H2D] backend=%s mode=%s memfabric_pool_size_gib=%d",
             self.offload_config.h2d_backend,
-            ("torch-shared-staging"
-             if self.torch_shared_cpu_weights_enabled else
-             ("shared" if self.enable_multi_card else "local")
-             if self.offload_config.h2d_backend == "memfabric" else "copy"),
+            ("shared" if self.enable_multi_card else "local")
+            if self.offload_config.h2d_backend == "memfabric"
+            else "copy",
             self.offload_config.memfabric_pool_size_gib,
         )
 
@@ -360,24 +290,48 @@ class ExpertOffloadManager:
         # Prefill pool: ndl layers × all experts on NPU, shared round-robin
         self._prefill_w13: list[torch.Tensor] = []
         self._prefill_w2: list[torch.Tensor] = []
-        self._prefill_w13_scale: list[torch.Tensor] = []       # W8A8 / W4A8_DYNAMIC
-        self._prefill_w13_scale_fp32: list[torch.Tensor] = []   # W8A8
-        self._prefill_w13_offset: list[torch.Tensor] = []       # W8A8
-        self._prefill_w2_scale: list[torch.Tensor] = []         # W8A8 / W4A8_DYNAMIC
-        self._prefill_w2_offset: list[torch.Tensor] = []        # W8A8
+        self._prefill_w13_scale: list[torch.Tensor] = []  # W8A8 / W4A8_DYNAMIC
+        self._prefill_w13_scale_fp32: list[torch.Tensor] = []  # W8A8
+        self._prefill_w13_offset: list[torch.Tensor] = []  # W8A8
+        self._prefill_w2_scale: list[torch.Tensor] = []  # W8A8 / W4A8_DYNAMIC
+        self._prefill_w2_offset: list[torch.Tensor] = []  # W8A8
         # W4A8_DYNAMIC scale_bias (float32), per-channel new_quant_version only.
         # Allocated lazily in create_prefill_pool when the layer has
         # w13_scale_bias / w2_scale_bias parameters.
         self._prefill_w13_scale_bias: list[torch.Tensor] = []
         self._prefill_w2_scale_bias: list[torch.Tensor] = []
-        self._prefill_log2phy: torch.Tensor = None              # identity [0..127]
-        # Multi-card All2All temporarily expands the dispatcher from the
-        # decode cache size to the full EP shard. Build its CPU metadata and
-        # NPU mapping once, before ACL graph capture; apply() only swaps refs.
-        self._prefill_local_expert_indices: list[int] | None = None
-        self._prefill_expert_ids_per_ep_rank: torch.Tensor | None = None
+        self._prefill_log2phy: torch.Tensor = None  # identity [0..127]
         self._prefill_initialized: bool = False
         self._skip_prefill: bool = False  # set during profile runs
+        # Prefill expert-paging state: expert weights are immutable after
+        # finalize, so a pool slot stays valid until a different model layer
+        # overwrites it (round-robin p = L % ndl).
+        # _prefill_pool_owner[p] = model layer_idx currently held by pool
+        # slot p, or -1 when the slot content is unknown.
+        self._prefill_pool_owner: list[int] = []
+        # Per-layer host copy of the decode-pool residency (int32 [ntotal],
+        # decode slot or -1), captured by the last prefill load of that layer
+        # and re-uploaded on demand for the split-GMM path.
+        self._prefill_residency_host: dict[int, torch.Tensor] = {}
+        # --- prefill load pipeline (prefill expert paging) ---
+        # 2-slot pipeline: compute / next-layer load.  Pending per-slot load
+        # events (pool slot H2D/D2D completed); a prefill layer joins its
+        # slot's event before the GMM reads the pool.
+        self._prefill_slot_load_done: dict[int, "torch_npu.npu.Event"] = {}
+        # Which layer each slot's pending load is for (consumer-side marker:
+        # cleared after the joining layer consumed it).
+        self._prefill_slot_load_target: dict[int, int] = {}
+        # --- prefill pipeline staging (see _prefill_pipe_update) ---
+        # update(L) stages layer L+1's residency D2H non-blockingly on the
+        # compute stream (overlapping GMM(L)); on_prefill_layer_done(L)
+        # waits it, publishes the mirror and kicks the next load.  A compute
+        # event recorded after the slot join is handed to that kick so the
+        # load stream cannot overwrite a slot the compute stream may still
+        # be reading.
+        self._pipe_stage_h: torch.Tensor | None = None  # pinned [ntotal]
+        self._pipe_stage_evt = None
+        self._pipe_stage_layer: int = -1
+        self._pipe_comp_evt = None
 
     def _init_prefetch_state(self) -> None:
         """Next-layer expert-prefetch infrastructure init."""
@@ -401,6 +355,30 @@ class ExpertOffloadManager:
         self._prefetch_log2phy_h: torch.Tensor | None = None
         self._prefetch_log2phy_np = None
 
+        # MoE-layer indices whose routing comes from a tid2eid table.
+        # Filled in _finalize_offload; used by trigger_next_layer_prefetch to
+        # keep the hash targets on this driver even when a trained predictor is configured.
+        self._hash_layer_indices: frozenset[int] = frozenset()
+
+        # the trained-predictor prefetch method, or None to leave
+        # every target to the heuristic ("fate") method. Created HERE — before
+        # the model is built — so decoder layers can resolve their capture site during construction
+        self.expert_predictor = maybe_create_driver(self)
+
+        # Prefetch-stall timing. Per-layer device event pairs bracketing the
+        # join in update_weights[_multi_card]
+        self._pf_wait_timing = bool(self.offload_config.expert_prefetch_wait_timing)
+        self._pf_wait_begin: list = []
+        self._pf_wait_end: list = []
+        self._pf_wait_armed: list[bool] = []
+        # Measured cost of the instrument itself (ms), subtracted from every
+        # sample so pf_wait reports the stall and not the two event records
+        # that bracket it. Calibrated in _finalize_offload.
+        self._pf_wait_bias = 0.0
+        self._pf_wait_ok = 0  # successful elapsed_time reads
+        self._pf_wait_fail = 0  # failed reads; first one logs
+        self._pf_wait_probed = False
+
     def _resolve_ep_info(self) -> None:
         """Lazily resolve ep_rank/ep_size from the EP group on first access.
 
@@ -411,6 +389,7 @@ class ExpertOffloadManager:
             return
         if self.enable_multi_card:
             from vllm.distributed.parallel_state import get_ep_group
+
             ep_group = get_ep_group()
             self._ep_size = ep_group.world_size
             self._ep_rank = ep_group.rank_in_group
@@ -427,17 +406,13 @@ class ExpertOffloadManager:
         return self._ep_rank
 
     def _create_h2d_transport(self):
-        enable_shared = (
-            self.offload_config.h2d_backend == "memfabric"
-            and self.enable_multi_card)
+        enable_shared = self.offload_config.h2d_backend == "memfabric" and self.enable_multi_card
         return create_h2d_transport(
             self.offload_config.h2d_backend,
             device_id=torch_npu.npu.current_device(),
-            memfabric_pool_size_gib=(
-                self.offload_config.memfabric_pool_size_gib),
+            memfabric_pool_size_gib=(self.offload_config.memfabric_pool_size_gib),
             memfabric_log_level=self.offload_config.memfabric_log_level,
             enable_multi_card=enable_shared,
-            enable_torch_shared_cpu=self.torch_shared_cpu_weights_enabled,
             world_size=self.ep_size if enable_shared else 1,
             rank_id=self.ep_rank if enable_shared else 0,
         )
@@ -455,216 +430,141 @@ class ExpertOffloadManager:
         return self.offload_config.num_device_experts_for_layer(layer_idx)
 
     @property
-    def exclusive_dynamic_enabled(self) -> bool:
-        """Whether CPU and NPU use disjoint, dynamically swapped ownership."""
-        return (self.offload_config.storage_partition_mode
-                == "exclusive_dynamic")
+    def native_mxfp4_enabled(self) -> bool:
+        return getattr(self, "_native_shared_weights", False)
 
-    @property
-    def torch_shared_cpu_weights_enabled(self) -> bool:
-        """Whether canonical CPU expert data uses one same-node Torch mmap."""
-        return bool(self.offload_config.shared_cpu_weights)
+    def _init_native_layer_buffers(self, layer, layer_idx, experts):
+        # Optional KT dependency: only native CPU/NPU workers import this owner.
+        from kt_kernel.utils.native_mxfp4 import NativeMXFP4Weights
 
-    @property
-    def exclusive_shared_cpu_enabled(self) -> bool:
-        """Whether exclusive ownership spans a same-node EP group."""
-        return (self.exclusive_dynamic_enabled
-                and self.torch_shared_cpu_weights_enabled
-                and getattr(self, "enable_multi_card",
-                            self.offload_config.enable_multi_card))
-
-    @property
-    def exclusive_sharded_cpu_enabled(self) -> bool:
-        """Whether exclusive ownership is private and EP-shard local."""
-        return (self.exclusive_dynamic_enabled
-                and self.offload_config.shard_per_rank
-                and not self.torch_shared_cpu_weights_enabled
-                and getattr(self, "enable_multi_card",
-                            self.offload_config.enable_multi_card))
-
-    def _ensure_torch_shared_cpu_pool(self) -> TorchSharedCPUWeightPool:
-        if self._torch_shared_cpu_pool is None:
-            from vllm.distributed.parallel_state import get_ep_group
-            self._torch_shared_cpu_pool = TorchSharedCPUWeightPool(
-                self.offload_config.shared_cpu_weights_dir,
-                world_size=self.ep_size,
-                rank_id=self.ep_rank,
-                cpu_group=get_ep_group().cpu_group,
-            )
-            logger.info(
-                "[EXPERT-OFFLOAD-H2D] initialized same-node Torch shared "
-                "CPU pool: rank=%d/%d dir=%s",
-                self.ep_rank, self.ep_size,
-                self.offload_config.shared_cpu_weights_dir)
-        return self._torch_shared_cpu_pool
-
-    def _allocate_torch_shared_expert_buffer(
-        self,
-        layer_idx: int,
-        name: str,
-        per_expert_shape,
-        dtype,
-    ) -> list[torch.Tensor]:
-        """Allocate one canonical mmap and return this rank's writer views."""
-        if self.exclusive_shared_cpu_enabled:
-            global_experts = len(self._cpu_slot_to_eid[layer_idx])
-            local_slots = self._exclusive_shared_local_cpu_slots[layer_idx]
-        else:
-            global_experts = self.num_total_experts
-            local_slots = range(self._shard_base,
-                                self._shard_base + self._shard_size)
-        global_buffer = self._ensure_torch_shared_cpu_pool().allocate(
-            f"L{layer_idx}-{name}",
-            (global_experts,) + tuple(per_expert_shape),
-            dtype,
+        if self.ep_size != 1:
+            raise ValueError("Shared native MXFP4 requires EP size one")
+        # shard_per_rank defaults true even on one card; that shard is the
+        # complete expert set and remains compatible with shared native storage.
+        self._shard_base = 0
+        self._shard_size = experts
+        w13 = _expert_weight(layer, "w13_weight")
+        w2 = _expert_weight(layer, "w2_weight")
+        if w13.dtype != torch.uint8 or w2.dtype != torch.uint8 or w13.ndim != 3 or w2.ndim != 3:
+            raise ValueError("Shared native storage requires unpacked uint8 MXFP4 expert parameters")
+        hidden, intermediate = int(w13.shape[2]) * 2, int(w2.shape[2]) * 2
+        if w13.shape[1] != 2 * intermediate or w2.shape[1] != hidden:
+            raise ValueError("Unsupported native MXFP4 expert weight shapes")
+        if not hasattr(layer, "w13_weight_scale") or not hasattr(layer, "w2_weight_scale"):
+            raise ValueError("Native MXFP4 requires both E8M0 weight scales")
+        # Allocate once through the selected pinned-host allocator. These six
+        # buffers become the only routed-expert DRAM weight/scale owner.
+        shapes = (
+            (experts, intermediate, hidden // 2),
+            (experts, intermediate, hidden // 2),
+            (experts, hidden, intermediate // 2),
+            (experts, intermediate, hidden // 32),
+            (experts, intermediate, hidden // 32),
+            (experts, hidden, intermediate // 32),
         )
-        self._torch_shared_cpu_buffers[(layer_idx, name)] = global_buffer
-        return [global_buffer[slot] for slot in local_slots]
+        nodes = self.offload_config.cpu_moe.numa_nodes
+        node = nodes[0] if nodes else 0
+        previous_affinity = os.sched_getaffinity(0)
+        with open(f"/sys/devices/system/node/node{node}/cpulist", encoding="utf-8") as cpu_file:
+            cpu_list = cpu_file.read().strip()
+        allowed = set()
+        for part in cpu_list.split(","):
+            bounds = part.split("-")
+            allowed.update(range(int(bounds[0]), int(bounds[-1]) + 1))
+        allowed &= previous_affinity
+        if not allowed:
+            raise ValueError(f"Native MXFP4 NUMA node {node} has no permitted CPUs")
+        os.sched_setaffinity(0, allowed)
+        try:
+            buffers = [self._allocate_expert_host_tensor(shape, torch.uint8) for shape in shapes]
+            for buffer in buffers:
+                ctypes.memset(buffer.data_ptr(), 0, buffer.numel())
+            owner = NativeMXFP4Weights(*buffers).validate(experts, hidden, intermediate)
+        finally:
+            os.sched_setaffinity(0, previous_affinity)
+        self._native_owners[layer_idx] = owner
+        self._native_loaded[layer_idx] = set()
+        # Compatibility views for expert-count bookkeeping. Native transfers
+        # never interpret the gate view as combined w13 storage.
+        self.w13_weights_cpu.append(list(owner.gate.unbind(0)))
+        self.w2_weights_cpu.append(list(owner.down.unbind(0)))
+        self.scale_cpu_buffers.setdefault("w13_weight_scale", []).append(list(owner.gate_scale.unbind(0)))
+        self.scale_cpu_buffers.setdefault("w2_weight_scale", []).append(list(owner.down_scale.unbind(0)))
+        self.w13_expert_size_bytes = owner.gate[0].numel() + owner.up[0].numel()
+        self.w2_expert_size_bytes = owner.down[0].numel()
 
-    def _replace_torch_shared_expert_buffer(
-        self,
-        layer_idx: int,
-        name: str,
-        local_values: list[torch.Tensor],
-        template: torch.Tensor | None = None,
-    ) -> list[torch.Tensor]:
-        """Replace a post-processed quant buffer with another shared mmap."""
-        shared_count = (
-            len(self._exclusive_shared_local_cpu_slots[layer_idx])
-            if self.exclusive_shared_cpu_enabled else self._shard_size)
-        bootstrap_count = 0
-        if (self.exclusive_shared_cpu_enabled
-                and layer_idx in getattr(
-                    self, "_exclusive_shared_bootstrap_layers", set())):
-            bootstrap_count = self.offload_config.num_device_experts_for_rank(
-                layer_idx, self.ep_size)
-        expected = shared_count + bootstrap_count
-        if len(local_values) != expected:
-            raise RuntimeError(
-                "Torch shared CPU replacement must cover the local shard: "
-                f"layer={layer_idx}, name={name}, values={len(local_values)}, "
-                f"shared={shared_count}, bootstrap={bootstrap_count}")
-        if template is None:
-            if not local_values:
-                raise RuntimeError(
-                    "Torch shared CPU replacement needs a template when "
-                    f"the local writer shard is empty: layer={layer_idx}, "
-                    f"name={name}")
-            template = local_values[0]
-        if any(value.shape != template.shape or value.dtype != template.dtype
-               for value in local_values):
-            raise RuntimeError(
-                "Torch shared CPU replacement tensors must have one shape "
-                f"and dtype: layer={layer_idx}, name={name}")
-        destinations = self._allocate_torch_shared_expert_buffer(
-            layer_idx, name, template.shape, template.dtype)
-        for destination, value in zip(
-                destinations, local_values[:shared_count]):
-            destination.copy_(value)
-        for value in local_values[shared_count:]:
-            destination = self._allocate_expert_host_tensor(
-                value.shape, value.dtype)
-            destination.copy_(value)
-            destinations.append(destination)
-        return destinations
+    def _require_native_weights_loaded(self):
+        for layer_idx, owner in self._native_owners.items():
+            expected = {
+                (expert, projection, kind)
+                for expert in range(owner.gate.shape[0])
+                for projection in ("w1", "w3", "w2")
+                for kind in ("weight", "scale")
+            }
+            missing = expected - self._native_loaded[layer_idx]
+            if missing:
+                raise RuntimeError(f"Native MXFP4 layer {layer_idx} has unloaded expert fields: {sorted(missing)[:8]}")
 
-    def _init_exclusive_ownership(
-        self,
-        layer_moe_idx: int,
-        ntotal: int,
-        ndev: int,
-        npu_eids: list[int] | None = None,
-        owned_eids: list[int] | None = None,
-    ) -> None:
-        """Create inverse CPU/NPU ownership maps for one MoE layer."""
-        if not 0 < ndev < ntotal:
-            raise ValueError(
-                "exclusive_dynamic requires 0 < num_device_experts < "
-                f"global_num_experts; layer={layer_moe_idx}, "
-                f"num_device_experts={ndev}, global_num_experts={ntotal}")
+    def _attach_native_cpu_backends(self):
+        from vllm_ascend.expert_offload.cpu_backend.wiring import maybe_attach_cpu_expert_backend
 
-        npu_slot_to_eid = (
-            list(range(ndev)) if npu_eids is None else list(npu_eids))
-        if (len(npu_slot_to_eid) != ndev
-                or len(set(npu_slot_to_eid)) != ndev
-                or any(eid < 0 or eid >= ntotal for eid in npu_slot_to_eid)):
-            raise ValueError(
-                "Initial exclusive NPU experts must be unique, in range, and "
-                f"match device capacity; layer={layer_moe_idx}, "
-                f"ndev={ndev}, experts={npu_slot_to_eid}")
-        canonical_eids = (
-            list(range(ntotal)) if owned_eids is None else list(owned_eids))
-        if (len(set(canonical_eids)) != len(canonical_eids)
-                or any(eid < 0 or eid >= ntotal for eid in canonical_eids)):
-            raise ValueError(
-                "Exclusive canonical experts must be unique and in range: "
-                f"layer={layer_moe_idx}, experts={canonical_eids}")
-        npu_set = set(npu_slot_to_eid)
-        if not npu_set.issubset(canonical_eids):
-            raise ValueError(
-                "Initial exclusive NPU experts must belong to this rank's "
-                f"canonical set: layer={layer_moe_idx}, npu={npu_slot_to_eid}, "
-                f"canonical={canonical_eids}")
-        cpu_slot_to_eid = [
-            eid for eid in canonical_eids if eid not in npu_set]
-        eid_to_npu_slot = [-1] * ntotal
-        eid_to_cpu_slot = [-1] * ntotal
-        for slot, eid in enumerate(npu_slot_to_eid):
-            eid_to_npu_slot[eid] = slot
-        for slot, eid in enumerate(cpu_slot_to_eid):
-            eid_to_cpu_slot[eid] = slot
+        self._require_native_weights_loaded()
+        borrowed_layers = 0
+        for layer_idx, layer in enumerate(self.moe_layers):
+            backend = maybe_attach_cpu_expert_backend(
+                routed_experts=layer,
+                layer_name=layer.layer_name,
+                moe_config=layer.moe_config,
+                cpu_moe_config=self.offload_config.cpu_moe,
+                enable_multi_card=self.enable_multi_card,
+                tp_size=self._native_tp_size,
+                native_weights=self._native_owners[layer_idx],
+            )
+            if backend is not None:
+                owner = self._native_owners[layer_idx]
+                pointers = [tensor.data_ptr() for tensor in owner.tensors]
+                if backend._wrapper.native_weights is not owner or backend._wrapper.moe.native_weight_pointers() != pointers:
+                    raise RuntimeError("Native CPU backend is not borrowing the manager's weight storage")
+                borrowed_layers += 1
+        logger.info(
+            "[NATIVE-SHARED] layers=%d cpu_borrowed_layers=%d expert_weight_scale_gib=%.3f "
+            "persistent_host_format=native_mxfp4 cpu_weight_copies=0 host_nz_copies=0",
+            len(self._native_owners), borrowed_layers,
+            sum(owner.nbytes for owner in self._native_owners.values()) / (1024**3),
+        )
 
-        if layer_moe_idx != len(self._cpu_slot_to_eid):
-            raise RuntimeError(
-                "MoE layers must register in contiguous order for "
-                f"exclusive ownership; got layer={layer_moe_idx}, "
-                f"registered={len(self._cpu_slot_to_eid)}")
-        self._cpu_slot_to_eid.append(cpu_slot_to_eid)
-        self._eid_to_cpu_slot.append(eid_to_cpu_slot)
-        self._npu_slot_to_eid.append(npu_slot_to_eid)
-        self._eid_to_npu_slot.append(eid_to_npu_slot)
-        self._exclusive_layer_locks.append(threading.RLock())
-        self._validate_exclusive_ownership(layer_moe_idx)
+    @staticmethod
+    def _copy_native_field(target, owned):
+        source = owned.view(torch.uint8)
+        if tuple(source.shape) != tuple(target.shape):
+            raise ValueError(f"Native MXFP4 checkpoint field shape mismatch: {source.shape} != {target.shape}")
+        target.copy_(source)
 
-    def _validate_exclusive_ownership(self, layer_idx: int) -> None:
-        """Validate the CPU/NPU partition and both inverse maps."""
-        cpu_eids = self._cpu_slot_to_eid[layer_idx]
-        npu_eids = self._npu_slot_to_eid[layer_idx]
-        ntotal = len(self._eid_to_cpu_slot[layer_idx])
-        if self.exclusive_sharded_cpu_enabled:
-            start = self._shard_base
-            expected_eids = set(range(start, start + self._shard_size))
-        else:
-            expected_eids = set(range(ntotal))
-        if (len(cpu_eids) + len(npu_eids) != len(expected_eids)
-                or set(cpu_eids).intersection(npu_eids)
-                or set(cpu_eids).union(npu_eids) != expected_eids):
-            raise RuntimeError(
-                f"Invalid exclusive expert partition for layer {layer_idx}")
-        for slot, eid in enumerate(cpu_eids):
-            if self._eid_to_cpu_slot[layer_idx][eid] != slot:
-                raise RuntimeError(
-                    f"Invalid CPU ownership inverse for layer={layer_idx}, "
-                    f"expert={eid}, slot={slot}")
-            if self._eid_to_npu_slot[layer_idx][eid] != -1:
-                raise RuntimeError(
-                    f"Expert {eid} is owned by both CPU and NPU in layer "
-                    f"{layer_idx}")
-        for slot, eid in enumerate(npu_eids):
-            if self._eid_to_npu_slot[layer_idx][eid] != slot:
-                raise RuntimeError(
-                    f"Invalid NPU ownership inverse for layer={layer_idx}, "
-                    f"expert={eid}, slot={slot}")
-            if self._eid_to_cpu_slot[layer_idx][eid] != -1:
-                raise RuntimeError(
-                    f"Expert {eid} is owned by both NPU and CPU in layer "
-                    f"{layer_idx}")
-        for eid in set(range(ntotal)) - expected_eids:
-            if (self._eid_to_cpu_slot[layer_idx][eid] != -1
-                    or self._eid_to_npu_slot[layer_idx][eid] != -1):
-                raise RuntimeError(
-                    "Remote expert unexpectedly has local exclusive ownership: "
-                    f"layer={layer_idx}, expert={eid}")
+    def _load_native_field(self, layer_idx, expert, projection, kind, loaded):
+        owner = self._native_owners[layer_idx]
+        field = {"w1": "gate", "w3": "up", "w2": "down"}[projection]
+        if kind == "scale":
+            field += "_scale"
+        target = getattr(owner, field)[expert]
+        # The mmap can close before background loading finishes. Keep only a
+        # bounded transient clone, using the existing load-pool drain policy.
+        owned = loaded.cpu().clone()
+        future = self._get_load_pool().submit(self._copy_native_field, target, owned)
+        self._track_load_future(future)
+        self._native_loaded[layer_idx].add((expert, projection, kind))
+
+    def _native_upload_task(self, layer_idx, source_eid, w13, w2, scale13, scale2, destination_eid, name):
+        owner = self._native_owners[layer_idx]
+        size13 = w13.untyped_storage().nbytes() // w13.shape[0]
+        size2 = w2.untyped_storage().nbytes() // w2.shape[0]
+        start13, start2 = destination_eid * size13, destination_eid * size2
+        return NativeExpertUploadTask(
+            owner=owner, expert=source_eid,
+            w13_destination=w13.untyped_storage()[start13:start13 + size13],
+            w2_destination=w2.untyped_storage()[start2:start2 + size2],
+            scale13_destination=scale13[destination_eid],
+            scale2_destination=scale2[destination_eid], name=name,
+        )
 
     def init_layer_cpu_buffers(self, layer, layer_moe_idx: int):
         """Allocate CPU weight + scale/offset buffers for one MoE layer.
@@ -675,8 +575,16 @@ class ExpertOffloadManager:
         ntotal = layer.global_num_experts
         if self.num_total_experts is None:
             self.num_total_experts = ntotal
-        assert ntotal == self.num_total_experts, \
+        assert ntotal == self.num_total_experts, (
             f"MoE layers must have same expert count: {ntotal} vs {self.num_total_experts}"
+        )
+
+        if self.native_mxfp4_enabled:
+            self._init_native_layer_buffers(layer, layer_moe_idx, ntotal)
+            self.moe_layers.append(layer)
+            self._extend_cache_for_layer()
+            self._register_layer_gate(layer)
+            return
 
         _w13 = _expert_weight(layer, "w13_weight")
         _w2 = _expert_weight(layer, "w2_weight")
@@ -684,120 +592,8 @@ class ExpertOffloadManager:
         w13_shape = (_w13.shape[2], _w13.shape[1])
         w2_shape = (_w2.shape[2], _w2.shape[1])
 
-        ndev = self.num_device_experts_for_layer(layer_moe_idx)
-        if self.exclusive_dynamic_enabled:
-            multi_card_exclusive = (
-                self.exclusive_shared_cpu_enabled
-                or self.exclusive_sharded_cpu_enabled)
-            device_slots = (
-                self.offload_config.num_device_experts_for_rank(
-                    layer_moe_idx, self.ep_size)
-                if multi_card_exclusive else ndev)
-            if (_w13.shape[0] != device_slots
-                    or _w2.shape[0] != device_slots):
-                raise ValueError(
-                    "exclusive_dynamic device expert buffer does not match "
-                    f"num_device_experts: layer={layer_moe_idx}, "
-                    f"configured_global={ndev}, "
-                    f"configured_per_rank={device_slots}, "
-                    f"w13_slots={_w13.shape[0]}, "
-                    f"w2_slots={_w2.shape[0]}")
-            if self.exclusive_sharded_cpu_enabled:
-                if ntotal % self.ep_size != 0:
-                    raise ValueError(
-                        "Rank-local exclusive CPU weights require "
-                        "global_num_experts divisible by EP size: "
-                        f"experts={ntotal}, ep_size={self.ep_size}")
-                self._shard_size = ntotal // self.ep_size
-                self._shard_base = self.ep_rank * self._shard_size
-                initial_npu_eids = (
-                    self.offload_config.initial_device_experts_for_rank(
-                        layer_moe_idx, ntotal, self.ep_size, self.ep_rank))
-                owned_eids = list(range(
-                    self._shard_base, self._shard_base + self._shard_size))
-                self._init_exclusive_ownership(
-                    layer_moe_idx, ntotal, device_slots, initial_npu_eids,
-                    owned_eids=owned_eids)
-            else:
-                initial_npu_eids = (
-                    self.offload_config.initial_device_experts_for_layer(
-                        layer_moe_idx, ntotal))
-                self._init_exclusive_ownership(
-                    layer_moe_idx, ntotal, ndev, initial_npu_eids)
-            cpu_experts = len(self._cpu_slot_to_eid[layer_moe_idx])
-            if self.exclusive_shared_cpu_enabled:
-                if ntotal % self.ep_size != 0:
-                    raise ValueError(
-                        "Multi-card exclusive Torch shared CPU weights "
-                        "require global_num_experts divisible by EP size: "
-                        f"experts={ntotal}, ep_size={self.ep_size}")
-                self._shard_size = ntotal // self.ep_size
-                self._shard_base = self.ep_rank * self._shard_size
-                start = cpu_experts * self.ep_rank // self.ep_size
-                end = cpu_experts * (self.ep_rank + 1) // self.ep_size
-                local_slots = list(range(start, end))
-                self._exclusive_shared_local_cpu_slots.append(local_slots)
-                self._exclusive_shared_cpu_slot_to_local.append({
-                    slot: local for local, slot in enumerate(local_slots)
-                })
-                w13_list = self._allocate_torch_shared_expert_buffer(
-                    layer_moe_idx, "w13", w13_shape, params_dtype)
-                w2_list = self._allocate_torch_shared_expert_buffer(
-                    layer_moe_idx, "w2", w2_shape, params_dtype)
-                # Append only this rank's initial NPU owners. These private
-                # tensors exist during checkpoint loading/finalization and are
-                # removed after their uniformly post-processed bytes are copied
-                # to the corresponding local device slots.
-                if not hasattr(self, "_exclusive_shared_bootstrap_layers"):
-                    self._exclusive_shared_bootstrap_layers = set()
-                self._exclusive_shared_bootstrap_layers.add(layer_moe_idx)
-                w13_list.extend(
-                    self._allocate_expert_host_tensor(w13_shape, params_dtype)
-                    for _ in range(device_slots))
-                w2_list.extend(
-                    self._allocate_expert_host_tensor(w2_shape, params_dtype)
-                    for _ in range(device_slots))
-            else:
-                # The suffix is initialization-only.  It captures the experts
-                # whose canonical owner is already NPU so they receive exactly
-                # the same transpose/NZ/scale processing as CPU-owned experts.
-                # _materialize_exclusive_sharded_bootstrap removes it before
-                # runtime and before memory accounting.
-                checkpoint_experts = cpu_experts
-                if self.exclusive_sharded_cpu_enabled:
-                    checkpoint_experts += device_slots
-                    if not hasattr(self, "_exclusive_sharded_bootstrap_layers"):
-                        self._exclusive_sharded_bootstrap_layers = set()
-                    self._exclusive_sharded_bootstrap_layers.add(layer_moe_idx)
-                w13_list = [
-                    self._allocate_expert_host_tensor(w13_shape, params_dtype)
-                    for _ in range(checkpoint_experts)
-                ]
-                w2_list = [
-                    self._allocate_expert_host_tensor(w2_shape, params_dtype)
-                    for _ in range(checkpoint_experts)
-                ]
-            self.w13_weights_cpu.append(w13_list)
-            self.w2_weights_cpu.append(w2_list)
-        elif self.torch_shared_cpu_weights_enabled:
-            # Checkpoint ownership stays sharded: rank r writes only
-            # [r*shard:(r+1)*shard). All ranks map the same global backing
-            # tensors, so decode can read any expert after finalization.
-            if ntotal % self.ep_size != 0:
-                raise ValueError(
-                    "Torch shared CPU weights require global_num_experts "
-                    "to be divisible by EP size: "
-                    f"experts={ntotal}, ep_size={self.ep_size}")
-            shard = ntotal // self.ep_size
-            self._shard_size = shard
-            self._shard_base = self.ep_rank * shard
-            self.w13_weights_cpu.append(
-                self._allocate_torch_shared_expert_buffer(
-                    layer_moe_idx, "w13", w13_shape, params_dtype))
-            self.w2_weights_cpu.append(
-                self._allocate_torch_shared_expert_buffer(
-                    layer_moe_idx, "w2", w2_shape, params_dtype))
-        elif self.offload_config.shard_per_rank:
+        use_shard = self.offload_config.shard_per_rank
+        if use_shard:
             # shard-per-rank: each rank holds ONLY its EP shard of weight
             # experts (ntotal // ep_size), as per-expert pinned tensors (like
             # the non-shared path, but shard-sized). No mmap, no cross-process
@@ -809,40 +605,19 @@ class ExpertOffloadManager:
             shard = ntotal // max(1, self.ep_size)
             self._shard_size = shard
             self._shard_base = self.ep_rank * shard
-            w13_list = [
-                self._allocate_expert_host_tensor(w13_shape, params_dtype)
-                for _ in range(shard)
-            ]
-            w2_list = [
-                self._allocate_expert_host_tensor(w2_shape, params_dtype)
-                for _ in range(shard)
-            ]
+            w13_list = [self._allocate_expert_host_tensor(w13_shape, params_dtype) for _ in range(shard)]
+            w2_list = [self._allocate_expert_host_tensor(w2_shape, params_dtype) for _ in range(shard)]
             self.w13_weights_cpu.append(w13_list)
             self.w2_weights_cpu.append(w2_list)
         else:
-            w13_list = [
-                self._allocate_expert_host_tensor(w13_shape, params_dtype)
-                for _ in range(ntotal)
-            ]
-            w2_list = [
-                self._allocate_expert_host_tensor(w2_shape, params_dtype)
-                for _ in range(ntotal)
-            ]
+            w13_list = [self._allocate_expert_host_tensor(w13_shape, params_dtype) for _ in range(ntotal)]
+            w2_list = [self._allocate_expert_host_tensor(w2_shape, params_dtype) for _ in range(ntotal)]
             self.w13_weights_cpu.append(w13_list)
             self.w2_weights_cpu.append(w2_list)
 
         # Per-expert storage size (works for both list[0] and big_tensor[0]).
-        if self.w13_weights_cpu[-1]:
-            first_w13 = self.w13_weights_cpu[-1][0]
-            first_w2 = self.w2_weights_cpu[-1][0]
-        elif self.exclusive_shared_cpu_enabled:
-            first_w13 = self._torch_shared_cpu_buffers[
-                (layer_moe_idx, "w13")][0]
-            first_w2 = self._torch_shared_cpu_buffers[
-                (layer_moe_idx, "w2")][0]
-        else:
-            raise RuntimeError(
-                f"Layer {layer_moe_idx} allocated no CPU expert buffers")
+        first_w13 = self.w13_weights_cpu[-1][0]
+        first_w2 = self.w2_weights_cpu[-1][0]
         self.w13_expert_size_bytes = first_w13.nelement() * first_w13.element_size()
         self.w2_expert_size_bytes = first_w2.nelement() * first_w2.element_size()
 
@@ -884,9 +659,10 @@ class ExpertOffloadManager:
         self.last_hit_experts.append([])
         self.last_miss_experts.append([])
         logger.info(
-            "[EXPERT-OFFLOAD-CACHE] extended cache policy to layer=%d "
-            "(total_layers=%d)",
-            new_idx, len(self.cache_policy.layer_states))
+            "[EXPERT-OFFLOAD-CACHE] extended cache policy to layer=%d (total_layers=%d)",
+            new_idx,
+            len(self.cache_policy.layer_states),
+        )
 
     @staticmethod
     def _cpu_tensor_storage_bytes(tensors) -> int:
@@ -939,30 +715,25 @@ class ExpertOffloadManager:
         """Log per-rank expert buffers and host memory for replica auditing."""
         if not self._debug:
             return
-        weights_bytes = self._cpu_tensor_storage_bytes(
-            (self.w13_weights_cpu, self.w2_weights_cpu))
-        quant_bytes = self._cpu_tensor_storage_bytes((
-            self.scale_cpu_buffers,
-            self.offset_cpu_buffers,
-            self.scale_bias_cpu_buffers,
-        ))
+        weights_bytes = self._cpu_tensor_storage_bytes((self.w13_weights_cpu, self.w2_weights_cpu))
+        quant_bytes = self._cpu_tensor_storage_bytes(
+            (
+                self.scale_cpu_buffers,
+                self.offset_cpu_buffers,
+                self.scale_bias_cpu_buffers,
+            )
+        )
+        if self.native_mxfp4_enabled:
+            weights_bytes = self._cpu_tensor_storage_bytes([owner.tensors[:3] for owner in self._native_owners.values()])
+            quant_bytes = self._cpu_tensor_storage_bytes([owner.tensors[3:] for owner in self._native_owners.values()])
         expert_bytes = weights_bytes + quant_bytes
         rss, hwm, available = self._host_memory_snapshot()
-        cpu_mode = (
-            "exclusive_sharded" if self.exclusive_sharded_cpu_enabled else
-            "exclusive_shared" if self.exclusive_shared_cpu_enabled else
-            "exclusive_dynamic" if self.exclusive_dynamic_enabled else
-            "torch_shared" if self.torch_shared_cpu_weights_enabled else
-            "sharded" if self.offload_config.shard_per_rank else
-            "replicated")
-        experts_per_layer = (
-            len(self.w13_weights_cpu[0]) if self.w13_weights_cpu else 0)
-        replica_factor = (
-            1 if (self.exclusive_dynamic_enabled
-                  or self.offload_config.shard_per_rank) else self.ep_size)
+        cpu_mode = "sharded" if self.offload_config.shard_per_rank else "replicated"
+        experts_per_layer = len(self.w13_weights_cpu[0]) if self.w13_weights_cpu else 0
+        replica_factor = 1 if self.offload_config.shard_per_rank else self.ep_size
 
         def mib(value):
-            return None if value is None else round(value / (1024 ** 2), 1)
+            return None if value is None else round(value / (1024**2), 1)
 
         logger.info(
             "[CPU_MEM] rank=%s/%s pid=%s cpu_mode=%s "
@@ -970,111 +741,30 @@ class ExpertOffloadManager:
             "expert_buffers_mib=%.1f weights_mib=%.1f quant_mib=%.1f "
             "process_rss_mib=%s process_hwm_mib=%s host_available_mib=%s "
             "expected_full_weight_copies_across_ep=%s",
-            self.ep_rank, self.ep_size, os.getpid(), cpu_mode,
-            experts_per_layer, self.num_total_experts, len(self.moe_layers),
-            mib(expert_bytes), mib(weights_bytes), mib(quant_bytes),
-            mib(rss), mib(hwm), mib(available), replica_factor)
-
-    def _log_torch_shared_cpu_pss(self) -> None:
-        """Collectively audit physical pages used by shared expert mmaps."""
-        if (not getattr(self, "_debug", False)
-                or not self.torch_shared_cpu_weights_enabled):
-            return
-        pool = self._torch_shared_cpu_pool
-        if pool is None:
-            return
-
-        from torch import distributed as dist
-        from vllm.distributed.parallel_state import get_ep_group
-
-        local_snapshot = pool.mapping_memory_snapshot()
-        snapshots = [None] * self.ep_size
-        dist.all_gather_object(
-            snapshots,
-            local_snapshot,
-            group=get_ep_group().cpu_group,
-        )
-        if self.ep_rank != 0:
-            return
-        if any(snapshot is None for snapshot in snapshots):
-            logger.info(
-                "[TORCH_SHARED_CPU_PSS] ranks=%d result=UNAVAILABLE "
-                "reason=proc_self_smaps_unavailable",
-                self.ep_size,
-            )
-            return
-
-        expected_bytes = self._cpu_tensor_storage_bytes(
-            getattr(self, "_torch_shared_cpu_buffers", {}))
-        mapped_sizes = [snapshot["size_bytes"] for snapshot in snapshots]
-        mapping_counts = [snapshot["mapping_count"]
-                          for snapshot in snapshots]
-        total_rss_bytes = sum(snapshot["rss_bytes"]
-                              for snapshot in snapshots)
-        total_pss_bytes = sum(snapshot["pss_bytes"]
-                              for snapshot in snapshots)
-        total_swap_pss_bytes = sum(snapshot["swap_pss_bytes"]
-                                   for snapshot in snapshots)
-        pss_ratio = (
-            total_pss_bytes / expected_bytes if expected_bytes else 0.0)
-        mapped_size_ratios = (
-            [size / expected_bytes for size in mapped_sizes]
-            if expected_bytes else [0.0] * len(mapped_sizes))
-        mappings_complete = (
-            expected_bytes > 0
-            and all(
-                abs(ratio - 1.0)
-                <= self._SHARED_CPU_MAPPING_SIZE_TOLERANCE
-                for ratio in mapped_size_ratios)
-        )
-        if not mappings_complete:
-            result = "FAIL_MAPPING_SIZE_MISMATCH"
-        elif total_swap_pss_bytes:
-            result = "INCONCLUSIVE_SWAPPED"
-        elif abs(pss_ratio - 1.0) <= self._SHARED_CPU_PSS_RATIO_TOLERANCE:
-            result = "PASS_ONE_PHYSICAL_COPY"
-        elif pss_ratio > 1.0:
-            result = "FAIL_EXTRA_PHYSICAL_PAGES"
-        else:
-            result = "INCONCLUSIVE_NOT_FULLY_RESIDENT"
-
-        mib = 1024 ** 2
-        logger.info(
-            "[TORCH_SHARED_CPU_PSS] ranks=%d expected_shared_expert_mib=%.1f "
-            "mapped_size_per_rank_mib=%.1f..%.1f "
-            "mappings_per_rank=%d..%d mapping_total_rss_mib=%.1f "
-            "mapping_total_pss_mib=%.1f mapping_total_swap_pss_mib=%.1f "
-            "pss_to_expected_ratio=%.3f result=%s",
+            self.ep_rank,
             self.ep_size,
-            expected_bytes / mib,
-            min(mapped_sizes) / mib,
-            max(mapped_sizes) / mib,
-            min(mapping_counts),
-            max(mapping_counts),
-            total_rss_bytes / mib,
-            total_pss_bytes / mib,
-            total_swap_pss_bytes / mib,
-            pss_ratio,
-            result,
+            os.getpid(),
+            cpu_mode,
+            experts_per_layer,
+            self.num_total_experts,
+            len(self.moe_layers),
+            mib(expert_bytes),
+            mib(weights_bytes),
+            mib(quant_bytes),
+            mib(rss),
+            mib(hwm),
+            mib(available),
+            replica_factor,
         )
 
-    def _init_layer_scale_buffers(self, layer, layer_moe_idx: int,
-                                   ntotal: int):
+    def _init_layer_scale_buffers(self, layer, layer_moe_idx: int, ntotal: int):
         """Allocate CPU scale/offset buffers for a single MoE layer."""
         # shard-per-rank: like the weight buffers, each rank holds only its EP
         # shard (ntotal // ep_size) of scale/offset/scale_bias, indexed LOCALLY.
         # global<->local via _shard_local (mirrors the weight path); non-shard
         # (single-card) keeps the full ntotal, global==local.
         use_shard = self.offload_config.shard_per_rank
-        if self.exclusive_dynamic_enabled:
-            nalloc = len(self._cpu_slot_to_eid[layer_moe_idx])
-            if (self.exclusive_sharded_cpu_enabled
-                    and layer_moe_idx in getattr(
-                        self, "_exclusive_sharded_bootstrap_layers", set())):
-                nalloc += len(self._npu_slot_to_eid[layer_moe_idx])
-        else:
-            nalloc = ((ntotal // max(1, self.ep_size))
-                      if use_shard else ntotal)
+        nalloc = (ntotal // max(1, self.ep_size)) if use_shard else ntotal
         attr_specs = [
             ("scale_cpu_buffers", "w13_weight_scale"),
             ("scale_cpu_buffers", "w2_weight_scale"),
@@ -1091,11 +781,10 @@ class ExpertOffloadManager:
             if "scale_bias" in attr_name:
                 per_expert_shape = tuple(dev_tensor.shape[1:])
             elif dtype.itemsize == 1:
-                from vllm_ascend.quantization.methods.w4a8_mxfp4 import (
-                    apply_mxfp4_weight_scale_layout)
+                from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import apply_mxfp4_weight_scale_layout
+
                 dtype = torch.uint8
-                per_expert_shape = tuple(
-                    apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8)).shape)
+                per_expert_shape = tuple(apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8)).shape)
             else:
                 per_expert_shape = (dev_tensor[0].numel(),)
             buffer_dict: dict = getattr(self, buffer_dict_name)
@@ -1104,25 +793,8 @@ class ExpertOffloadManager:
             buffers = buffer_dict[attr_name]
             while len(buffers) <= layer_moe_idx:
                 buffers.append([])
-            if self.torch_shared_cpu_weights_enabled:
-                buffers[layer_moe_idx] = (
-                    self._allocate_torch_shared_expert_buffer(
-                        layer_moe_idx, attr_name, per_expert_shape, dtype))
-                if (self.exclusive_shared_cpu_enabled
-                        and layer_moe_idx in getattr(
-                            self, "_exclusive_shared_bootstrap_layers", set())):
-                    device_slots = (
-                        self.offload_config.num_device_experts_for_rank(
-                            layer_moe_idx, self.ep_size))
-                    buffers[layer_moe_idx].extend(
-                        self._allocate_expert_host_tensor(
-                            per_expert_shape, dtype)
-                        for _ in range(device_slots))
-            else:
-                for _ in range(nalloc):
-                    buffers[layer_moe_idx].append(
-                        self._allocate_expert_host_tensor(
-                            per_expert_shape, dtype))
+            for _ in range(nalloc):
+                buffers[layer_moe_idx].append(self._allocate_expert_host_tensor(per_expert_shape, dtype))
 
     def _finalize_offload(self, model):
         """Post-weight-loading finalization.
@@ -1137,14 +809,17 @@ class ExpertOffloadManager:
         # Barrier: ensure all deferred load_w13/load_w2/_load_scale_shard
         # copies have landed before process_weights_after_loading reads them.
         self.drain_load_pool()
+        if self.native_mxfp4_enabled:
+            self._attach_native_cpu_backends()
         t0 = time.perf_counter()
         logger.info(
             "[OFFLOAD] weight load (safetensors→CPU buffer): %.1fs over %d calls",
-            self._weight_load_secs, self._weight_load_calls)
+            self._weight_load_secs,
+            self._weight_load_calls,
+        )
         t1 = time.perf_counter()
         self.process_weights_after_loading()
         self._publish_shared_h2d_sources()
-        self._initialize_mc_runtime_collectives()
         t2 = time.perf_counter()
 
         num_moe_layers = len(self.moe_layers)
@@ -1161,7 +836,9 @@ class ExpertOffloadManager:
         if self._debug:
             logger.info(
                 "[OFFLOAD] num_device_experts per layer (n_layers=%d): %s",
-                num_moe_layers, nde_list if len(nde_list) > 1 else nde_list[0])
+                num_moe_layers,
+                nde_list if len(nde_list) > 1 else nde_list[0],
+            )
         if self.offload_config.cache_policy_enabled:
             self.cache_requests = [0 for _ in range(num_moe_layers)]
             self.cache_hits = [0 for _ in range(num_moe_layers)]
@@ -1185,39 +862,80 @@ class ExpertOffloadManager:
                 router_weight=self.offload_config.cache_router_weight,
                 age_weight=self.offload_config.cache_age_weight,
             )
+
+        # Hash-routed layers are identified by their gate carrying a
+        # tid2eid table — the same test predict_next_layer_experts_npu uses —
+        # so no new config key is needed and the notion cannot drift.
+        self._hash_layer_indices = frozenset(
+            index
+            for index, moe_layer in enumerate(self.moe_layers)
+            if getattr(getattr(moe_layer, "gate", None), "tid2eid", None) is not None
+        )
+
+        # register the MoE-layer topology with the decode-statistics collector.
+        self._stats = get_decode_stats()
+        if self._stats is not None:
+            self._stats.set_topology(num_moe_layers, set(self._hash_layer_indices), multi_card=self.enable_multi_card)
+            logger.info(
+                "[DECODE-STATS] topology: moe_layers=%d hash_layers=%s multi_card=%s",
+                num_moe_layers,
+                sorted(self._hash_layer_indices),
+                self.enable_multi_card,
+            )
+        from vllm_ascend.ascend_config import get_ascend_config
+        counter_config = get_ascend_config()
+        if counter_config.benchmark_route_stats_enabled is True:
+            if self.enable_multi_card or not counter_config.decode_stats_path or not counter_config.decode_stats_enabled:
+                raise ValueError("benchmark_route_stats_enabled requires single-card offload, decode_stats_enabled and decode_stats_path")
+            if self._benchmark_route_counters is None:
+                from vllm_ascend.expert_offload.benchmark_counters import BenchmarkRouteCounters
+                self._benchmark_route_counters = BenchmarkRouteCounters(
+                    _expert_weight(self.moe_layers[0], "w13_weight").device,
+                    counter_config.decode_stats_path)
+                self._benchmark_route_counters.configuration = dict(
+                    self._benchmark_service_config,
+                    expert_offload_config=dict(self.offload_config.config),
+                    cpu_moe=dict(self.offload_config.cpu_moe.config))
+                logger.info("[BENCHMARK-COUNTERS] cumulative snapshots: %s",
+                            self._benchmark_route_counters.path)
         t3 = time.perf_counter()
 
         ntotal = self.num_total_experts
         self.topk_ids_h = torch.zeros(
-            [self.offload_threshold, self.topk],
-            dtype=torch.int32, device="cpu", pin_memory=True)
+            [self.offload_threshold, self.topk], dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        # pre-substitution routed ids. Substitution now runs on the NPU
+        # before topk_ids_h is staged, so the host callback can no longer clone
+        # the "before" ids out of topk_ids_h.
+        self.topk_ids_gt_h = None
+        if self.offload_config.expert_substitution_enabled:
+            self.topk_ids_gt_h = torch.zeros(
+                [self.offload_threshold, self.topk], dtype=torch.int32, device="cpu", pin_memory=True
+            )
         self.topk_weights_h = torch.zeros(
-            [self.offload_threshold, self.topk],
-            dtype=torch.float32, device="cpu", pin_memory=True)
+            [self.offload_threshold, self.topk], dtype=torch.float32, device="cpu", pin_memory=True
+        )
+        self.prune_debug_h = torch.zeros(
+            [self.offload_threshold, 3, self.topk],
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
         self.router_logits_h = None
         self.e_score_correction_bias_h = None
         if self.offload_config.expert_substitution_enabled:
             self.router_logits_h = torch.zeros(
-                [self.offload_threshold, ntotal],
-                dtype=torch.float32, device="cpu", pin_memory=True)
-            self.e_score_correction_bias_h = torch.zeros(
-                ntotal, dtype=torch.float32, device="cpu", pin_memory=True)
+                [self.offload_threshold, ntotal], dtype=torch.float32, device="cpu", pin_memory=True
+            )
+            self.e_score_correction_bias_h = torch.zeros(ntotal, dtype=torch.float32, device="cpu", pin_memory=True)
         # Per-rank active-token mask (1=real, 0=pad), mirrored to pinned CPU so
         # the multi-card host callback can drop pad rows before counting. Under
         # single-batch TP, ranks past the real-token count route zero-hidden
         # PAD tokens whose topk is garbage; without this filter they pollute
         # global_counts (placement), the LRU freq, and hit/miss stats.
-        self.mc2_mask_h = torch.zeros(
-            self.offload_threshold, dtype=torch.int32,
-            device="cpu", pin_memory=True)
-        self.log2phy_h = torch.zeros(ntotal, dtype=torch.int32,
-                                     device='cpu', pin_memory=True)
+        self.mc2_mask_h = torch.zeros(self.offload_threshold, dtype=torch.int32, device="cpu", pin_memory=True)
+        self.log2phy_h = torch.zeros(ntotal, dtype=torch.int32, device="cpu", pin_memory=True)
         self.log2phy_np = self.log2phy_h.numpy()
-        if self.exclusive_shared_cpu_enabled:
-            self._initialize_exclusive_shared_runtime_state()
-            self._log_exclusive_shared_canonical_memory()
-        elif self.exclusive_sharded_cpu_enabled:
-            self._initialize_exclusive_sharded_runtime_state()
         t4 = time.perf_counter()
 
         self.refresh_fp32_scales()
@@ -1234,17 +952,74 @@ class ExpertOffloadManager:
             # update_weights (blocking .cpu() on a live graph tensor would
             # deadlock during replay).
             self._prefetch_log2phy_h = torch.zeros(
-                self.num_total_experts, dtype=torch.int32,
-                device='cpu', pin_memory=True)
+                self.num_total_experts, dtype=torch.int32, device="cpu", pin_memory=True
+            )
             self._prefetch_log2phy_np = self._prefetch_log2phy_h.numpy()
+            # load the trained head and allocate its buffers —
+            # after every weight has landed, and before graph capture, because
+            # the head's parameters must be resident when the graph is
+            # recorded and the model geometry is only known once the model exists.
+            if self.expert_predictor is not None:
+                self.expert_predictor.finalize(model)
+            if self._pf_wait_timing:
+                # One pair per MoE layer, allocated ONCE and re-recorded every
+                # step. Creating them per call would add 2 events per layer per
+                # capture size and risk the 207008 stream/event ceiling; reusing
+                # them keeps the graph's event-record nodes pointing at stable
+                # handles, which is what makes elapsed_time meaningful on replay.
+                n = len(self.moe_layers)
+                self._pf_wait_begin = [torch_npu.npu.Event(enable_timing=True) for _ in range(n)]
+                self._pf_wait_end = [torch_npu.npu.Event(enable_timing=True) for _ in range(n)]
+                self._pf_wait_armed = [False] * n
+                # Calibrate the bracket's own cost, and validate elapsed_time
+                # HERE — before any graph is captured. A failure at this point
+                # disables recording cleanly
+                probe_a = torch_npu.npu.Event(enable_timing=True)
+                probe_b = torch_npu.npu.Event(enable_timing=True)
+                probe_stream = torch_npu.npu.current_stream()
+                try:
+                    samples = []
+                    for _ in range(16):
+                        probe_a.record(probe_stream)
+                        probe_b.record(probe_stream)
+                        probe_b.synchronize()
+                        samples.append(float(probe_a.elapsed_time(probe_b)))
+                    self._pf_wait_bias = min(samples)
+                    logger.info(
+                        "[PREFETCH-WAIT] timing enabled: %d event pairs; "
+                        "bracket cost %.4f ms is subtracted from every sample. "
+                        "pf_wait measures the compute stream's block at the "
+                        "prefetch join, so TPOT from this run is NOT a baseline",
+                        n,
+                        self._pf_wait_bias,
+                    )
+                except Exception:
+                    self._pf_wait_timing = False
+                    self._pf_wait_begin = []
+                    self._pf_wait_end = []
+                    self._pf_wait_armed = []
+                    logger.warning(
+                        "[PREFETCH-WAIT] elapsed_time is not usable on this "
+                        "build; prefetch-stall timing disabled and NOTHING will "
+                        "be recorded into the graph. The run is otherwise "
+                        "unaffected.",
+                        exc_info=True,
+                    )
         t7 = time.perf_counter()
         self._log_cpu_expert_memory()
         logger.info(
             "[OFFLOAD] finalize breakdown: process_weights=%.1fs "
             "cache_policy=%.1fs buffers=%.1fs init_device=%.1fs "
             "hot_preload=%.1fs prefill_pool=%.1fs gate=%.1fs | total=%.1fs",
-            t2 - t1, t3 - t2, t4 - t3, t5 - t4, t_hot - t5, t6 - t_hot,
-            t7 - t6, t7 - t0)
+            t2 - t1,
+            t3 - t2,
+            t4 - t3,
+            t5 - t4,
+            t_hot - t5,
+            t6 - t_hot,
+            t7 - t6,
+            t7 - t0,
+        )
 
     def process_weights_after_loading(self):
         """Convert resident CPU expert buffers to the on-device weight format.
@@ -1263,6 +1038,13 @@ class ExpertOffloadManager:
         Touch it only via untyped_storage() slicing, never through the tensor
         view. No-op for non-quantized (other dtype) models.
         """
+        if self.native_mxfp4_enabled:
+            self._require_native_weights_loaded()
+            # Keep native bytes/scales on the host. Only device slot metadata
+            # is prepared here; every actual miss converts in HBM.
+            self._cast_device_slots_to_mxfp4_nz()
+            return
+
         first_w13 = self.w13_weights_cpu[0][0]
         first_layer = self.moe_layers[0]
         # Detect W4A8_DYNAMIC by scale dtype: process_scale converts float32
@@ -1271,8 +1053,7 @@ class ExpertOffloadManager:
         # it as int8 (no pack_to_int32) while compressed_tensors packs to
         # int32. Without this check, modelslim W4A8 would be misrouted to the
         # W8A8 branch, skipping scale encoding and producing garbled output.
-        is_w4a8 = (hasattr(first_layer, 'w13_weight_scale') and
-                   first_layer.w13_weight_scale.dtype == torch.int64)
+        is_w4a8 = hasattr(first_layer, "w13_weight_scale") and first_layer.w13_weight_scale.dtype == torch.int64
         if first_w13.dtype == torch.int8:
             first_dev = _expert_weight(first_layer, "w13_weight")
             if first_dev.dtype == torch.int32:
@@ -1300,35 +1081,8 @@ class ExpertOffloadManager:
             # H2D; only the format persists.
             self._cast_device_slots_to_mxfp4_nz()
         # else: non-quantized model, no-op
-        self._materialize_exclusive_shared_bootstrap()
-        self._materialize_exclusive_sharded_bootstrap()
 
-    @staticmethod
-    def _tensor_storage_window(
-        tensor: torch.Tensor,
-        nbytes: int,
-    ) -> torch.UntypedStorage:
-        """Return this tensor view's byte range within its backing storage.
-
-        ``tensor.untyped_storage()`` returns the complete backing storage and
-        does not apply ``tensor.storage_offset()``. That distinction matters
-        for one-expert views into the compact Torch shared mmap: copying a
-        converted expert into the unsliced storage would target the whole
-        shared pool. Private bootstrap tensors have offset zero and use the
-        same bounded path.
-        """
-        storage = tensor.untyped_storage()
-        start = tensor.storage_offset() * tensor.element_size()
-        end = start + nbytes
-        if nbytes <= 0 or start < 0 or end > storage.nbytes():
-            raise RuntimeError(
-                "Tensor storage window is outside its backing storage: "
-                f"offset_bytes={start}, requested_bytes={nbytes}, "
-                f"storage_bytes={storage.nbytes()}")
-        return storage[start:end]
-
-    def _cast_cpu_weights_to_device_format(self, mxfp4: bool = False,
-                                            w4a8_dynamic: bool = False):
+    def _cast_cpu_weights_to_device_format(self, mxfp4: bool = False, w4a8_dynamic: bool = False):
         """Relayout resident CPU w13/w2 expert buffers into the device format.
 
         NZ (W8A8) and format-29 mxfp4 (W4A8_MXFP) are equal-length relayouts,
@@ -1341,23 +1095,23 @@ class ExpertOffloadManager:
         can hold the packed bytes without reallocation.
         """
         num_moe_layers = len(self.w13_weights_cpu)
+        num_experts = len(self.w13_weights_cpu[0])
         use_shard = self.offload_config.shard_per_rank
         for layer_id in range(num_moe_layers):
-            num_experts = len(self.w13_weights_cpu[layer_id])
-            if num_experts == 0:
-                continue
-            w13 = torch.stack(self.w13_weights_cpu[layer_id]).to('npu')
-            w2 = torch.stack(self.w2_weights_cpu[layer_id]).to('npu')
+            w13 = torch.stack(self.w13_weights_cpu[layer_id]).to("npu")
+            w2 = torch.stack(self.w2_weights_cpu[layer_id]).to("npu")
             if mxfp4:
                 w13 = w13.transpose(1, 2).contiguous()
                 w2 = w2.transpose(1, 2).contiguous()
                 w13 = torch_npu.npu_format_cast(
-                    w13.view(torch.uint8), 29,
+                    w13.view(torch.uint8),
+                    29,
                     customize_dtype=torch.float8_e4m3fn,
                     input_dtype=torch_npu.float4_e2m1fn_x2,
                 )
                 w2 = torch_npu.npu_format_cast(
-                    w2.view(torch.uint8), 29,
+                    w2.view(torch.uint8),
+                    29,
                     customize_dtype=torch.float8_e4m3fn,
                     input_dtype=torch_npu.float4_e2m1fn_x2,
                 )
@@ -1391,176 +1145,13 @@ class ExpertOffloadManager:
                 # remaps it to the local slot); w13/w2_storage are indexed by
                 # the local position in the stacked tensor (== global id when
                 # not sharded).
-                shared_bootstrap = (
-                    self.exclusive_shared_cpu_enabled
-                    and layer_id in getattr(
-                        self, "_exclusive_shared_bootstrap_layers", set()))
-                sharded_bootstrap = (
-                    self.exclusive_sharded_cpu_enabled
-                    and layer_id in getattr(
-                        self, "_exclusive_sharded_bootstrap_layers", set()))
-                if shared_bootstrap or sharded_bootstrap:
-                    # Checkpoint buffers contain compact canonical CPU owners
-                    # followed by the initial local NPU owners. Shared-mode
-                    # prefix entries are views into the whole mmap, whereas
-                    # the suffix and rank-local mode use private tensors. Apply
-                    # each tensor view's byte offset before writing either.
-                    self._tensor_storage_window(
-                        self.w13_weights_cpu[layer_id][local_i],
-                        per_w13,
-                    ).copy_(
-                        w13_storage[local_i * per_w13:
-                                    (local_i + 1) * per_w13])
-                    self._tensor_storage_window(
-                        self.w2_weights_cpu[layer_id][local_i],
-                        per_w2,
-                    ).copy_(
-                        w2_storage[local_i * per_w2:
-                                   (local_i + 1) * per_w2])
-                    continue
-                if self.exclusive_dynamic_enabled:
-                    cpu_slot = (
-                        self._exclusive_shared_local_cpu_slots[
-                            layer_id][local_i]
-                        if self.exclusive_shared_cpu_enabled else local_i)
-                    geid = self._cpu_slot_to_eid[layer_id][cpu_slot]
-                else:
-                    geid = ((self._shard_base + local_i)
-                            if use_shard else local_i)
-                self._expert_dst_storage(layer_id, geid, 'w13').copy_(
+                geid = (self._shard_base + local_i) if use_shard else local_i
+                self._expert_dst_storage(layer_id, geid, "w13").copy_(
                     w13_storage[local_i * per_w13 : (local_i + 1) * per_w13]
                 )
-                self._expert_dst_storage(layer_id, geid, 'w2').copy_(
+                self._expert_dst_storage(layer_id, geid, "w2").copy_(
                     w2_storage[local_i * per_w2 : (local_i + 1) * per_w2]
                 )
-
-    def _materialize_exclusive_shared_bootstrap(self) -> None:
-        """Materialize uniformly processed global owners on each local NPU.
-
-        The compact shared mmap contains only CPU-owned experts. During
-        checkpoint loading, each rank appends private temporary tensors for the
-        global physical slots hosted by that rank. Copy those post-processed
-        weights and quant attributes to local NPU slots, synchronize, and drop
-        the suffix before publishing shared sources or auditing canonical
-        memory. No cross-rank weight transfer is involved.
-        """
-        bootstrap_layers = getattr(
-            self, "_exclusive_shared_bootstrap_layers", set())
-        if not self.exclusive_shared_cpu_enabled or not bootstrap_layers:
-            return
-
-        for layer_idx in sorted(tuple(bootstrap_layers)):
-            layer = self.moe_layers[layer_idx]
-            shared_writer_count = len(
-                self._exclusive_shared_local_cpu_slots[layer_idx])
-            local_npu_count = (
-                self.offload_config.num_device_experts_for_rank(
-                    layer_idx, self.ep_size))
-            expected_count = shared_writer_count + local_npu_count
-            if expected_count != self._shard_size:
-                raise RuntimeError(
-                    "Shared exclusive bootstrap must cover one complete EP "
-                    "checkpoint shard: "
-                    f"rank={self.ep_rank}, layer={layer_idx}, "
-                    f"expected_shard={self._shard_size}, "
-                    f"shared_writers={shared_writer_count}, "
-                    f"local_npu={local_npu_count}")
-            global_slot_base = self.ep_rank * local_npu_count
-            local_npu_eids = self._npu_slot_to_eid[layer_idx][
-                global_slot_base:global_slot_base + local_npu_count]
-            if len(local_npu_eids) != local_npu_count:
-                raise RuntimeError(
-                    "Shared exclusive bootstrap local NPU owner count mismatch: "
-                    f"rank={self.ep_rank}, layer={layer_idx}, "
-                    f"expected={local_npu_count}, actual={len(local_npu_eids)}")
-
-            weight_buffers = (
-                ("w13", self.w13_weights_cpu[layer_idx],
-                 self.w13_expert_size_bytes),
-                ("w2", self.w2_weights_cpu[layer_idx],
-                 self.w2_expert_size_bytes),
-            )
-            for name, buffers, _ in weight_buffers:
-                if len(buffers) != expected_count:
-                    raise RuntimeError(
-                        "Shared exclusive bootstrap buffer count mismatch: "
-                        f"rank={self.ep_rank}, layer={layer_idx}, name={name}, "
-                        f"expected={expected_count}, actual={len(buffers)}")
-
-            tasks = []
-            for local_slot, eid in enumerate(local_npu_eids):
-                source_index = shared_writer_count + local_slot
-                for name, buffers, nbytes in weight_buffers:
-                    tasks.append(H2DCopyTask(
-                        source=buffers[source_index].untyped_storage(),
-                        destination=self._expert_device_storage(
-                            layer, local_slot, name),
-                        nbytes=nbytes,
-                        name=(f"exclusive-shared-bootstrap-{name}"
-                              f"[L{layer_idx},E{eid}->S{local_slot}]"),
-                    ))
-
-                for buffer_dict in (
-                        self.scale_cpu_buffers,
-                        self.offset_cpu_buffers,
-                        self.scale_bias_cpu_buffers):
-                    for attr_name, layer_buffers in buffer_dict.items():
-                        if layer_idx >= len(layer_buffers):
-                            continue
-                        buffers = layer_buffers[layer_idx]
-                        dev_tensor = getattr(layer, attr_name, None)
-                        if dev_tensor is None:
-                            continue
-                        if len(buffers) != expected_count:
-                            raise RuntimeError(
-                                "Shared exclusive bootstrap quant buffer count "
-                                "mismatch: "
-                                f"rank={self.ep_rank}, layer={layer_idx}, "
-                                f"name={attr_name}, expected={expected_count}, "
-                                f"actual={len(buffers)}")
-                        source = buffers[source_index]
-                        destination = dev_tensor.data[local_slot]
-                        tasks.append(H2DCopyTask(
-                            source=source.reshape(destination.shape),
-                            destination=destination,
-                            nbytes=(source.numel() * source.element_size()),
-                            name=(f"exclusive-shared-bootstrap-{attr_name}"
-                                  f"[L{layer_idx},E{eid}->S{local_slot}]"),
-                        ))
-
-            with torch_npu.npu.stream(self.load_stream):
-                self._get_h2d_transport().copy_batch(tasks)
-                for local_slot in range(local_npu_count):
-                    self._refresh_expert_fp32_scale(layer, local_slot)
-                self._synchronize_h2d()
-
-            # Keep only this rank's writer views into the compact shared mmap.
-            # Dropping the private suffix restores the steady-state invariant:
-            # compact shared CPU + all local NPU slots == one global model.
-            self.w13_weights_cpu[layer_idx] = self.w13_weights_cpu[
-                layer_idx][:shared_writer_count]
-            self.w2_weights_cpu[layer_idx] = self.w2_weights_cpu[
-                layer_idx][:shared_writer_count]
-            for buffer_dict in (
-                    self.scale_cpu_buffers,
-                    self.offset_cpu_buffers,
-                    self.scale_bias_cpu_buffers):
-                for layer_buffers in buffer_dict.values():
-                    if layer_idx < len(layer_buffers):
-                        layer_buffers[layer_idx] = layer_buffers[
-                            layer_idx][:shared_writer_count]
-
-            bootstrap_layers.remove(layer_idx)
-            self._validate_exclusive_ownership(layer_idx)
-            logger.info(
-                "[EXCLUSIVE-SHARED-BOOTSTRAP] rank=%d/%d layer=%d "
-                "checkpoint_local_experts=%d materialized_npu_slots=%d "
-                "shared_cpu_writer_slots=%d canonical_shared_cpu_slots=%d "
-                "copy_tasks=%d source_layout=cpu_postprocess "
-                "cross_rank_weight_transfer=False status=ok",
-                self.ep_rank, self.ep_size, layer_idx, expected_count,
-                local_npu_count, shared_writer_count,
-                len(self._cpu_slot_to_eid[layer_idx]), len(tasks))
 
     def _cast_device_slots_to_mxfp4_nz(self):
         """Stamp on-device W4A8_MXFP expert weight slots with format-29 (NZ).
@@ -1593,10 +1184,13 @@ class ExpertOffloadManager:
                 w = _expert_weight(layer, name)
                 if w is None:
                     continue
+                if self.native_mxfp4_enabled and torch_npu.get_npu_format(w) == 29:
+                    continue
                 d = w.data.transpose(1, 2).contiguous()
                 try:
                     d = torch_npu.npu_format_cast(
-                        d.view(torch.uint8), 29,
+                        d.view(torch.uint8),
+                        29,
                         customize_dtype=torch.float8_e4m3fn,
                         input_dtype=torch_npu.float4_e2m1fn_x2,
                     )
@@ -1606,121 +1200,12 @@ class ExpertOffloadManager:
                         "failed on layer slot %r; leaving expert slots in base "
                         "format. Safe for DeepSeek-V4 (fused-swiglu GMM reads "
                         "raw storage); breaks the Kimi-K3 SiTU "
-                        "npu_grouped_matmul path. Error: %s", name, e)
+                        "npu_grouped_matmul path. Error: %s",
+                        name,
+                        e,
+                    )
                     return
                 w.data = d.transpose(1, 2)
-
-    def _materialize_exclusive_sharded_bootstrap(self) -> None:
-        """Materialize uniformly processed initial owners on the local NPU.
-
-        The original routed-expert loader writes initial NPU owners directly to
-        their device slots, while CPU-owned experts pass through this manager's
-        CPU post-processing.  That is unsafe when a device-wide format cast is
-        unsupported: an initial expert evicted by the first exclusive swap can
-        otherwise enter the canonical CPU pool with a different byte layout
-        from experts loaded from the checkpoint CPU path.
-
-        For every bootstrap layer, the temporary suffix in each CPU buffer is
-        ordered exactly like ``_npu_slot_to_eid``.  Copy those already-processed
-        weight and quant bytes to the matching local device slots, synchronize,
-        then remove the suffix.  No cross-rank transfer or persistent CPU
-        duplicate is introduced.
-        """
-        bootstrap_layers = getattr(
-            self, "_exclusive_sharded_bootstrap_layers", set())
-        if not self.exclusive_sharded_cpu_enabled or not bootstrap_layers:
-            return
-
-        for layer_idx in sorted(tuple(bootstrap_layers)):
-            layer = self.moe_layers[layer_idx]
-            cpu_count = len(self._cpu_slot_to_eid[layer_idx])
-            npu_count = len(self._npu_slot_to_eid[layer_idx])
-            expected_count = cpu_count + npu_count
-            weight_buffers = (
-                ("w13", self.w13_weights_cpu[layer_idx],
-                 self.w13_expert_size_bytes),
-                ("w2", self.w2_weights_cpu[layer_idx],
-                 self.w2_expert_size_bytes),
-            )
-            for name, buffers, _ in weight_buffers:
-                if len(buffers) != expected_count:
-                    raise RuntimeError(
-                        "Rank-local exclusive bootstrap buffer count mismatch: "
-                        f"rank={self.ep_rank}, layer={layer_idx}, name={name}, "
-                        f"expected={expected_count}, actual={len(buffers)}")
-
-            tasks = []
-            for slot, eid in enumerate(self._npu_slot_to_eid[layer_idx]):
-                source_index = cpu_count + slot
-                for name, buffers, nbytes in weight_buffers:
-                    tasks.append(H2DCopyTask(
-                        source=buffers[source_index].untyped_storage(),
-                        destination=self._expert_device_storage(
-                            layer, slot, name),
-                        nbytes=nbytes,
-                        name=(f"exclusive-bootstrap-{name}[L{layer_idx},"
-                              f"E{eid}->S{slot}]"),
-                    ))
-
-                for buffer_dict in (
-                        self.scale_cpu_buffers,
-                        self.offset_cpu_buffers,
-                        self.scale_bias_cpu_buffers):
-                    for attr_name, layer_buffers in buffer_dict.items():
-                        if layer_idx >= len(layer_buffers):
-                            continue
-                        buffers = layer_buffers[layer_idx]
-                        dev_tensor = getattr(layer, attr_name, None)
-                        if dev_tensor is None:
-                            continue
-                        if len(buffers) != expected_count:
-                            raise RuntimeError(
-                                "Rank-local exclusive bootstrap quant buffer "
-                                "count mismatch: "
-                                f"rank={self.ep_rank}, layer={layer_idx}, "
-                                f"name={attr_name}, expected={expected_count}, "
-                                f"actual={len(buffers)}")
-                        source = buffers[source_index]
-                        destination = dev_tensor.data[slot]
-                        tasks.append(H2DCopyTask(
-                            source=source.reshape(destination.shape),
-                            destination=destination,
-                            nbytes=(source.numel() * source.element_size()),
-                            name=(f"exclusive-bootstrap-{attr_name}[L{layer_idx},"
-                                  f"E{eid}->S{slot}]"),
-                        ))
-
-            with torch_npu.npu.stream(self.load_stream):
-                self._get_h2d_transport().copy_batch(tasks)
-                for slot in range(npu_count):
-                    self._refresh_expert_fp32_scale(layer, slot)
-                self._synchronize_h2d()
-
-            # Drop only the temporary initial-NPU suffix.  The retained prefix
-            # remains indexed by _cpu_slot_to_eid and is the sole canonical CPU
-            # owner set used by runtime swaps.
-            self.w13_weights_cpu[layer_idx] = self.w13_weights_cpu[
-                layer_idx][:cpu_count]
-            self.w2_weights_cpu[layer_idx] = self.w2_weights_cpu[
-                layer_idx][:cpu_count]
-            for buffer_dict in (
-                    self.scale_cpu_buffers,
-                    self.offset_cpu_buffers,
-                    self.scale_bias_cpu_buffers):
-                for layer_buffers in buffer_dict.values():
-                    if layer_idx < len(layer_buffers):
-                        layer_buffers[layer_idx] = layer_buffers[
-                            layer_idx][:cpu_count]
-
-            bootstrap_layers.remove(layer_idx)
-            self._validate_exclusive_ownership(layer_idx)
-            logger.info(
-                "[EXCLUSIVE-SHARDED-BOOTSTRAP] rank=%d/%d layer=%d "
-                "checkpoint_local_experts=%d materialized_npu_slots=%d "
-                "canonical_cpu_slots=%d copy_tasks=%d source_layout=cpu_postprocess "
-                "cross_rank_weight_transfer=False status=ok",
-                self.ep_rank, self.ep_size, layer_idx, expected_count,
-                npu_count, cpu_count, len(tasks))
 
     def _process_scale_bias_cpu_buffers(self):
         """Apply update_bias transformation to scale_bias CPU buffers.
@@ -1731,26 +1216,12 @@ class ExpertOffloadManager:
         """
         for attr_name, layer_buffers in self.scale_bias_cpu_buffers.items():
             for layer_idx, expert_buffers in enumerate(layer_buffers):
-                transformed_buffers = [
-                    buf.transpose(0, 1).contiguous().sum(dim=0)
-                    for buf in expert_buffers
-                ]
-                if self.torch_shared_cpu_weights_enabled:
-                    template = None
-                    if not transformed_buffers:
-                        source = self._torch_shared_cpu_buffers[
-                            (layer_idx, attr_name)][0]
-                        template = source.transpose(
-                            0, 1).contiguous().sum(dim=0)
-                    new_buffers = self._replace_torch_shared_expert_buffer(
-                        layer_idx, attr_name, transformed_buffers, template)
-                else:
-                    new_buffers = []
-                    for transformed in transformed_buffers:
-                        backend_buffer = self._allocate_expert_host_tensor(
-                            transformed.shape, transformed.dtype)
-                        backend_buffer.copy_(transformed)
-                        new_buffers.append(backend_buffer)
+                new_buffers = []
+                for buf in expert_buffers:
+                    transformed = buf.transpose(0, 1).contiguous().sum(dim=0)
+                    backend_buffer = self._allocate_expert_host_tensor(transformed.shape, transformed.dtype)
+                    backend_buffer.copy_(transformed)
+                    new_buffers.append(backend_buffer)
                 layer_buffers[layer_idx] = new_buffers
 
     def _encode_w4a8_dynamic_weight_scales(self):
@@ -1774,43 +1245,24 @@ class ExpertOffloadManager:
         matching ``layer.w13_weight_scale.dtype`` on the NPU.
         """
         import numpy as np
+
         for attr_name in ("w13_weight_scale", "w2_weight_scale"):
             if attr_name not in self.scale_cpu_buffers:
                 continue
-            for layer_idx, expert_buffers in enumerate(
-                    self.scale_cpu_buffers[attr_name]):
-                encoded_values = []
+            for layer_idx, expert_buffers in enumerate(self.scale_cpu_buffers[attr_name]):
+                encoded_buffers = []
                 for buf in expert_buffers:
                     # buf: float32, shape per-expert (e.g. (2*IN,) for w13)
-                    scale_np = np.ascontiguousarray(
-                        buf.cpu().numpy()).astype(np.float32)
+                    scale_np = np.ascontiguousarray(buf.cpu().numpy()).astype(np.float32)
                     # Bit-reinterpret float32 bytes as uint32, then
                     # zero-extend to int64 — identical to device process_scale
                     # per-channel branch.
                     scale_np.dtype = np.uint32
                     encoded = scale_np.astype(np.int64)
-                    encoded_tensor = torch.from_numpy(np.ascontiguousarray(
-                        encoded.copy()))
-                    encoded_values.append(encoded_tensor)
-                if self.torch_shared_cpu_weights_enabled:
-                    template = None
-                    if not encoded_values:
-                        source = self._torch_shared_cpu_buffers[
-                            (layer_idx, attr_name)][0]
-                        source_np = np.ascontiguousarray(
-                            source.cpu().numpy()).astype(np.float32)
-                        source_np.dtype = np.uint32
-                        template = torch.from_numpy(np.ascontiguousarray(
-                            source_np.astype(np.int64).copy()))
-                    encoded_buffers = self._replace_torch_shared_expert_buffer(
-                        layer_idx, attr_name, encoded_values, template)
-                else:
-                    encoded_buffers = []
-                    for encoded_tensor in encoded_values:
-                        encoded_buf = self._allocate_expert_host_tensor(
-                            encoded_tensor.shape, encoded_tensor.dtype)
-                        encoded_buf.copy_(encoded_tensor)
-                        encoded_buffers.append(encoded_buf)
+                    encoded_tensor = torch.from_numpy(np.ascontiguousarray(encoded.copy()))
+                    encoded_buf = self._allocate_expert_host_tensor(encoded_tensor.shape, encoded_tensor.dtype)
+                    encoded_buf.copy_(encoded_tensor)
+                    encoded_buffers.append(encoded_buf)
                 self.scale_cpu_buffers[attr_name][layer_idx] = encoded_buffers
 
     # ------------------------------------------------------------------ #
@@ -1838,13 +1290,9 @@ class ExpertOffloadManager:
             # thread limit (EAGAIN). Parallelism comes from the pool itself.
             self._saved_num_threads = torch.get_num_threads()
             torch.set_num_threads(1)
-            self._load_pool = ThreadPoolExecutor(
-                max_workers=self._LOAD_POOL_WORKERS,
-                thread_name_prefix="offload-load")
+            self._load_pool = ThreadPoolExecutor(max_workers=self._LOAD_POOL_WORKERS, thread_name_prefix="offload-load")
             self._load_phase_start = time.perf_counter()
-            logger.info(
-                "[OFFLOAD] starting parallel weight load (workers=%d)",
-                self._LOAD_POOL_WORKERS)
+            logger.info("[OFFLOAD] starting parallel weight load (workers=%d)", self._LOAD_POOL_WORKERS)
         return self._load_pool
 
     def _track_load_future(self, fut) -> None:
@@ -1864,14 +1312,12 @@ class ExpertOffloadManager:
         self._drained_shards = previously_drained + n
         t0 = getattr(self, "_load_phase_start", None)
         crossed_progress_boundary = (
-            self._drained_shards // self._LOAD_PROGRESS_LOG_EVERY
-            > previously_drained // self._LOAD_PROGRESS_LOG_EVERY
+            self._drained_shards // self._LOAD_PROGRESS_LOG_EVERY > previously_drained // self._LOAD_PROGRESS_LOG_EVERY
         )
         if t0 and crossed_progress_boundary:
             elapsed = time.perf_counter() - t0
             logger.info(
-                "[OFFLOAD] weight load progress: %d shards copied "
-                "(%.0f shards/s, %.0fs elapsed)",
+                "[OFFLOAD] weight load progress: %d shards copied (%.0f shards/s, %.0fs elapsed)",
                 self._drained_shards,
                 self._drained_shards / max(elapsed, 1e-6),
                 elapsed,
@@ -1908,8 +1354,7 @@ class ExpertOffloadManager:
         """
         if weight.dtype != torch.int8:
             weight = weight.to(torch.int8)
-        assert weight.shape[0] % 2 == 0, (
-            f"dim 0 must be even for int4 packing, got {weight.shape[0]}")
+        assert weight.shape[0] % 2 == 0, f"dim 0 must be even for int4 packing, got {weight.shape[0]}"
         pairs = weight.reshape(weight.shape[0] // 2, 2, *weight.shape[1:])
         lo = pairs[:, 0] & 0x0F
         hi = pairs[:, 1] & 0x0F
@@ -1918,35 +1363,33 @@ class ExpertOffloadManager:
     # -- worker copy kernels (static: no self, no shared mutable state) -- #
 
     @staticmethod
-    def _copy_w13_shard(cpu: torch.Tensor, owned: torch.Tensor,
-                        shard_id: str, intermed: int) -> None:
+    def _copy_w13_shard(cpu: torch.Tensor, owned: torch.Tensor, shard_id: str, intermed: int) -> None:
         if shard_id == "w1":
             cpu[:, :intermed].copy_(owned.t())
         elif shard_id == "w3":
-            cpu[:, intermed: intermed + owned.shape[0]].copy_(owned.t())
+            cpu[:, intermed : intermed + owned.shape[0]].copy_(owned.t())
 
     @staticmethod
     def _copy_w2(dst: torch.Tensor, owned: torch.Tensor) -> None:
         dst.copy_(owned.t())
 
     @staticmethod
-    def _copy_scale_assembled(target: torch.Tensor,
-                              w1: torch.Tensor, w3: torch.Tensor) -> None:
+    def _copy_scale_assembled(target: torch.Tensor, w1: torch.Tensor, w3: torch.Tensor) -> None:
         assembled = torch.cat([w1, w3], dim=0)
         if target.dtype == torch.uint8:
             # W4A8_MXFP: store the post-layout bytes so the 1D buffer matches
             # the post-process device slot element order (the device path
             # applies reshape(...,k//2,2).transpose to the e8m0 scale).
-            from vllm_ascend.quantization.methods.w4a8_mxfp4 import (
-                apply_mxfp4_weight_scale_layout)
+            from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import apply_mxfp4_weight_scale_layout
+
             assembled = apply_mxfp4_weight_scale_layout(assembled.view(torch.uint8))
         target.copy_(assembled.reshape(target.shape))
 
     @staticmethod
     def _copy_scale_direct(target: torch.Tensor, owned: torch.Tensor) -> None:
         if target.dtype == torch.uint8:
-            from vllm_ascend.quantization.methods.w4a8_mxfp4 import (
-                apply_mxfp4_weight_scale_layout)
+            from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import apply_mxfp4_weight_scale_layout
+
             owned = apply_mxfp4_weight_scale_layout(owned.view(torch.uint8))
         target.copy_(owned.reshape(target.shape))
 
@@ -1971,10 +1414,8 @@ class ExpertOffloadManager:
         for layer in self.moe_layers:
             gate = getattr(layer, "gate", None)
             gate_param = getattr(gate, "weight", None)
-            self._gate_weights_npu.append(
-                None if gate_param is None else gate_param.data.float().clone())
-        logger.info("[PREFETCH] registered gate weights for %d MoE layers",
-                    len(self._gate_weights_npu))
+            self._gate_weights_npu.append(None if gate_param is None else gate_param.data.float().clone())
+        logger.info("[PREFETCH] registered gate weights for %d MoE layers", len(self._gate_weights_npu))
 
     def _register_layer_gate(self, layer):
         """Stage one MoE layer's gate.weight for prefetch prediction.
@@ -1993,14 +1434,14 @@ class ExpertOffloadManager:
             return
         if not hasattr(self, "topk_ids_h"):
             return
-        gate = getattr(layer, 'gate', None)
-        gate_param = getattr(gate, 'weight', None)
-        self._gate_weights_npu.append(
-            None if gate_param is None else gate_param.data.float().clone())
+        gate = getattr(layer, "gate", None)
+        gate_param = getattr(gate, "weight", None)
+        self._gate_weights_npu.append(None if gate_param is None else gate_param.data.float().clone())
         logger.info(
-            "[PREFETCH] registered gate weight for post-finalize layer "
-            "(total gates=%d, moe_layers=%d)",
-            len(self._gate_weights_npu), len(self.moe_layers))
+            "[PREFETCH] registered gate weight for post-finalize layer (total gates=%d, moe_layers=%d)",
+            len(self._gate_weights_npu),
+            len(self.moe_layers),
+        )
 
     def _shard_local(self, global_eid: int) -> int | None:
         """Map a GLOBAL expert id to the CPU weight buffer's local index.
@@ -2015,49 +1456,15 @@ class ExpertOffloadManager:
         local = global_eid - self._shard_base
         return local if 0 <= local < self._shard_size else None
 
-    def _cpu_local(self, layer_idx: int, global_eid: int) -> int | None:
-        """Resolve an expert's current compact CPU slot, if CPU-owned."""
-        if self.exclusive_dynamic_enabled:
-            slot = self._eid_to_cpu_slot[layer_idx][global_eid]
-            return None if slot < 0 else slot
-        return self._shard_local(global_eid)
-
-    def _checkpoint_cpu_local(
-        self, layer_idx: int, global_eid: int
-    ) -> int | None:
-        """Resolve this rank's writable checkpoint slot for one CPU expert."""
-        cpu_slot = self._cpu_local(layer_idx, global_eid)
-        if (cpu_slot is None and self.exclusive_shared_cpu_enabled
-                and layer_idx in getattr(
-                    self, "_exclusive_shared_bootstrap_layers", set())):
-            physical_slot = self._eid_to_npu_slot[layer_idx][global_eid]
-            local_npu_count = (
-                self.offload_config.num_device_experts_for_rank(
-                    layer_idx, self.ep_size))
-            global_slot_base = self.ep_rank * local_npu_count
-            if (global_slot_base <= physical_slot
-                    < global_slot_base + local_npu_count):
-                return (
-                    len(self._exclusive_shared_local_cpu_slots[layer_idx])
-                    + physical_slot - global_slot_base)
-        if (cpu_slot is None and self.exclusive_sharded_cpu_enabled
-                and layer_idx in getattr(
-                    self, "_exclusive_sharded_bootstrap_layers", set())):
-            npu_slot = self._eid_to_npu_slot[layer_idx][global_eid]
-            if npu_slot >= 0:
-                cpu_slot = len(self._cpu_slot_to_eid[layer_idx]) + npu_slot
-        if cpu_slot is None or not self.exclusive_shared_cpu_enabled:
-            return cpu_slot
-        return self._exclusive_shared_cpu_slot_to_local[layer_idx].get(
-            cpu_slot)
-
-    def load_w13(self, layer_moe_idx: int, expert_id: int,
-                 loaded_weight: torch.Tensor, shard_id: str):
+    def load_w13(self, layer_moe_idx: int, expert_id: int, loaded_weight: torch.Tensor, shard_id: str):
         """Store w1/w3 shard to CPU buffer (transposed) via the load pool."""
         self._weight_load_calls += 1
-        idx = self._checkpoint_cpu_local(layer_moe_idx, expert_id)
+        if self.native_mxfp4_enabled:
+            self._load_native_field(layer_moe_idx, expert_id, shard_id, "weight", loaded_weight)
+            return
+        idx = self._shard_local(expert_id)
         if idx is None:
-            return  # sharded remote expert or exclusive NPU-owned expert
+            return  # shard-per-rank: expert not owned by this rank
         cpu = self.w13_weights_cpu[layer_moe_idx][idx]
         intermed = cpu.shape[1] // 2
         if loaded_weight.ndim > 0 and loaded_weight.shape[0] > intermed:
@@ -2066,17 +1473,18 @@ class ExpertOffloadManager:
             else:
                 loaded_weight = loaded_weight.narrow(0, 0, intermed)
         owned = loaded_weight.cpu().clone()
-        fut = self._get_load_pool().submit(
-            self._copy_w13_shard, cpu, owned, shard_id, intermed)
+        fut = self._get_load_pool().submit(self._copy_w13_shard, cpu, owned, shard_id, intermed)
         self._track_load_future(fut)
 
-    def load_w2(self, layer_moe_idx: int, expert_id: int,
-                loaded_weight: torch.Tensor):
+    def load_w2(self, layer_moe_idx: int, expert_id: int, loaded_weight: torch.Tensor):
         """Store w2 weight to CPU buffer (transposed) via the load pool."""
         self._weight_load_calls += 1
-        idx = self._checkpoint_cpu_local(layer_moe_idx, expert_id)
+        if self.native_mxfp4_enabled:
+            self._load_native_field(layer_moe_idx, expert_id, "w2", "weight", loaded_weight)
+            return
+        idx = self._shard_local(expert_id)
         if idx is None:
-            return  # sharded remote expert or exclusive NPU-owned expert
+            return  # shard-per-rank: expert not owned by this rank
         dst = self.w2_weights_cpu[layer_moe_idx][idx]
         owned = loaded_weight.cpu().clone()
         fut = self._get_load_pool().submit(self._copy_w2, dst, owned)
@@ -2086,9 +1494,9 @@ class ExpertOffloadManager:
     #  Scale / offset helpers (quantized models only)                     #
     # ------------------------------------------------------------------ #
 
-    def _load_scale_shard(self, layer_moe_idx: int, expert_id: int,
-                          attr_name: str, shard_id: str,
-                          loaded_weight: torch.Tensor):
+    def _load_scale_shard(
+        self, layer_moe_idx: int, expert_id: int, attr_name: str, shard_id: str, loaded_weight: torch.Tensor
+    ):
         """Load a scale/offset shard into its CPU buffer via the load pool.
 
         w13 scale/offset arrives as two shards (w1, w3) that must be
@@ -2097,6 +1505,11 @@ class ExpertOffloadManager:
         w2 scale/offset is a single shard — clone and defer directly.
         """
         self._weight_load_calls += 1
+        if self.native_mxfp4_enabled:
+            if attr_name not in ("w13_weight_scale", "w2_weight_scale"):
+                raise ValueError(f"Unsupported native MXFP4 quantization attribute {attr_name}")
+            self._load_native_field(layer_moe_idx, expert_id, shard_id, "scale", loaded_weight)
+            return
         assert shard_id in ("w1", "w2", "w3"), f"unexpected shard_id: {shard_id}"
         if "scale_bias" in attr_name:
             target_dict = self.scale_bias_cpu_buffers
@@ -2106,9 +1519,9 @@ class ExpertOffloadManager:
             target_dict = self.offset_cpu_buffers
         # shard-per-rank: skip scales for non-owned experts and index the
         # shard-sized buffer locally (mirrors load_w13/load_w2).
-        local_eid = self._checkpoint_cpu_local(layer_moe_idx, expert_id)
+        local_eid = self._shard_local(expert_id)
         if local_eid is None:
-            return  # sharded remote expert or exclusive NPU-owned expert
+            return  # shard-per-rank: scale not owned by this rank
         target = target_dict[attr_name][layer_moe_idx][local_eid]
         if attr_name.startswith("w13_"):
             key = (layer_moe_idx, expert_id, attr_name)
@@ -2120,8 +1533,7 @@ class ExpertOffloadManager:
                     w1, w3 = cur_shard, pending_shard
                 else:
                     w1, w3 = pending_shard, cur_shard
-                fut = self._get_load_pool().submit(
-                    self._copy_scale_assembled, target, w1, w3)
+                fut = self._get_load_pool().submit(self._copy_scale_assembled, target, w1, w3)
                 self._track_load_future(fut)
             else:
                 # First shard — stash an owned clone.
@@ -2129,8 +1541,7 @@ class ExpertOffloadManager:
         else:
             # w2 scale/offset — single shard.
             owned = loaded_weight.cpu().clone()
-            fut = self._get_load_pool().submit(
-                self._copy_scale_direct, target, owned)
+            fut = self._get_load_pool().submit(self._copy_scale_direct, target, owned)
             self._track_load_future(fut)
 
     def refresh_fp32_scales(self):
@@ -2141,12 +1552,10 @@ class ExpertOffloadManager:
         w13_weight_scale_fp32 from the freshly-loaded w13_weight_scale.
         """
         for i, layer in enumerate(self.moe_layers):
-            ndev = min(self.num_device_experts_for_layer(i),
-                       _expert_weight(layer, "w13_weight").shape[0])
-            if hasattr(layer, 'w13_weight_scale_fp32'):
+            ndev = min(self.num_device_experts_for_layer(i), _expert_weight(layer, "w13_weight").shape[0])
+            if hasattr(layer, "w13_weight_scale_fp32"):
                 for j in range(ndev):
-                    layer.w13_weight_scale_fp32[j].copy_(
-                        layer.w13_weight_scale.data[j].to(torch.float32))
+                    layer.w13_weight_scale_fp32[j].copy_(layer.w13_weight_scale.data[j].to(torch.float32))
 
     def create_prefill_pool(self):
         """Allocate prefill pool tensors on NPU with full expert count.
@@ -2184,32 +1593,20 @@ class ExpertOffloadManager:
         # Prefill log2phy: identity — all experts mapped to their slots
         self._prefill_log2phy = torch.arange(ntotal, dtype=torch.int32, device=dev)
 
-        if self.enable_multi_card:
-            from vllm_ascend.expert_offload.multi_card_planner import (
-                all2all_expert_ids_per_ep_rank,
-                all2all_local_expert_indices,
-            )
-
-            self._prefill_local_expert_indices = all2all_local_expert_indices(
-                self.ep_rank, ntotal)
-            self._prefill_expert_ids_per_ep_rank = torch.tensor(
-                all2all_expert_ids_per_ep_rank(
-                    ntotal, self.num_total_experts),
-                dtype=torch.int32,
-                device=dev,
-            )
-
         # Pre-initialize all pool slots with layer 0 weights so that
         # profile_run / _dummy_run (which may use prefill path) has
         # valid data.  Subsequent _prefill_load_layer calls will
         # overwrite with the correct per-layer weights.
         self._init_prefill_pool_data(dev, ntotal, ndl)
+        self._prefill_pool_owner = [-1] * ndl
         self._prefill_initialized = True
-        logger.info("[PREFILL_POOL] allocated %d layers × %d experts, "
-                    "w13[0].shape=%s w2[0].shape=%s",
-                    ndl, ntotal,
-                    tuple(self._prefill_w13[0].shape),
-                    tuple(self._prefill_w2[0].shape))
+        logger.info(
+            "[PREFILL_POOL] allocated %d layers × %d experts, w13[0].shape=%s w2[0].shape=%s",
+            ndl,
+            ntotal,
+            tuple(self._prefill_w13[0].shape),
+            tuple(self._prefill_w2[0].shape),
+        )
 
     def _alloc_prefill_pool_slot(self, pool_layer, dev, dt, ntotal: int):
         """Append one prefill-pool slot (weights always; scales/offsets/scale_bias
@@ -2225,17 +1622,18 @@ class ExpertOffloadManager:
             ("_prefill_w13_scale_bias", "w13_scale_bias", None),
             ("_prefill_w2_scale_bias", "w2_scale_bias", None),
         ]
-        self._prefill_w13.append(torch.empty(
-            (ntotal,) + tuple(_expert_weight(pool_layer, "w13_weight").shape[1:]), dtype=dt, device=dev))
-        self._prefill_w2.append(torch.empty(
-            (ntotal,) + tuple(_expert_weight(pool_layer, "w2_weight").shape[1:]), dtype=dt, device=dev))
+        self._prefill_w13.append(
+            torch.empty((ntotal,) + tuple(_expert_weight(pool_layer, "w13_weight").shape[1:]), dtype=dt, device=dev)
+        )
+        self._prefill_w2.append(
+            torch.empty((ntotal,) + tuple(_expert_weight(pool_layer, "w2_weight").shape[1:]), dtype=dt, device=dev)
+        )
         for tgt, src, dtype_override in quant_specs:
             if not hasattr(pool_layer, src):
                 continue
             src_t = getattr(pool_layer, src)
             dtype = dtype_override if dtype_override is not None else src_t.dtype
-            getattr(self, tgt).append(torch.empty(
-                (ntotal,) + tuple(src_t.shape[1:]), dtype=dtype, device=dev))
+            getattr(self, tgt).append(torch.empty((ntotal,) + tuple(src_t.shape[1:]), dtype=dtype, device=dev))
 
     def _cast_prefill_pool_format(self, dev, dt):
         """Cast prefill-pool weight tensors to the on-device (kernel) format.
@@ -2250,24 +1648,24 @@ class ExpertOffloadManager:
         n = len(self._prefill_w13)
         if dt == torch.int8:
             from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+
             for i in range(n):
-                self._prefill_w13[i] = torch_npu.npu_format_cast(
-                    self._prefill_w13[i], ACL_FORMAT_FRACTAL_NZ)
-                self._prefill_w2[i] = torch_npu.npu_format_cast(
-                    self._prefill_w2[i], ACL_FORMAT_FRACTAL_NZ)
+                self._prefill_w13[i] = torch_npu.npu_format_cast(self._prefill_w13[i], ACL_FORMAT_FRACTAL_NZ)
+                self._prefill_w2[i] = torch_npu.npu_format_cast(self._prefill_w2[i], ACL_FORMAT_FRACTAL_NZ)
         elif dt == torch.int32:
             from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
+
             for i in range(n):
                 t13 = self._prefill_w13[i]
                 t2 = self._prefill_w2[i]
                 t13_nz = torch_npu.npu_format_cast(
-                    torch.empty(t13.shape[:-1] + (t13.shape[-1] * 4,),
-                                dtype=torch.int8, device=dev),
-                    ACL_FORMAT_FRACTAL_NZ)
+                    torch.empty(t13.shape[:-1] + (t13.shape[-1] * 4,), dtype=torch.int8, device=dev),
+                    ACL_FORMAT_FRACTAL_NZ,
+                )
                 t2_nz = torch_npu.npu_format_cast(
-                    torch.empty(t2.shape[:-1] + (t2.shape[-1] * 4,),
-                                dtype=torch.int8, device=dev),
-                    ACL_FORMAT_FRACTAL_NZ)
+                    torch.empty(t2.shape[:-1] + (t2.shape[-1] * 4,), dtype=torch.int8, device=dev),
+                    ACL_FORMAT_FRACTAL_NZ,
+                )
                 self._prefill_w13[i] = t13_nz.view(torch.int32)
                 self._prefill_w2[i] = t2_nz.view(torch.int32)
         elif dt == torch.uint8:
@@ -2275,7 +1673,8 @@ class ExpertOffloadManager:
                 for attr in ("_prefill_w13", "_prefill_w2"):
                     t = getattr(self, attr)[i]
                     t = torch_npu.npu_format_cast(
-                        t.transpose(1, 2).contiguous().view(torch.uint8), 29,
+                        t.transpose(1, 2).contiguous().view(torch.uint8),
+                        29,
                         customize_dtype=torch.float8_e4m3fn,
                         input_dtype=torch_npu.float4_e2m1fn_x2,
                     )
@@ -2288,114 +1687,221 @@ class ExpertOffloadManager:
         source_eid: int,
         destination_eid: int,
     ) -> list[H2DCopyTask]:
-        """Build mixed-source copies for one prefill-pool expert.
-
-        Legacy ownership always uses CPU H2D.  Dynamic exclusive ownership
-        resolves the current canonical source per expert: CPU residents use
-        H2D and NPU residents use D2D from their decode slot.  Prefill does not
-        mutate ownership; it remains a full overwrite of the prefill pool.
-        """
+        """Build weight and quant tasks for one prefill-pool expert."""
+        if self.native_mxfp4_enabled:
+            return [self._native_upload_task(
+                layer_idx, source_eid, self._prefill_w13[pool_slot], self._prefill_w2[pool_slot],
+                self._prefill_w13_scale[pool_slot], self._prefill_w2_scale[pool_slot],
+                destination_eid, f"native-prefill[L{layer_idx},E{source_eid}->P{pool_slot}:E{destination_eid}]",
+            )]
         w13_start = destination_eid * self.w13_expert_size_bytes
         w2_start = destination_eid * self.w2_expert_size_bytes
-        w13_dst = self._prefill_w13[pool_slot].untyped_storage()[
-            w13_start:w13_start + self.w13_expert_size_bytes]
-        w2_dst = self._prefill_w2[pool_slot].untyped_storage()[
-            w2_start:w2_start + self.w2_expert_size_bytes]
-        npu_slot = -1
-        direction = CopyDirection.H2D
-        if self.exclusive_dynamic_enabled:
-            npu_slot = self._eid_to_npu_slot[layer_idx][source_eid]
-        if npu_slot >= 0:
-            source_layer = self.moe_layers[layer_idx]
-            w13_source = self._expert_device_storage(
-                source_layer, npu_slot, "w13")
-            w2_source = self._expert_device_storage(
-                source_layer, npu_slot, "w2")
-            direction = CopyDirection.D2D
-        else:
-            w13_source = self._expert_src_storage(
-                layer_idx, source_eid, 'w13')
-            w2_source = self._expert_src_storage(
-                layer_idx, source_eid, 'w2')
-
+        w13_dst = self._prefill_w13[pool_slot].untyped_storage()[w13_start : w13_start + self.w13_expert_size_bytes]
+        w2_dst = self._prefill_w2[pool_slot].untyped_storage()[w2_start : w2_start + self.w2_expert_size_bytes]
         tasks = [
             H2DCopyTask(
-                source=w13_source,
+                source=self._expert_src_storage(layer_idx, source_eid, "w13"),
                 destination=w13_dst,
                 nbytes=self.w13_expert_size_bytes,
-                name=(f"prefill-w13[L{layer_idx},E{source_eid}"
-                      f"->P{pool_slot}:E{destination_eid}]"),
-                direction=direction,
+                name=(f"prefill-w13[L{layer_idx},E{source_eid}->P{pool_slot}:E{destination_eid}]"),
             ),
             H2DCopyTask(
-                source=w2_source,
+                source=self._expert_src_storage(layer_idx, source_eid, "w2"),
                 destination=w2_dst,
                 nbytes=self.w2_expert_size_bytes,
-                name=(f"prefill-w2[L{layer_idx},E{source_eid}"
-                      f"->P{pool_slot}:E{destination_eid}]"),
-                direction=direction,
+                name=(f"prefill-w2[L{layer_idx},E{source_eid}->P{pool_slot}:E{destination_eid}]"),
             ),
         ]
 
-        local_eid = self._cpu_local(layer_idx, source_eid)
+        local_eid = self._shard_local(source_eid)
         quant_specs = (
-            (self.scale_cpu_buffers, "w13_weight_scale",
-             self._prefill_w13_scale),
-            (self.scale_cpu_buffers, "w2_weight_scale",
-             self._prefill_w2_scale),
-            (self.offset_cpu_buffers, "w13_weight_offset",
-             self._prefill_w13_offset),
-            (self.offset_cpu_buffers, "w2_weight_offset",
-             self._prefill_w2_offset),
-            (self.scale_bias_cpu_buffers, "w13_scale_bias",
-             self._prefill_w13_scale_bias),
-            (self.scale_bias_cpu_buffers, "w2_scale_bias",
-             self._prefill_w2_scale_bias),
+            (self.scale_cpu_buffers, "w13_weight_scale", self._prefill_w13_scale),
+            (self.scale_cpu_buffers, "w2_weight_scale", self._prefill_w2_scale),
+            (self.offset_cpu_buffers, "w13_weight_offset", self._prefill_w13_offset),
+            (self.offset_cpu_buffers, "w2_weight_offset", self._prefill_w2_offset),
+            (self.scale_bias_cpu_buffers, "w13_scale_bias", self._prefill_w13_scale_bias),
+            (self.scale_bias_cpu_buffers, "w2_scale_bias", self._prefill_w2_scale_bias),
         )
         for cpu_buffers, attr_name, prefill_buffers in quant_specs:
-            if (pool_slot >= len(prefill_buffers)
-                    or attr_name not in cpu_buffers
-                    or layer_idx >= len(cpu_buffers[attr_name])):
+            if (
+                pool_slot >= len(prefill_buffers)
+                or attr_name not in cpu_buffers
+                or layer_idx >= len(cpu_buffers[attr_name])
+            ):
                 continue
             dst = prefill_buffers[pool_slot][destination_eid]
-            if npu_slot >= 0:
-                source_layer = self.moe_layers[layer_idx]
-                source = getattr(source_layer, attr_name).data[npu_slot]
-                nbytes = source.numel() * source.element_size()
-                attr_direction = CopyDirection.D2D
-            elif (not self.exclusive_shared_cpu_enabled
-                    and local_eid is not None
-                    and local_eid < len(cpu_buffers[attr_name][layer_idx])):
+            if local_eid is not None and local_eid < len(cpu_buffers[attr_name][layer_idx]):
                 src_tensor = cpu_buffers[attr_name][layer_idx][local_eid]
                 source = src_tensor.reshape(dst.shape)
                 nbytes = src_tensor.numel() * src_tensor.element_size()
-                attr_direction = CopyDirection.H2D
             else:
-                source = self._shared_h2d_source(
-                    layer_idx, source_eid, attr_name)
+                source = self._shared_h2d_source(layer_idx, source_eid, attr_name)
                 nbytes = dst.numel() * dst.element_size()
-                attr_direction = CopyDirection.H2D
-            tasks.append(H2DCopyTask(
-                source=source,
-                destination=dst,
-                nbytes=nbytes,
-                name=(f"prefill-{attr_name}[L{layer_idx},E{source_eid}"
-                      f"->P{pool_slot}:E{destination_eid}]"),
-                direction=attr_direction,
-            ))
+            tasks.append(
+                H2DCopyTask(
+                    source=source,
+                    destination=dst,
+                    nbytes=nbytes,
+                    name=(f"prefill-{attr_name}[L{layer_idx},E{source_eid}->P{pool_slot}:E{destination_eid}]"),
+                )
+            )
         return tasks
 
-    def _refresh_prefill_fp32_scale(self, pool_slot: int,
-                                    num_experts: int) -> None:
-        if (pool_slot >= len(self._prefill_w13_scale_fp32)
-                or pool_slot >= len(self._prefill_w13_scale)):
+    def _refresh_prefill_fp32_scale(self, pool_slot: int, num_experts: int) -> None:
+        if pool_slot >= len(self._prefill_w13_scale_fp32) or pool_slot >= len(self._prefill_w13_scale):
             return
-        count = min(num_experts,
-                    self._prefill_w13_scale[pool_slot].shape[0])
+        count = min(num_experts, self._prefill_w13_scale[pool_slot].shape[0])
         for eid in range(count):
             self._prefill_w13_scale_fp32[pool_slot][eid].copy_(
-                self._prefill_w13_scale[pool_slot][eid].to(torch.float32),
-                non_blocking=True)
+                self._prefill_w13_scale[pool_slot][eid].to(torch.float32), non_blocking=True
+            )
+
+    def _init_prefill_pool_data(self, dev, ntotal: int, ndl: int):
+        """Load layer 0 weights into all prefill pool slots.
+
+        Prefill pool tensors are already NZ-cast at this point (done in
+        create_prefill_pool). Route the initial full overwrite through the
+        configured H2D transport, just like runtime prefill/decode loading.
+        """
+        del dev
+        num_source_experts = min(ntotal, len(self.w13_weights_cpu[0]))
+        with torch_npu.npu.stream(self.load_stream):
+            for slot in range(ndl):
+                tasks = []
+                for local_eid in range(num_source_experts):
+                    source_eid = self._shard_base + local_eid if self.offload_config.shard_per_rank else local_eid
+                    tasks.extend(self._build_prefill_h2d_tasks(0, slot, source_eid, local_eid))
+                self._get_h2d_transport().copy_batch(tasks)
+                self._refresh_prefill_fp32_scale(slot, num_source_experts)
+            self._synchronize_h2d()
+
+    def _prefill_load_layer(self, layer_idx: int, log2phy: torch.Tensor):
+        """Load experts for model layer layer_idx into the prefill pool.
+
+        For W8A8: loads into normal-format scratch, then casts to NZ.
+        For unquantized: loads directly into pool tensors via copy_().
+        Pool slot = layer_idx % ndl.  No slot_owner tracking needed —
+        log2phy is set to identity for prefill.
+
+        With ``prefill_delta_load`` / ``prefill_split_gmm``
+        (prefill expert paging) the load becomes residency-aware:
+
+        * experts resident in the decode pool (``log2phy[eid] >= 0``) are
+          copied D2D from their decode slot (split mode: not loaded at all —
+          the split GMM reads them in place);
+        * experts already held by this pool slot from an earlier forward of
+          the SAME layer are skipped entirely (weights are immutable);
+        * everything else is H2D from the pinned CPU buffers.
+
+        NOTE: Do NOT modify the layer's own log2phy here — decode path
+        relies on it staying with 32-expert mapping.  Prefill path in
+        apply() explicitly uses self._prefill_log2phy instead.
+        """
+        ndl = self.num_device_layers
+        pool_slot = layer_idx % ndl
+        ntotal = self.num_total_experts
+        is_w8a8 = self._prefill_w13[pool_slot].dtype == torch.int8
+
+        split = self.offload_config.prefill_split_gmm
+        delta = self.offload_config.prefill_delta_load or split
+
+        if self._debug:
+            logger.info(
+                "[PREFILL_LOAD] layer=%d pool_slot=%d ntotal=%d is_w8a8=%s delta=%s split=%s",
+                layer_idx, pool_slot, ntotal, is_w8a8, delta, split,
+            )
+
+        # Split mode reads the decode slots LIVE during the GMM, so the
+        # residency must be re-captured every forward even when the pool
+        # itself is already up to date (decode LRC may have swapped experts
+        # between prefill forwards).  FUSED_MC2 fuses dispatch+MLP+combine
+        # and cannot be row-split — fall back to a full (non-holey) pool.
+        if split:
+            from vllm_ascend.ascend_forward_context import MoECommType
+
+            if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
+                split = False
+                delta = delta and self.offload_config.prefill_delta_load
+
+        owner_hit = delta and self._prefill_pool_owner[pool_slot] == layer_idx
+        residency = None
+        if delta and (split or not owner_hit):
+            # Decode-pool residency for THIS layer, host side.  log2phy
+            # tracks the decode slots (hot-expert preload initially, LRC
+            # swaps when decode runs on this card); on a PD-split P node it
+            # stays at the initial hot set.  One small synchronous D2H per
+            # layer per forward, on the already-synchronizing load path.
+            residency = log2phy.detach().to("cpu", non_blocking=False)
+            self._prefill_residency_host[layer_idx] = residency
+
+        if owner_hit:
+            # Same model layer re-loaded into the same pool slot: expert
+            # weights are immutable, so every pool expert is already in
+            # place — zero copies (scales included).
+            if self._debug:
+                logger.info(
+                    "[PREFILL_DELTA] layer=%d pool=%d all %d experts already resident, no copies",
+                    layer_idx, pool_slot, ntotal,
+                )
+            return
+
+        tasks, n_h2d, n_d2d, n_skip = self._build_prefill_load_tasks(layer_idx, pool_slot, residency)
+        # Split the batch by direction: the resident-expert D2D copies
+        # (decode slots -> pool) go to a side stream and overlap the
+        # pinned H2D copies on the load stream.  The two sets write
+        # disjoint expert rows of the same pool slot, so the only ordering
+        # needed is the join below, ahead of the fp32-scale refresh and
+        # the host sync.
+        d2d_tasks = [t for t in tasks if t.direction == CopyDirection.D2D]
+        h2d_tasks = [t for t in tasks if t.direction != CopyDirection.D2D]
+        d2d_evt = None
+        if d2d_tasks:
+            # Anchor the D2D stream at the load stream's current queue
+            # position so anything the load stream was already ordered
+            # after also orders these decode-slot reads.
+            entry_evt = torch_npu.npu.Event()
+            self.load_stream.record_event(entry_evt)
+            with torch_npu.npu.stream(self._prefill_d2d_stream):
+                self._prefill_d2d_stream.wait_event(entry_evt)
+                self._get_h2d_transport().copy_batch(d2d_tasks)
+                d2d_evt = torch_npu.npu.Event()
+                self._prefill_d2d_stream.record_event(d2d_evt)
+        with torch_npu.npu.stream(self.load_stream):
+            if d2d_evt is not None:
+                self.load_stream.wait_event(d2d_evt)
+            self._get_h2d_transport().copy_batch(h2d_tasks)
+            self._refresh_prefill_fp32_scale(pool_slot, ntotal)
+            self._synchronize_h2d()
+        self._prefill_pool_owner[pool_slot] = layer_idx
+
+        if self._debug:
+            logger.info(
+                "[PREFILL_DELTA] layer=%d pool=%d h2d=%d d2d=%d skip_resident=%d split=%s par_d2d=%s",
+                layer_idx, pool_slot, n_h2d, n_d2d, n_skip, split, d2d_evt is not None,
+            )
+
+    def _build_prefill_load_tasks(self, layer_idx: int, pool_slot: int, residency):
+        """Build the (delta-aware) copy tasks that fill pool_slot for
+        layer_idx.  Returns (tasks, n_h2d, n_d2d, n_skip)."""
+        ntotal = self.num_total_experts
+        split = self.offload_config.prefill_split_gmm
+        tasks = []
+        n_h2d = n_d2d = n_skip = 0
+        for eid in range(ntotal):
+            src_slot = int(residency[eid]) if residency is not None else -1
+            if src_slot >= 0:
+                if split:
+                    # Split mode: resident experts are read in place from
+                    # their decode slots by GMM-1; the pool keeps a hole at
+                    # this id (group_list count 0 keeps the GMM away).
+                    n_skip += 1
+                    continue
+                tasks.extend(self._build_prefill_local_d2d_tasks(layer_idx, pool_slot, src_slot, eid, eid))
+                n_d2d += 1
+                continue
+            tasks.extend(self._build_prefill_h2d_tasks(layer_idx, pool_slot, eid, eid))
+            n_h2d += 1
+        return tasks, n_h2d, n_d2d, n_skip
 
     def _build_prefill_local_d2d_tasks(
         self,
@@ -2408,10 +1914,10 @@ class ExpertOffloadManager:
         """Build same-rank prefill copies without typed weight ``copy_``.
 
         The 950DT aclnn-only runtime rejects ``Tensor.copy_`` when the weight
-        tensor carries an internal format.  The existing single-card path
-        avoids that dispatch by copying the raw weight storages.  Keep the
-        same representation for same-rank multi-card D2D; quantization
-        metadata remains ordinary-format typed tensors.
+        tensor carries an internal format.  The single-card path avoids that
+        dispatch by copying the raw weight storages.  Keep the same
+        representation for the resident-expert D2D; quantization metadata
+        remains ordinary-format typed tensors.
         """
         layer = self.moe_layers[layer_idx]
         tasks = []
@@ -2422,31 +1928,44 @@ class ExpertOffloadManager:
         for name, prefill_buffers, nbytes in weight_specs:
             start = destination_slot * nbytes
             source = self._expert_device_storage(layer, source_slot, name)
-            destination = prefill_buffers[pool_slot].untyped_storage()[
-                start:start + nbytes]
-            tasks.append(H2DCopyTask(
-                source=source,
-                destination=destination,
-                nbytes=nbytes,
-                name=(f"prefill-local-d2d-{name}[L{layer_idx},"
-                      f"E{expert_id},S{source_slot}->P{pool_slot}:"
-                      f"E{destination_slot}]"),
-                direction=CopyDirection.D2D,
-            ))
+            destination = prefill_buffers[pool_slot].untyped_storage()[start : start + nbytes]
+            tasks.append(
+                H2DCopyTask(
+                    source=source,
+                    destination=destination,
+                    nbytes=nbytes,
+                    name=(
+                        f"prefill-local-d2d-{name}[L{layer_idx},"
+                        f"E{expert_id},S{source_slot}->P{pool_slot}:"
+                        f"E{destination_slot}]"
+                    ),
+                    direction=CopyDirection.D2D,
+                )
+            )
 
         for name, source, destination in self._prefill_device_components(
-                layer_idx, pool_slot, source_slot, destination_slot,
-                include_weights=False):
-            tasks.append(H2DCopyTask(
-                source=source,
-                destination=destination,
-                nbytes=source.numel() * source.element_size(),
-                name=(f"prefill-local-d2d-{name}[L{layer_idx},"
-                      f"E{expert_id},S{source_slot}->P{pool_slot}:"
-                      f"E{destination_slot}]"),
-                direction=CopyDirection.D2D,
-            ))
+            layer_idx, pool_slot, source_slot, destination_slot, include_weights=False
+        ):
+            tasks.append(
+                H2DCopyTask(
+                    source=source,
+                    destination=destination,
+                    nbytes=source.numel() * source.element_size(),
+                    name=(
+                        f"prefill-local-d2d-{name}[L{layer_idx},"
+                        f"E{expert_id},S{source_slot}->P{pool_slot}:"
+                        f"E{destination_slot}]"
+                    ),
+                    direction=CopyDirection.D2D,
+                )
+            )
         return tasks
+
+    def _expert_device_storage(self, layer, slot: int, which: str):
+        """Return one decode slot's raw device bytes without changing layout."""
+        size = self.w13_expert_size_bytes if which == "w13" else self.w2_expert_size_bytes
+        start = slot * size
+        return _expert_weight(layer, f"{which}_weight").data.untyped_storage()[start : start + size]
 
     def _prefill_device_components(
         self,
@@ -2457,16 +1976,24 @@ class ExpertOffloadManager:
         *,
         include_weights: bool = True,
     ) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
-        """Return matching typed views for local or buffered prefill copies."""
+        """Return matching typed views for local prefill copies."""
         layer = self.moe_layers[layer_idx]
         components = []
         if include_weights:
-            components.extend([
-                ("w13", _expert_weight(layer, "w13_weight").data[source_slot],
-                 self._prefill_w13[pool_slot][destination_slot]),
-                ("w2", _expert_weight(layer, "w2_weight").data[source_slot],
-                 self._prefill_w2[pool_slot][destination_slot]),
-            ])
+            components.extend(
+                [
+                    (
+                        "w13",
+                        _expert_weight(layer, "w13_weight").data[source_slot],
+                        self._prefill_w13[pool_slot][destination_slot],
+                    ),
+                    (
+                        "w2",
+                        _expert_weight(layer, "w2_weight").data[source_slot],
+                        self._prefill_w2[pool_slot][destination_slot],
+                    ),
+                ]
+            )
         quant_specs = (
             ("w13_weight_scale", self._prefill_w13_scale),
             ("w2_weight_scale", self._prefill_w2_scale),
@@ -2479,664 +2006,178 @@ class ExpertOffloadManager:
             source = getattr(layer, attr_name, None)
             if source is None or pool_slot >= len(prefill_buffers):
                 continue
-            components.append((
-                attr_name,
-                source.data[source_slot],
-                prefill_buffers[pool_slot][destination_slot],
-            ))
+            components.append(
+                (attr_name, source.data[source_slot], prefill_buffers[pool_slot][destination_slot])
+            )
         for name, source, destination in components:
             if source.shape != destination.shape or source.dtype != destination.dtype:
                 raise RuntimeError(
                     "Prefill copies require matching expert tensors: "
                     f"layer={layer_idx}, name={name}, "
                     f"source={tuple(source.shape)}/{source.dtype}, "
-                    f"destination={tuple(destination.shape)}/{destination.dtype}")
-        return components
-
-    def _prefill_peer_components(
-        self,
-        layer_idx: int,
-        pool_slot: int,
-        source_slot: int,
-        destination_slot: int,
-    ) -> list[_PrefillPeerComponent]:
-        """Return ordered sources and destinations for one remote expert.
-
-        Weight components always use raw storage because their typed tensors
-        may carry an Ascend internal format. Quantization metadata remains
-        typed because layouts such as MXFP4 scale are non-contiguous after
-        reshape+transpose and require a stride-aware local copy.
-        """
-        layer = self.moe_layers[layer_idx]
-        components: list[_PrefillPeerComponent] = []
-        weight_specs = (
-            ("w13", self._prefill_w13, self.w13_expert_size_bytes),
-            ("w2", self._prefill_w2, self.w2_expert_size_bytes),
-        )
-        for name, prefill_buffers, nbytes in weight_specs:
-            destination_start = destination_slot * nbytes
-            components.append(_PrefillPeerComponent(
-                name=name,
-                source=self._expert_device_storage(
-                    layer, source_slot, name),
-                destination=prefill_buffers[pool_slot].untyped_storage()[
-                    destination_start:destination_start + nbytes],
-                nbytes=nbytes,
-            ))
-
-        for name, source, destination in self._prefill_device_components(
-                layer_idx, pool_slot, source_slot, destination_slot,
-                include_weights=False):
-            components.append(_PrefillPeerComponent(
-                name=name,
-                source=source,
-                destination=destination,
-                nbytes=source.numel() * source.element_size(),
-                dtype=source.dtype,
-                shape=tuple(source.shape),
-                element_size=source.element_size(),
-            ))
-        return components
-
-    @staticmethod
-    def _layout_prefill_peer_components(
-        entries: list[tuple[int, _PrefillPeerComponent]],
-    ) -> tuple[list[tuple[int, _PrefillPeerComponent, int]], int]:
-        """Assign deterministic, dtype-aligned byte offsets to components."""
-        layout = []
-        offset = 0
-        for eid, component in entries:
-            alignment = component.element_size
-            if alignment <= 0:
-                raise ValueError(
-                    "Prefill communication component alignment must be "
-                    f"positive: name={component.name}, alignment={alignment}")
-            offset = ((offset + alignment - 1) // alignment) * alignment
-            layout.append((eid, component, offset))
-            offset += component.nbytes
-        return layout, offset
-
-    @classmethod
-    def _prefill_peer_plan_signature(
-        cls,
-        entries: list[tuple[int, _PrefillPeerComponent]],
-    ) -> tuple[int, int, str]:
-        """Return a compact deterministic signature for one peer payload."""
-        chunks = cls._chunk_prefill_peer_components(
-            entries, _EXCLUSIVE_PREFILL_P2P_CHUNK_BYTES)
-        description = tuple(
-            (
-                chunk_idx,
-                chunk_bytes,
-                tuple(
-                    (
-                        eid,
-                        component.name,
-                        offset,
-                        component.nbytes,
-                        (str(component.dtype)
-                         if component.uses_typed_copy else "raw"),
-                        component.shape,
-                        component.element_size,
-                    )
-                    for eid, component, offset in layout
-                ),
-            )
-            for chunk_idx, (layout, chunk_bytes) in enumerate(chunks)
-        )
-        digest = hashlib.sha256(repr(description).encode("utf-8")).hexdigest()
-        return (
-            sum(chunk_bytes for _, chunk_bytes in chunks),
-            sum(len(layout) for layout, _ in chunks),
-            digest,
-        )
-
-    @classmethod
-    def _chunk_prefill_peer_components(
-        cls,
-        entries: list[tuple[int, _PrefillPeerComponent]],
-        max_chunk_bytes: int,
-    ) -> list[
-        tuple[list[tuple[int, _PrefillPeerComponent, int]], int]]:
-        """Split one peer payload into bounded, independently aligned chunks.
-
-        A single component is never split because typed metadata must retain
-        its complete shape. Such a component may exceed the soft limit; real
-        expert weight and metadata components are much smaller than the
-        default limit.
-        """
-        if max_chunk_bytes <= 0:
-            raise ValueError(
-                "Prefill P2P chunk size must be positive; "
-                f"got {max_chunk_bytes}")
-        chunks = []
-        current_entries = []
-        for entry in entries:
-            candidate_entries = current_entries + [entry]
-            _, candidate_bytes = cls._layout_prefill_peer_components(
-                candidate_entries)
-            if current_entries and candidate_bytes > max_chunk_bytes:
-                chunks.append(cls._layout_prefill_peer_components(
-                    current_entries))
-                current_entries = [entry]
-            else:
-                current_entries = candidate_entries
-        if current_entries:
-            chunks.append(cls._layout_prefill_peer_components(
-                current_entries))
-        return chunks
-
-    def _validate_prefill_peer_plans(
-        self,
-        dist,
-        cpu_group,
-        layer_idx: int,
-        send_components: dict[
-            int, list[tuple[int, _PrefillPeerComponent]]],
-        recv_components: dict[
-            int, list[tuple[int, _PrefillPeerComponent]]],
-    ) -> None:
-        """Collectively reject asymmetric P2P plans before entering HCCL.
-
-        A send and its matching receive must have the same expert/component
-        order, byte offsets, dtypes and shapes. Checking a compact digest on
-        the CPU group turns a potential HCCL size mismatch or silent metadata
-        corruption into a deterministic initialization error.
-        """
-        local_plan = {
-            "send": {
-                peer: self._prefill_peer_plan_signature(entries)
-                for peer, entries in sorted(send_components.items())
-            },
-            "recv": {
-                peer: self._prefill_peer_plan_signature(entries)
-                for peer, entries in sorted(recv_components.items())
-            },
-        }
-        gathered_plans = [None] * self.ep_size
-        dist.all_gather_object(
-            gathered_plans, local_plan, group=cpu_group)
-
-        errors = []
-        for source_rank, plan in enumerate(gathered_plans):
-            if (not isinstance(plan, dict)
-                    or not isinstance(plan.get("send"), dict)
-                    or not isinstance(plan.get("recv"), dict)):
-                errors.append(
-                    f"rank {source_rank} published an invalid plan: {plan!r}")
-                continue
-            for destination_rank, signature in plan["send"].items():
-                if not isinstance(destination_rank, int) or not (
-                        0 <= destination_rank < self.ep_size):
-                    errors.append(
-                        f"rank {source_rank} has invalid send peer "
-                        f"{destination_rank!r}")
-                    continue
-                peer_plan = gathered_plans[destination_rank]
-                peer_signature = (
-                    peer_plan.get("recv", {}).get(source_rank)
-                    if isinstance(peer_plan, dict) else None)
-                if signature != peer_signature:
-                    errors.append(
-                        f"send R{source_rank}->R{destination_rank} "
-                        f"{signature!r} != recv {peer_signature!r}")
-            for source_peer, signature in plan["recv"].items():
-                if not isinstance(source_peer, int) or not (
-                        0 <= source_peer < self.ep_size):
-                    errors.append(
-                        f"rank {source_rank} has invalid recv peer "
-                        f"{source_peer!r}")
-                    continue
-                peer_plan = gathered_plans[source_peer]
-                peer_signature = (
-                    peer_plan.get("send", {}).get(source_rank)
-                    if isinstance(peer_plan, dict) else None)
-                if signature != peer_signature:
-                    errors.append(
-                        f"recv R{source_peer}->R{source_rank} "
-                        f"{signature!r} != send {peer_signature!r}")
-        if errors:
-            raise RuntimeError(
-                "Cross-rank prefill communication plans do not match: "
-                f"layer={layer_idx}; " + "; ".join(errors[:8]))
-
-    @staticmethod
-    def _prefill_comm_component_view(
-        buffer: torch.Tensor,
-        offset: int,
-        component: _PrefillPeerComponent,
-    ):
-        """Return raw or typed local-copy view into a uint8 peer buffer."""
-        if component.uses_typed_copy:
-            dtype = component.dtype
-            shape = component.shape
-            if (dtype is None or shape is None
-                    or component.nbytes % component.element_size != 0):
-                raise RuntimeError(
-                    "Invalid typed prefill communication component: "
-                    f"name={component.name}, dtype={dtype}, shape={shape}, "
-                    f"nbytes={component.nbytes}, "
-                    f"element_size={component.element_size}")
-            if offset % component.element_size != 0:
-                raise RuntimeError(
-                    "Misaligned typed prefill communication component: "
-                    f"name={component.name}, offset={offset}, "
-                    f"element_size={component.element_size}")
-            byte_view = buffer.narrow(0, offset, component.nbytes)
-            return byte_view.view(dtype).reshape(shape)
-        return buffer.untyped_storage()[
-            offset:offset + component.nbytes]
-
-    def _get_exclusive_prefill_comm_buffer(
-        self,
-        direction: str,
-        peer_rank: int,
-        required_bytes: int,
-        device,
-    ) -> torch.Tensor:
-        """Return a zero-offset contiguous uint8 NPU buffer for one peer."""
-        if required_bytes <= 0:
-            raise ValueError(
-                "Prefill communication buffer size must be positive; "
-                f"got {required_bytes}")
-        buffers = getattr(self, "_exclusive_prefill_comm_buffers", None)
-        if buffers is None:
-            buffers = {}
-            self._exclusive_prefill_comm_buffers = buffers
-        key = (direction, peer_rank)
-        buffer = buffers.get(key)
-        if (buffer is None or buffer.numel() < required_bytes
-                or buffer.device != device):
-            # Drop an undersized cached allocation before requesting the
-            # larger one so chunk growth does not retain both buffers.
-            buffers.pop(key, None)
-            buffer = None
-            buffer = torch.empty(
-                required_bytes, dtype=torch.uint8, device=device)
-            buffers[key] = buffer
-        communication_view = buffer[:required_bytes]
-        if (communication_view.dtype != torch.uint8
-                or not communication_view.is_contiguous()
-                or communication_view.storage_offset() != 0):
-            raise RuntimeError(
-                "Invalid cross-rank prefill communication buffer: "
-                f"direction={direction}, peer={peer_rank}, "
-                f"dtype={communication_view.dtype}, "
-                f"contiguous={communication_view.is_contiguous()}, "
-                f"storage_offset={communication_view.storage_offset()}")
-        return communication_view
-
-    def _get_exclusive_prefill_pyhccl(self, ep_group, device):
-        """Collectively create the raw-pointer EP P2P communicator."""
-        communicator = getattr(self, "_exclusive_prefill_pyhccl", None)
-        if communicator is not None:
-            if (not communicator.available or communicator.disabled):
-                raise RuntimeError(
-                    "Exclusive prefill PyHCCL communicator is closed")
-            if communicator.device != device:
-                raise RuntimeError(
-                    "Exclusive prefill PyHCCL communicator device changed: "
-                    f"expected={communicator.device}, actual={device}")
-            return communicator
-
-        from torch import distributed as dist
-        from vllm_ascend.distributed.device_communicators.pyhccl import (
-            PyHcclCommunicator,
-        )
-        from vllm_ascend.distributed.device_communicators.pyhccl_wrapper import (  # noqa: E501
-            HCCLLibrary,
-        )
-
-        local_error = None
-        try:
-            library = HCCLLibrary()
-            if not library.supports_batch_send_recv:
-                local_error = "HcclBatchSendRecv symbol is missing"
-        except BaseException as exc:
-            local_error = f"{type(exc).__name__}: {exc}"
-        availability = [None] * self.ep_size
-        dist.all_gather_object(
-            availability, local_error, group=ep_group.cpu_group)
-        failures = [
-            f"rank={rank} {error}"
-            for rank, error in enumerate(availability)
-            if error is not None
-        ]
-        if failures:
-            raise RuntimeError(
-                "Raw-pointer prefill P2P is unavailable: "
-                + "; ".join(failures))
-
-        communicator = PyHcclCommunicator(
-            ep_group.cpu_group, device=device)
-        if (not communicator.available or communicator.disabled
-                or not communicator.hccl.supports_batch_send_recv):
-            communicator.close()
-            raise RuntimeError(
-                "Multi-card exclusive prefill requires the raw-pointer "
-                "HcclBatchSendRecv API on every EP rank")
-        self._exclusive_prefill_pyhccl = communicator
-        logger.info(
-            "[PREFILL-D2D] initialized raw-pointer PyHCCL communicator "
-            "on %s across %d EP ranks",
-            device, self.ep_size)
-        return communicator
-
-    def _prefill_load_layer_shard_exclusive_shared(
-        self,
-        layer_idx: int,
-        pool_slot: int,
-    ) -> None:
-        """Load one static EP shard using CPU H2D and raw-pointer HCCL P2P.
-
-        CPU-owned experts read the compact shared mmap. Same-rank NPU weights
-        use the single-card raw-storage D2D representation. Cross-rank NPU
-        components are packed into base-format, zero-offset uint8 NPU buffers,
-        transferred through ``HcclBatchSendRecv`` on the same load stream,
-        then unpacked into the destination prefill pool. Weights use raw
-        storage; metadata uses typed local views to preserve non-contiguous
-        layouts. This read-only snapshot does not change canonical ownership
-        or the decode log2phy mapping.
-        """
-        from torch import distributed as dist
-        from vllm.distributed.parallel_state import get_ep_group
-
-        if not self._shared_h2d_layer_ready(layer_idx):
-            raise RuntimeError(
-                "Exclusive shared prefill cannot run before the compact "
-                f"shared CPU layer is finalized: layer={layer_idx}")
-        ep_group = get_ep_group()
-        group_ranks = getattr(ep_group, "ranks", None)
-        if (getattr(ep_group, "cpu_group", None) is None
-                or group_ranks is None
-                or len(group_ranks) != self.ep_size):
-            raise RuntimeError(
-                "Multi-card exclusive prefill requires a complete EP CPU "
-                "group; CPU weight fallback is disabled")
-        comm_lock = getattr(self, "_exclusive_prefill_comm_lock", None)
-        if comm_lock is None:
-            comm_lock = threading.Lock()
-            self._exclusive_prefill_comm_lock = comm_lock
-        layer_lock = self._exclusive_layer_locks[layer_idx]
-        with comm_lock, layer_lock:
-            device = self._prefill_w13[pool_slot].device
-            pyhccl = self._get_exclusive_prefill_pyhccl(
-                ep_group, device)
-
-            shard = self.mc_shard_size
-            per_rank_slots = (
-                self.offload_config.num_device_experts_for_rank(
-                    layer_idx, self.ep_size))
-            local_tasks: list[H2DCopyTask] = []
-            send_components: dict[
-                int, list[tuple[int, _PrefillPeerComponent]]] = {}
-            recv_components: dict[
-                int, list[tuple[int, _PrefillPeerComponent]]] = {}
-            remote_experts = 0
-            for eid in range(self.num_total_experts):
-                destination_rank = eid // shard
-                destination_slot = eid % shard
-                physical_slot = self._eid_to_npu_slot[layer_idx][eid]
-                if physical_slot < 0:
-                    # CPU-owned: shared mmap -> pinned staging -> raw NPU
-                    # storage.
-                    if destination_rank == self.ep_rank:
-                        local_tasks.extend(self._build_prefill_h2d_tasks(
-                            layer_idx, pool_slot, eid, destination_slot))
-                    continue
-
-                source_rank = physical_slot // per_rank_slots
-                source_slot = physical_slot % per_rank_slots
-                if source_rank == destination_rank:
-                    # Same-rank NPU-owned: preserve the single-card raw D2D
-                    # path.
-                    if source_rank == self.ep_rank:
-                        local_tasks.extend(
-                            self._build_prefill_local_d2d_tasks(
-                                layer_idx, pool_slot, source_slot,
-                                destination_slot, eid))
-                    continue
-
-                remote_experts += 1
-                if self.ep_rank not in (source_rank, destination_rank):
-                    continue
-                peer_rank = (destination_rank
-                             if self.ep_rank == source_rank else source_rank)
-                peer_components = (
-                    send_components if self.ep_rank == source_rank
-                    else recv_components)
-                entries = peer_components.setdefault(peer_rank, [])
-                entries.extend(
-                    (eid, component)
-                    for component in self._prefill_peer_components(
-                        layer_idx, pool_slot, source_slot,
-                        destination_slot)
+                    f"destination={tuple(destination.shape)}/{destination.dtype}"
                 )
+        return components
 
-            self._validate_prefill_peer_plans(
-                dist, ep_group.cpu_group, layer_idx,
-                send_components, recv_components)
+    def get_prefill_resident_slots(self, layer_idx: int) -> torch.Tensor:
+        """Device int32 [ntotal]: decode slot index per expert, -1 if the
+        expert is not in this layer's decode pool.  Consumed by the split-GMM
+        path (prefill_split.PrefillSplitCtx) to partition dispatch rows.
 
-            send_chunks = {
-                peer: self._chunk_prefill_peer_components(
-                    entries, _EXCLUSIVE_PREFILL_P2P_CHUNK_BYTES)
-                for peer, entries in sorted(send_components.items())
-            }
-            recv_chunks = {
-                peer: self._chunk_prefill_peer_components(
-                    entries, _EXCLUSIVE_PREFILL_P2P_CHUNK_BYTES)
-                for peer, entries in sorted(recv_components.items())
-            }
-            num_rounds = max(
-                [len(chunks) for chunks in send_chunks.values()]
-                + [len(chunks) for chunks in recv_chunks.values()]
-                + [1])
-            total_pack_tasks = sum(
-                len(layout)
-                for chunks in send_chunks.values()
-                for layout, _ in chunks)
-            total_unpack_tasks = sum(
-                len(layout)
-                for chunks in recv_chunks.values()
-                for layout, _ in chunks)
-            total_p2p_ops = sum(map(len, send_chunks.values()))
-            total_p2p_ops += sum(map(len, recv_chunks.values()))
-            if self._debug:
-                local_h2d_tasks = sum(
-                    task.direction == CopyDirection.H2D
-                    for task in local_tasks)
-                local_d2d_tasks = sum(
-                    task.direction == CopyDirection.D2D
-                    for task in local_tasks)
-                raw_storage_d2d_tasks = sum(
-                    task.direction == CopyDirection.D2D
-                    and not isinstance(task.source, torch.Tensor)
-                    and not isinstance(task.destination, torch.Tensor)
-                    for task in local_tasks)
-                send_bytes = ",".join(
-                    f"{peer}:{sum(size for _, size in chunks)}"
-                    for peer, chunks in send_chunks.items()) or "-"
-                recv_bytes = ",".join(
-                    f"{peer}:{sum(size for _, size in chunks)}"
-                    for peer, chunks in recv_chunks.items()) or "-"
-                peak_send_chunk = max(
-                    (size for chunks in send_chunks.values()
-                     for _, size in chunks), default=0)
-                peak_recv_chunk = max(
-                    (size for chunks in recv_chunks.values()
-                     for _, size in chunks), default=0)
-                typed_pack_tasks = sum(
-                    component.uses_typed_copy
-                    for entries in send_components.values()
-                    for _, component in entries)
-                typed_unpack_tasks = sum(
-                    component.uses_typed_copy
-                    for entries in recv_components.values()
-                    for _, component in entries)
-                logger.info(
-                    "[PREFILL-D2D-PLAN] layer=%d rank=%d h2d_tasks=%d "
-                    "local_d2d_tasks=%d raw_storage_d2d_tasks=%d "
-                    "pack_tasks=%d unpack_tasks=%d p2p_ops=%d rounds=%d "
-                    "typed_pack_tasks=%d typed_unpack_tasks=%d "
-                    "send_bytes_by_peer=%s recv_bytes_by_peer=%s "
-                    "chunk_limit=%d peak_send_chunk=%d peak_recv_chunk=%d "
-                    "global_remote_experts=%d",
-                    layer_idx, self.ep_rank, local_h2d_tasks,
-                    local_d2d_tasks, raw_storage_d2d_tasks,
-                    total_pack_tasks, total_unpack_tasks, total_p2p_ops,
-                    num_rounds, typed_pack_tasks, typed_unpack_tasks,
-                    send_bytes, recv_bytes,
-                    _EXCLUSIVE_PREFILL_P2P_CHUNK_BYTES,
-                    peak_send_chunk, peak_recv_chunk, remote_experts)
-
-            for round_idx in range(num_rounds):
-                pack_tasks: list[H2DCopyTask] = []
-                unpack_tasks: list[H2DCopyTask] = []
-                send_buffers: dict[int, torch.Tensor] = {}
-                recv_buffers: dict[int, torch.Tensor] = {}
-                for peer_rank, chunks in send_chunks.items():
-                    if round_idx >= len(chunks):
-                        continue
-                    layout, total_bytes = chunks[round_idx]
-                    buffer = self._get_exclusive_prefill_comm_buffer(
-                        "send", peer_rank, total_bytes, device)
-                    send_buffers[peer_rank] = buffer
-                    for eid, component, offset in layout:
-                        pack_tasks.append(H2DCopyTask(
-                            source=component.source,
-                            destination=self._prefill_comm_component_view(
-                                buffer, offset, component),
-                            nbytes=component.nbytes,
-                            name=(f"prefill-p2p-pack-{component.name}"
-                                  f"[L{layer_idx},E{eid},"
-                                  f"R{self.ep_rank}->R{peer_rank}]"),
-                            direction=CopyDirection.D2D,
-                        ))
-                for peer_rank, chunks in recv_chunks.items():
-                    if round_idx >= len(chunks):
-                        continue
-                    layout, total_bytes = chunks[round_idx]
-                    buffer = self._get_exclusive_prefill_comm_buffer(
-                        "recv", peer_rank, total_bytes, device)
-                    recv_buffers[peer_rank] = buffer
-                    for eid, component, offset in layout:
-                        unpack_tasks.append(H2DCopyTask(
-                            source=self._prefill_comm_component_view(
-                                buffer, offset, component),
-                            destination=component.destination,
-                            nbytes=component.nbytes,
-                            name=(f"prefill-p2p-unpack-{component.name}"
-                                  f"[L{layer_idx},E{eid},"
-                                  f"R{peer_rank}->R{self.ep_rank}]"),
-                            direction=CopyDirection.D2D,
-                        ))
-
-                with torch_npu.npu.stream(self.load_stream):
-                    round_local_tasks = (
-                        local_tasks if round_idx == 0 else [])
-                    self._get_h2d_transport().copy_batch(
-                        round_local_tasks + pack_tasks)
-                    if send_buffers or recv_buffers:
-                        # pack -> HCCL -> unpack use one stream. This avoids
-                        # treating ProcessGroup Work.wait() as a cross-stream
-                        # dependency for the receive buffer.
-                        pyhccl.batch_send_recv(
-                            send_buffers, recv_buffers,
-                            stream=self.load_stream)
-                    self._get_h2d_transport().copy_batch(unpack_tasks)
-                    # The next round reuses the same bounded buffers.
-                    self._synchronize_h2d()
-                del pack_tasks, unpack_tasks
-                if send_buffers or recv_buffers:
-                    del buffer
-                del send_buffers, recv_buffers
-
-            with torch_npu.npu.stream(self.load_stream):
-                self._refresh_prefill_fp32_scale(pool_slot, shard)
-            self._synchronize_h2d()
-            dist.barrier(group=ep_group.cpu_group)
-            if self._debug:
-                logger.info(
-                    "[PREFILL-D2D] layer=%d rank=%d local_tasks=%d "
-                    "pack_tasks=%d unpack_tasks=%d p2p_ops=%d "
-                    "rounds=%d global_remote_experts=%d",
-                    layer_idx, self.ep_rank, len(local_tasks),
-                    total_pack_tasks, total_unpack_tasks, total_p2p_ops,
-                    num_rounds, remote_experts)
-
-    def _init_prefill_pool_data(self, dev, ntotal: int, ndl: int):
-        """Load layer 0 weights into all prefill pool slots.
-
-        Prefill pool tensors are already NZ-cast at this point (done in
-        create_prefill_pool). Route the initial full overwrite through the
-        configured H2D transport, just like runtime prefill/decode loading.
+        Uses the host residency captured by the last delta prefill load of
+        this layer; falls back to reading the live log2phy when the layer was
+        loaded by the legacy full-overwrite path.
         """
-        del dev
-        if self.exclusive_shared_cpu_enabled:
-            for slot in range(ndl):
-                self._prefill_load_layer_shard_exclusive_shared(0, slot)
-            return
-        if self.exclusive_sharded_cpu_enabled:
-            with torch_npu.npu.stream(self.load_stream):
-                for slot in range(ndl):
-                    self._load_prefill_shard_from_local_ownership(0, slot)
-                self._synchronize_h2d()
-            return
-        if self.exclusive_dynamic_enabled:
-            source_eids = list(range(ntotal))
-        else:
-            num_source_experts = min(ntotal, len(self.w13_weights_cpu[0]))
-            source_eids = [
-                (self._shard_base + local_eid
-                 if self.offload_config.shard_per_rank else local_eid)
-                for local_eid in range(num_source_experts)
-            ]
-        lock = (self._exclusive_layer_locks[0]
-                if self.exclusive_dynamic_enabled else nullcontext())
-        with lock:
-            with torch_npu.npu.stream(self.load_stream):
-                for slot in range(ndl):
-                    tasks = []
-                    for destination_eid, source_eid in enumerate(source_eids):
-                        tasks.extend(self._build_prefill_h2d_tasks(
-                            0, slot, source_eid, destination_eid))
-                    self._get_h2d_transport().copy_batch(tasks)
-                    self._refresh_prefill_fp32_scale(
-                        slot, len(source_eids))
-                self._synchronize_h2d()
+        host = self._prefill_residency_host.get(layer_idx)
+        if host is None:
+            layer = self.moe_layers[layer_idx]
+            host = layer.log2phy.detach().to("cpu", non_blocking=False)
+            self._prefill_residency_host[layer_idx] = host
+        dev = self._prefill_w13[layer_idx % self.num_device_layers].device
+        return host.to(device=dev, dtype=torch.int32, non_blocking=True)
 
-    def _prefill_load_layer(self, layer_idx: int, log2phy: torch.Tensor):
-        """Load ALL experts for model layer layer_idx into the prefill pool.
+    # ------------------------------------------------------------------ #
+    #  Prefill load pipeline: slot events, blocking fallback, async kick  #
+    # ------------------------------------------------------------------ #
+    def _prefill_join_load(self, layer_idx: int) -> bool:
+        """Join the pending async pool load for this layer's slot, if this
+        exact layer was prefetched into it.  True => pool ready."""
+        pool_slot = layer_idx % self.num_device_layers
+        if self._prefill_slot_load_target.get(pool_slot) != layer_idx:
+            return False
+        evt = self._prefill_slot_load_done.get(pool_slot)
+        if evt is not None:
+            torch_npu.npu.current_stream().wait_event(evt)
+        self._prefill_slot_load_target[pool_slot] = -1
+        return True
 
-        For W8A8: loads into normal-format scratch, then casts to NZ.
-        For unquantized: loads directly into pool tensors via copy_().
-        Full-overwrite into pool_slot = layer_idx % ndl.  No slot_owner
-        tracking needed — log2phy is set to identity for prefill.
+    def _prefill_residency_for(self, layer_idx: int):
+        """Host residency mirror for layer_idx; D2H once and cache."""
+        host = self._prefill_residency_host.get(layer_idx)
+        if host is None:
+            layer = self.moe_layers[layer_idx]
+            host = layer.log2phy.detach().to("cpu", non_blocking=False)
+            self._prefill_residency_host[layer_idx] = host
+        return host
+
+    def _prefill_pipe_active(self) -> bool:
+        """Pipelined prefill loads are available whenever the prefill pool
+        is in use: _prefill_kick_load relies only on the slot-event table."""
+        return self._prefill_initialized and not self._skip_prefill
+
+    def _prefill_pipe_update(self, layer_idx: int) -> None:
+        """update_weights prefill branch, pipelined.
+
+        Nothing here may block the host: stage the NEXT layer's residency
+        D2H non-blockingly (submitted before the slot join so the tiny copy
+        is not parked behind the whole load window), record a compute event
+        for the next kick's overwrite safety, then join this layer's slot
+        event (or fall back to the blocking load on cold start / pipeline
+        break).  The next load is kicked from on_prefill_layer_done(layer_idx)
+        — after the GMM is submitted — so the kick's host work (task build
+        + copy submission) overlaps the GMM execution instead of stalling
+        the layer boundary.
         """
-        ndl = self.num_device_layers
-        pool_slot = layer_idx % ndl
-        ntotal = self.num_total_experts
-        is_w8a8 = self._prefill_w13[pool_slot].dtype == torch.int8
+        next_idx = layer_idx + 1
+        if next_idx < len(self.moe_layers):
+            # Fresh residency: the decode LRC may have swapped slots since
+            # any cached mirror was written (e.g. across chunked prefill
+            # chunks), so the D2H is mandatory — staged BEFORE the slot
+            # join (else the compute-stream wait would park this tiny copy
+            # behind the whole load window) and blocking-deferred to the
+            # post-GMM hook.
+            self._prefill_stage_residency(next_idx)
+        comp_evt = torch_npu.npu.Event()
+        torch_npu.npu.current_stream().record_event(comp_evt)
+        self._pipe_comp_evt = comp_evt
+        if not self._prefill_join_load(layer_idx):
+            if self._debug:
+                logger.info("[PREFILL_PIPE] layer=%d not prefetched, blocking fallback", layer_idx)
+            self._prefill_load_layer(layer_idx, self.moe_layers[layer_idx].log2phy)
 
+    def _prefill_stage_residency(self, layer_idx: int) -> None:
+        """Stage layer_idx's decode-pool residency D2H non-blockingly on
+        the current (compute) stream; on_prefill_layer_done consumes it
+        (event wait + mirror publish) before kicking the next load."""
+        if self._pipe_stage_h is None:
+            self._pipe_stage_h = torch.zeros(
+                self.num_total_experts, dtype=torch.int32, device="cpu", pin_memory=True
+            )
+        if self._pipe_stage_evt is not None:
+            # A previous stage may still be in flight (its consumer hook
+            # never ran, e.g. an aborted forward); retire it before reuse.
+            self._pipe_stage_evt.synchronize()
+        self._pipe_stage_h.copy_(self.moe_layers[layer_idx].log2phy, non_blocking=True)
+        evt = torch_npu.npu.Event()
+        torch_npu.npu.current_stream().record_event(evt)
+        self._pipe_stage_evt = evt
+        self._pipe_stage_layer = layer_idx
+
+    def _prefill_kick_load(self, layer_idx: int, wait_event=None) -> None:
+        """Asynchronously fill pool_slot for layer_idx on the load stream.
+
+        Delta-aware (same task builder as the blocking path).  ``wait_event``
+        (a compute event recorded after the consuming layer's slot join) is
+        joined on the load stream so this load cannot overwrite a pool slot
+        the compute stream may still be reading.
+        """
+        pool_slot = layer_idx % self.num_device_layers
+        residency = self._prefill_residency_for(layer_idx)
+        with torch_npu.npu.stream(self.load_stream):
+            if wait_event is not None:
+                self.load_stream.wait_event(wait_event)
+            tasks, _, _, _ = self._build_prefill_load_tasks(layer_idx, pool_slot, residency)
+            self._get_h2d_transport().copy_batch(tasks)
+            self._refresh_prefill_fp32_scale(pool_slot, self.num_total_experts)
+            evt = torch_npu.npu.Event()
+            self.load_stream.record_event(evt)
+        self._prefill_slot_load_done[pool_slot] = evt
+        self._prefill_slot_load_target[pool_slot] = layer_idx
+        self._prefill_pool_owner[pool_slot] = layer_idx
         if self._debug:
-            logger.info("[PREFILL_LOAD] layer=%d pool_slot=%d ntotal=%d is_w8a8=%s",
-                        layer_idx, pool_slot, ntotal, is_w8a8)
+            logger.info("[PREFILL_PIPE] kicked load layer=%d slot=%d", layer_idx, pool_slot)
 
-        lock = (self._exclusive_layer_locks[layer_idx]
-                if self.exclusive_dynamic_enabled else nullcontext())
-        with lock:
-            with torch_npu.npu.stream(self.load_stream):
-                tasks = []
-                for eid in range(ntotal):
-                    tasks.extend(self._build_prefill_h2d_tasks(
-                        layer_idx, pool_slot, eid, eid))
-                self._get_h2d_transport().copy_batch(tasks)
-                self._refresh_prefill_fp32_scale(pool_slot, ntotal)
-                self._synchronize_h2d()
+    def on_prefill_layer_done(self, layer) -> None:
+        """Post-GMM hook (called by the quant methods after the prefill GMM
+        submitted).  Publish the staged next-layer residency (its D2H ran
+        under the GMM submit) and kick the NEXT layer's load here —
+        post-GMM-submit — so the kick's host work overlaps the GMM
+        execution instead of stalling the layer boundary."""
+        try:
+            layer_idx = self.moe_layers.index(layer)
+        except ValueError:
+            return
+        if torch.npu.is_current_stream_capturing():
+            # Capture dummy run: consuming the staged D2H (event sync) or
+            # kicking the next load would operate on a capturing stream.
+            # Leave pipe state pending; the next eager forward resumes it.
+            return
+        if not self._prefill_pipe_active():
+            return
+        # Plain pipeline: the staged D2H (submitted in _prefill_pipe_update
+        # before the slot join) has by now executed under the GMM submit;
+        # publish the mirror and kick the next load.
+        next_idx = layer_idx + 1
+        if next_idx >= len(self.moe_layers):
+            return
+        if self._pipe_stage_layer == next_idx and self._pipe_stage_evt is not None:
+            self._pipe_stage_evt.synchronize()
+            self._prefill_residency_host[next_idx] = self._pipe_stage_h.clone()
+            self._pipe_stage_layer = -1
+            self._pipe_stage_evt = None
+        elif next_idx not in self._prefill_residency_host:
+            # Stage missed (hook ordering surprise): fresh blocking D2H.
+            next_layer = self.moe_layers[next_idx]
+            self._prefill_residency_host[next_idx] = next_layer.log2phy.detach().to(
+                "cpu", non_blocking=False
+            )
+        comp_evt = self._pipe_comp_evt
+        self._pipe_comp_evt = None
+        # comp_evt covers everything the compute stream had done before this
+        # layer's slot join — including the previous GMM that read the pool
+        # slot this kick is about to overwrite.
+        self._prefill_kick_load(next_idx, wait_event=comp_evt)
 
-        # NOTE: Do NOT modify the layer's own log2phy here — decode path
-        # relies on it staying with 32-expert mapping.  Prefill path in
-        # apply() explicitly uses self._prefill_log2phy instead.
 
     # ------------------------------------------------------------------ #
     #  Multi-card prefill: per-rank EP shard into the prefill pool        #
@@ -3153,7 +2194,7 @@ class ExpertOffloadManager:
         dispatcher (it masks topk_ids to local via expert_map != -1 and uses
         active_expert_range = [rank*nel, rank*nel+nel]).
         """
-        if getattr(self, '_mc_shard_expert_map', None) is not None:
+        if getattr(self, "_mc_shard_expert_map", None) is not None:
             return self._mc_shard_expert_map
         shard = self.mc_shard_size
         base = self.ep_rank * shard
@@ -3179,26 +2220,11 @@ class ExpertOffloadManager:
         shard = self.mc_shard_size
         base = self.ep_rank * shard
 
-        if self.exclusive_shared_cpu_enabled:
-            self._prefill_load_layer_shard_exclusive_shared(
-                layer_idx, pool_slot)
-            return
-
-        if self.exclusive_sharded_cpu_enabled:
-            with self._exclusive_layer_locks[layer_idx]:
-                with torch_npu.npu.stream(self.load_stream):
-                    self._load_prefill_shard_from_local_ownership(
-                        layer_idx, pool_slot)
-                    self._synchronize_h2d()
-            return
-
-        if (self.offload_config.h2d_backend == "memfabric"
-                or self.torch_shared_cpu_weights_enabled):
+        if self.offload_config.h2d_backend == "memfabric":
             with torch_npu.npu.stream(self.load_stream):
                 tasks = []
                 for local_i, eid in enumerate(range(base, base + shard)):
-                    tasks.extend(self._build_prefill_h2d_tasks(
-                        layer_idx, pool_slot, eid, local_i))
+                    tasks.extend(self._build_prefill_h2d_tasks(layer_idx, pool_slot, eid, local_i))
                 self._get_h2d_transport().copy_batch(tasks)
                 self._refresh_prefill_fp32_scale(pool_slot, shard)
                 self._synchronize_h2d()
@@ -3207,29 +2233,46 @@ class ExpertOffloadManager:
         with torch_npu.npu.stream(self.load_stream):
             for local_i in range(shard):
                 eid = base + local_i
-                self._prefill_w13[pool_slot].untyped_storage()[local_i * self.w13_expert_size_bytes : (local_i + 1) * self.w13_expert_size_bytes].copy_(
-                    self._expert_src_storage(layer_idx, eid, 'w13'))
-                self._prefill_w2[pool_slot].untyped_storage()[local_i * self.w2_expert_size_bytes : (local_i + 1) * self.w2_expert_size_bytes].copy_(
-                    self._expert_src_storage(layer_idx, eid, 'w2'))
+                self._prefill_w13[pool_slot].untyped_storage()[
+                    local_i * self.w13_expert_size_bytes : (local_i + 1) * self.w13_expert_size_bytes
+                ].copy_(self._expert_src_storage(layer_idx, eid, "w13"))
+                self._prefill_w2[pool_slot].untyped_storage()[
+                    local_i * self.w2_expert_size_bytes : (local_i + 1) * self.w2_expert_size_bytes
+                ].copy_(self._expert_src_storage(layer_idx, eid, "w2"))
             # quant scales / offsets / scale_bias (w4a8) — shard only
-            for scale_name, prefill_list in [("w13_weight_scale", self._prefill_w13_scale),
-                                             ("w2_weight_scale", self._prefill_w2_scale)]:
-                if pool_slot < len(prefill_list) and scale_name in self.scale_cpu_buffers \
-                        and layer_idx < len(self.scale_cpu_buffers[scale_name]):
+            for scale_name, prefill_list in [
+                ("w13_weight_scale", self._prefill_w13_scale),
+                ("w2_weight_scale", self._prefill_w2_scale),
+            ]:
+                if (
+                    pool_slot < len(prefill_list)
+                    and scale_name in self.scale_cpu_buffers
+                    and layer_idx < len(self.scale_cpu_buffers[scale_name])
+                ):
                     for local_i in range(min(shard, len(self.scale_cpu_buffers[scale_name][layer_idx]))):
                         src = self.scale_cpu_buffers[scale_name][layer_idx][local_i]
                         prefill_list[pool_slot][local_i].copy_(src.reshape(prefill_list[pool_slot][local_i].shape))
-            for off_name, prefill_list in [("w13_weight_offset", self._prefill_w13_offset),
-                                           ("w2_weight_offset", self._prefill_w2_offset)]:
-                if pool_slot < len(prefill_list) and off_name in self.offset_cpu_buffers \
-                        and layer_idx < len(self.offset_cpu_buffers[off_name]):
+            for off_name, prefill_list in [
+                ("w13_weight_offset", self._prefill_w13_offset),
+                ("w2_weight_offset", self._prefill_w2_offset),
+            ]:
+                if (
+                    pool_slot < len(prefill_list)
+                    and off_name in self.offset_cpu_buffers
+                    and layer_idx < len(self.offset_cpu_buffers[off_name])
+                ):
                     for local_i in range(min(shard, len(self.offset_cpu_buffers[off_name][layer_idx]))):
                         src = self.offset_cpu_buffers[off_name][layer_idx][local_i]
                         prefill_list[pool_slot][local_i].copy_(src.reshape(prefill_list[pool_slot][local_i].shape))
-            for sb_name, prefill_list in [("w13_scale_bias", self._prefill_w13_scale_bias),
-                                          ("w2_scale_bias", self._prefill_w2_scale_bias)]:
-                if pool_slot < len(prefill_list) and sb_name in self.scale_bias_cpu_buffers \
-                        and layer_idx < len(self.scale_bias_cpu_buffers[sb_name]):
+            for sb_name, prefill_list in [
+                ("w13_scale_bias", self._prefill_w13_scale_bias),
+                ("w2_scale_bias", self._prefill_w2_scale_bias),
+            ]:
+                if (
+                    pool_slot < len(prefill_list)
+                    and sb_name in self.scale_bias_cpu_buffers
+                    and layer_idx < len(self.scale_bias_cpu_buffers[sb_name])
+                ):
                     for local_i in range(min(shard, len(self.scale_bias_cpu_buffers[sb_name][layer_idx]))):
                         src = self.scale_bias_cpu_buffers[sb_name][layer_idx][local_i]
                         prefill_list[pool_slot][local_i].copy_(src.reshape(prefill_list[pool_slot][local_i].shape))
@@ -3239,41 +2282,149 @@ class ExpertOffloadManager:
             # next op is queued).
             self._synchronize_h2d()
 
-    def _load_prefill_shard_from_local_ownership(
+    # ------------------------------------------------------------------ #
+    #  Forward path: page in experts based on topk_ids                   #
+    # ------------------------------------------------------------------ #
+
+    def _read_pf_wait(self, layer_idx: int):
+        """Milliseconds the compute stream was blocked at this layer's join.
+
+        Called from the reactive host callback, which is stream-ordered after
+        the `end` record, so under graph replay both timestamps are already
+        committed. The explicit `end.synchronize()` covers eager, where the
+        callback runs inline on the forward thread and the compute stream may
+        not have reached the record yet.
+
+        `_pf_wait_bias` is the calibrated cost of the bracket itself (see
+        _finalize_offload) and is subtracted so the number approximates the
+        stall alone rather than stall + instrument.
+
+        Returns None rather than raising: a device that cannot time events
+        inside a captured graph must degrade to "no samples", not kill the run.
+        An all-None series makes the summary row VANISH rather than print zeros
+        (decode_stats._summarize_series returns None for an empty series), so
+        the log lines below are the only way to tell "no stall measured" apart
+        from "feature never applied".
+        """
+        if not self._pf_wait_timing:
+            return None
+        if layer_idx >= len(self._pf_wait_armed):
+            return None
+        if not self._pf_wait_probed:
+            # One line, on the first read attempt of the run, that separates
+            # every failure mode at once: armed=0 means no layer had a wait node
+            # to bracket, armed=N with no later "first sample" line means
+            # elapsed_time is failing inside the graph.
+            self._pf_wait_probed = True
+            logger.info(
+                "[PREFETCH-WAIT] first read: layer=%d armed=%d/%d bias=%.4f ms",
+                layer_idx,
+                sum(self._pf_wait_armed),
+                len(self._pf_wait_armed),
+                self._pf_wait_bias,
+            )
+        if not self._pf_wait_armed[layer_idx]:
+            return None
+        try:
+            end = self._pf_wait_end[layer_idx]
+            end.synchronize()
+            raw = float(self._pf_wait_begin[layer_idx].elapsed_time(end))
+        except Exception:
+            self._pf_wait_fail += 1
+            if self._pf_wait_fail == 1:
+                # count and carry on. Latching _pf_wait_timing off here
+                # also stopped the RECORDING, and because the eager warmup runs
+                # before the capture, that silently emptied the captured graph.
+                logger.warning(
+                    "[PREFETCH-WAIT] elapsed_time failed; pf_wait samples will "
+                    "be dropped (recording left on so a warmup-only failure "
+                    "does not empty the captured graph)",
+                    exc_info=True,
+                )
+            return None
+        # Clamp: a stall shorter than the bracket's own cost is indistinguishable
+        # from no stall, and a negative millisecond in the summary is worse than
+        # a zero.
+        value = raw - self._pf_wait_bias
+        if value < 0.0:
+            value = 0.0
+        self._pf_wait_ok += 1
+        if self._pf_wait_ok == 1:
+            # Mirrors '[DECODE-STATS] first sample recorded' — a positive
+            # signal, so an empty summary row is never ambiguous.
+            logger.info(
+                "[PREFETCH-WAIT] first sample: layer=%d stall=%.3f ms (raw=%.3f bias=%.4f)",
+                layer_idx,
+                value,
+                raw,
+                self._pf_wait_bias,
+            )
+        return value
+
+    def _finish_pending_predict(self, layer_idx: int) -> None:
+        """Consume a trained predictor's in-flight prediction for this layer.
+
+        Called from update_weights and update_weights_multi_card as their first
+        act, before the prefetch event pop — the latest point at which the
+        prefetch can still be dispatched, and the first at which the real
+        routed experts are known.
+
+        It lives here rather than in the decoder layer because the decoder
+        layer's forward is traced by Dynamo (DeepseekV4Model is
+        @support_torch_compile with fullgraph) and nothing the driver's
+        finish() does is traceable. This method is on the apply() side, already
+        behind the MoE custom-op boundary — the same boundary that has always
+        made this class's own streams, locks and host callbacks safe.
+
+        All four apply() implementations call update_weights /
+        update_weights_multi_card unconditionally inside their
+        `enable_expert_offload` block, before any prefill-regime branch, and a
+        layer can only have launched if it is one of those layers — so the
+        launch/finish pairing is structural.
+
+        No-op with the heuristic method (no driver), and for hash layers and
+        any layer that did not launch (no pending entry).
+        """
+        predictor = self.expert_predictor
+        if predictor is not None:
+            predictor.finish(layer_idx)
+
+    def _finish_next_layer_predict(self, layer_idx: int, compute_stream) -> None:
+        """Dispatch a layer-shifted predictor's prediction for layer_idx + 1.
+
+        Called at the END of update_weights[_multi_card], after this layer's
+        reactive host callback has been enqueued. The event recorded here is the
+        ordering edge that keeps the prefetch H2D for layer_idx + 1 off the
+        report thread and off load_stream until layer_idx's on-demand load has
+        drained — the reactive callback internally synchronizes load_stream, so
+        the compute stream cannot reach this record until that transfer is done.
+
+        No-op for fate and for mode2_har (nothing is ever pending under the
+        next layer's key), and the event is only allocated when there is
+        something to dispatch, so neither method pays an extra Event per layer
+        per capture size.
+        """
+        predictor = self.expert_predictor
+        if predictor is None or not predictor.has_pending(layer_idx + 1):
+            return
+        ondemand_done = torch_npu.npu.Event()
+        compute_stream.record_event(ondemand_done)
+        predictor.finish(layer_idx + 1, ondemand_done)
+
+    def update_weights(
         self,
-        layer_idx: int,
-        pool_slot: int,
-    ) -> None:
-        """Fill this rank's prefill shard without any cross-rank weight read."""
-        shard = self.mc_shard_size
-        base = self.ep_rank * shard
-        tasks = []
-        for local_slot, eid in enumerate(range(base, base + shard)):
-            if (self._eid_to_cpu_slot[layer_idx][eid] < 0
-                    and self._eid_to_npu_slot[layer_idx][eid] < 0):
-                raise RuntimeError(
-                    "Rank-local exclusive prefill cannot read a remote or "
-                    "unowned expert: "
-                    f"rank={self.ep_rank}, layer={layer_idx}, expert={eid}")
-            tasks.extend(self._build_prefill_h2d_tasks(
-                layer_idx, pool_slot, eid, local_slot))
-        self._get_h2d_transport().copy_batch(tasks)
-        self._refresh_prefill_fp32_scale(pool_slot, shard)
-
-    # ------------------------------------------------------------------ #
-    #  Forward path: page in experts based on topk_ids                    #
-    # ------------------------------------------------------------------ #
-
-    def update_weights(self, layer, topk_ids: torch.Tensor,
-                        log2phy: torch.Tensor,
-                        topk_weights: torch.Tensor | None = None,
-                        hidden_states: torch.Tensor | None = None,
-                        router_logits: torch.Tensor | None = None,
-                        renormalize: bool = False,
-                        scoring_func: str = "softmax",
-                        e_score_correction_bias: torch.Tensor | None = None,
-                        routed_scaling_factor: float = 1.0,
-                        is_hash_routed: bool = False) -> int:
+        layer,
+        topk_ids: torch.Tensor,
+        log2phy: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+        router_logits: torch.Tensor | None = None,
+        renormalize: bool = False,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: torch.Tensor | None = None,
+        routed_scaling_factor: float = 1.0,
+        is_hash_routed: bool = False,
+    ) -> int:
         """Incrementally page in needed experts, overwriting unused slots.
 
         Routes to prefill pool (full-overwrite) when num_tokens exceeds
@@ -3290,6 +2441,37 @@ class ExpertOffloadManager:
         Returns: number of CPU→NPU copies performed (decode path),
                  0 for prefill path (full-overwrite via pool).
         """
+        try:
+            layer_idx = self.moe_layers.index(layer)
+        except ValueError:
+            return 0
+        self._finish_pending_predict(layer_idx)
+        # Wait for prefetch NPU copies to complete before using the weights.
+        # Use stream wait (graphable) instead of host synchronize.
+        with self._prefetch_state_lock:
+            npu_event = self._prefetch_layer_npu_event.pop(layer_idx, None)
+        if npu_event is not None:
+            wait_stream = torch_npu.npu.current_stream()
+            # Bracket the join with device events so the stall is measurable
+            # under graph replay, where no Python runs. Both records are graph
+            # nodes re-executed every replay; _read_pf_wait consumes them from
+            # the reactive callback. Nothing is recorded when the key is off.
+            if self._pf_wait_timing:
+                self._pf_wait_begin[layer_idx].record(wait_stream)
+            wait_stream.wait_event(npu_event)
+            if self._pf_wait_timing:
+                self._pf_wait_end[layer_idx].record(wait_stream)
+                self._pf_wait_armed[layer_idx] = True
+        elif (
+            self._pf_wait_timing
+            and layer_idx < len(self._pf_wait_armed)
+            # only a DECODE-regime call may clear the flag
+            and topk_ids.size(0) <= self.offload_threshold
+        ):
+            # No prefetch for this layer this step: no wait node exists, so
+            # there is nothing to time and the layer contributes no sample.
+            self._pf_wait_armed[layer_idx] = False
+
         # Multi-card offload sets routed layers' log2phy=None (standard-EP
         # dispatch) and uses update_weights_multi_card instead. Shared experts
         # (per-card replicated, not dispatched) may still reach here with
@@ -3299,31 +2481,52 @@ class ExpertOffloadManager:
             return 0
         num_tokens = topk_ids.size(0)
         if num_tokens > self.offload_threshold:
-            # Prefill: layerwise reuse + full-overwrite of all experts
-            if (self._prefill_initialized
-                    and not self._skip_prefill):
-                try:
-                    layer_idx = self.moe_layers.index(layer)
-                except ValueError:
-                    return 0
-                self._prefill_load_layer(layer_idx, log2phy)
+            # Prefill: layerwise reuse + (delta-aware) expert paging.
+            # Graph-capture dummy runs exceed offload_threshold once
+            # cudagraph sizes grow past it (max_num_seqs > threshold);
+            # the paging path issues blocking D2H/H2D which is illegal
+            # on a capturing stream — bail like the pool-not-ready case.
+            if (
+                self._prefill_initialized
+                and not self._skip_prefill
+                and not torch.npu.is_current_stream_capturing()
+            ):
+                # reuse the layer_idx resolved above
+                if self._prefill_pipe_active():
+                    # Pipelined: consume the prefetch or fall back, then
+                    # kick the next layer's load so it overlaps this layer's
+                    # GMM (compute hidden inside the next load window).
+                    self._prefill_pipe_update(layer_idx)
+                else:
+                    self._prefill_load_layer(layer_idx, log2phy)
                 return 0
             else:
                 # Profile run or pool not ready — bail out gracefully
                 return 0
 
-        try:
-            layer_idx = self.moe_layers.index(layer)
-        except ValueError:
-            return 0
-
-        # Wait for prefetch NPU copies to complete before using the weights.
-        # Use stream wait (graphable) instead of host synchronize.
-        with self._prefetch_state_lock:
-            npu_event = self._prefetch_layer_npu_event.pop(layer_idx, None)
-        if npu_event is not None:
-            torch_npu.npu.current_stream().wait_event(npu_event)
-
+        prune_debug = None
+        if self.offload_config.experts_pruning_enabled and topk_weights is not None:
+            logger.info_once(
+                "[EXPERT-PRUNE] entered NPU pruning path: topk=%d thresholds=%s",
+                self.topk,
+                tuple(self.offload_config.experts_pruning_threshold),
+            )
+            pruned_weights, pruned_ids, prune_debug = maybe_prune_topk_experts(
+                topk_weights,
+                topk_ids,
+                log2phy=log2phy,
+            )
+            # 必须原地写回，因为w4a8.py仍然持有原Tensor。
+            topk_weights.copy_(pruned_weights)
+            topk_ids.copy_(pruned_ids)
+        prune_debug_h = None
+        if prune_debug is not None:
+            prune_debug_npu = prune_debug.permute(1, 0, 2).contiguous()
+            prune_debug_h = self.prune_debug_h[:num_tokens]
+            prune_debug_h.copy_(
+                prune_debug_npu,
+                non_blocking=_EXTRA_CTX.capturing,
+            )
         topk_ids_h = self.topk_ids_h[:num_tokens]
         do_substitution = (
             self.offload_config.expert_substitution_enabled
@@ -3331,30 +2534,50 @@ class ExpertOffloadManager:
             and router_logits is not None
             and router_logits.shape[-1] == self.num_total_experts
         )
-        if (self.offload_config.expert_substitution_enabled
-                and not is_hash_routed and router_logits is not None
-                and router_logits.shape[-1] != self.num_total_experts):
+        if (
+            self.offload_config.expert_substitution_enabled
+            and not is_hash_routed
+            and router_logits is not None
+            and router_logits.shape[-1] != self.num_total_experts
+        ):
             logger.warning_once(
                 "[SUBST] router_logits width %d != num_total_experts %d; "
                 "expert substitution is disabled for this layer",
-                router_logits.shape[-1], self.num_total_experts)
+                router_logits.shape[-1],
+                self.num_total_experts,
+            )
 
         topk_weights_h = None
-        if (topk_weights is not None and self.cache_policy is not None
-                and self.offload_config.cache_router_weight != 0):
+        if topk_weights is not None and self.cache_policy is not None and self.offload_config.cache_router_weight != 0:
             topk_weights_h = self.topk_weights_h[:num_tokens]
             topk_weights_h.copy_(topk_weights.to(dtype=torch.float32), non_blocking=_EXTRA_CTX.capturing)
-        router_logits_h = None
-        correction_bias_h = None
+        # substitution now runs on the NPU
+        # Replaces the router_logits_h / e_score_correction_bias_h staging (an
+        # [n, 256] fp32 D2H per layer per step) and the whole
+        # plan_expert_substitutions Python block
+        topk_ids_gt_h = None
         if do_substitution:
-            router_logits_h = self.router_logits_h[:num_tokens]
-            router_logits_h.copy_(router_logits.to(dtype=torch.float32),
-                                  non_blocking=_EXTRA_CTX.capturing)
-            if e_score_correction_bias is not None:
-                correction_bias_h = self.e_score_correction_bias_h
-                correction_bias_h.copy_(
-                    e_score_correction_bias.to(dtype=torch.float32),
-                    non_blocking=_EXTRA_CTX.capturing)
+            if self.topk_ids_gt_h is not None:
+                # Ground truth G for hit_pre / pred_acc / subst (§3.6), staged
+                # BEFORE the mutation below. Deliberately NOT gated on
+                # stats.collecting the way the old host clone was: this line is
+                # captured, so a branch on a flag that flips at arming time
+                # would be frozen to whatever it was at capture. 72 bytes.
+                topk_ids_gt_h = self.topk_ids_gt_h[:num_tokens]
+                topk_ids_gt_h.copy_(topk_ids[:, : self.topk], non_blocking=_EXTRA_CTX.capturing)
+            substituted_ids = substitute_experts_device(
+                router_logits,
+                topk_ids[:, : self.topk],
+                log2phy,
+                expert_substitution_threshold=(self.offload_config.expert_substitution_threshold),
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+            )
+            # In-place so every downstream consumer (log2phy gather, dispatch,
+            # GMM) sees the substituted ids. The previous code mutated this
+            # same tensor the same way, just after the callback instead of
+            # before. Same stream, so the gt D2H above reads pre-mutation.
+            topk_ids[:, : self.topk].copy_(substituted_ids)
         log2phy_h = self.log2phy_h
         log2phy_np = self.log2phy_np
         topk_ids_h.copy_(topk_ids, non_blocking=_EXTRA_CTX.capturing)
@@ -3366,6 +2589,10 @@ class ExpertOffloadManager:
             torch_npu.npu._subscribe_report(current_compute_stream)
             subscribed_compute_streams.add(current_compute_stream)
         self._is_prefetch = False
+        # router_logits_h / scoring_func / correction_bias_h
+        # are gone (the callback no longer substitutes); topk_ids_gt_h carries
+        # the pre-substitution ids the statistics need. The 6-tuple prefetch
+        # form built by _build_prefetch_call is unchanged.
         args = (
             topk_ids_h,
             log2phy_np,
@@ -3374,23 +2601,27 @@ class ExpertOffloadManager:
             topk_weights_h,
             self._is_prefetch,
             do_substitution,
-            router_logits_h,
-            scoring_func,
-            correction_bias_h,
+            topk_ids_gt_h,
+            prune_debug_h,
         )
+        # launch the guarded wrapper — see _note_cb_failure.
         if _EXTRA_CTX.capturing:
             torch_npu.npu._launch_host_func(
                 current_compute_stream,
-                self._update_weights,
+                self._update_weights_guarded,
                 args,
             )
         else:
-            self._update_weights(args)
+            self._update_weights_guarded(args)
 
-        if do_substitution:
-            topk_ids[:, :self.topk].copy_(topk_ids_h[:, :self.topk],
-                                          non_blocking=True)
+        # The substituted ids were written into topk_ids on the device above,
+        # so this H2D write-back has nothing left to publish.
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
+
+        # dispatch a layer-shifted predictor's prediction for the NEXT
+        # layer here, behind an event recorded after this layer's on-demand
+        # load. No-op for fate and mode2_har.
+        self._finish_next_layer_predict(layer_idx, current_compute_stream)
 
     def _mc_handle_prefill_regime(self, layer_idx) -> bool:
         """Multi-card PREFILL (non-MC2 comm): load this rank's EP shard into the
@@ -3402,24 +2633,9 @@ class ExpertOffloadManager:
         because its AllGather reuses decode weights; multi-card All2All cannot).
         """
         from vllm_ascend.ascend_forward_context import MoECommType
+
         if _EXTRA_CTX.moe_comm_type == MoECommType.MC2:
             return False
-        if (layer_idx == 0
-                and getattr(self, "_mc_graph_callbacks_registered", False)):
-            # An ACL graph replay returns control before every queued host
-            # callback is necessarily finished.  Drain the compute stream at
-            # the MC2 -> ALLTOALL boundary before prefill starts touching the
-            # shared expert ownership state or entering its CPU barriers.  Do
-            # this once per forward (the first registered MoE layer), not once
-            # per layer, so decode remains fully asynchronous and prefill pays
-            # only one transition synchronization.
-            torch_npu.npu.synchronize()
-            if self._debug:
-                logger.info(
-                    "[MC_MODE_SYNC] rank=%s drained decode graph callbacks "
-                    "before ALLTOALL prefill",
-                    self.ep_rank,
-                )
         if self._prefill_initialized:
             self._prefill_load_layer_shard(layer_idx)
             if self._debug and logger.isEnabledFor(logging.DEBUG):
@@ -3428,8 +2644,13 @@ class ExpertOffloadManager:
                     "[MC_OBS] rank=%s L=%s PREFILL: loaded EP shard "
                     "experts[%d..%d] (%d experts) into pool on rank%d "
                     "(static shard, reloaded each prefill forward)",
-                    self.ep_rank, layer_idx, base, base + self.mc_shard_size - 1,
-                    self.mc_shard_size, self.ep_rank)
+                    self.ep_rank,
+                    layer_idx,
+                    base,
+                    base + self.mc_shard_size - 1,
+                    self.mc_shard_size,
+                    self.ep_rank,
+                )
         return True
 
     def _log_mc_debug_event(self, event: str, context=None, **details) -> None:
@@ -3437,8 +2658,7 @@ class ExpertOffloadManager:
         if not self._debug:
             return
         context = context or {}
-        details_text = " ".join(
-            f"{key}={value}" for key, value in details.items())
+        details_text = " ".join(f"{key}={value}" for key, value in details.items())
         logger.info(
             "[MC_DEBUG] event=%s rank=%s layer=%s layer_call=%s "
             "callback_seq=%s source=%s prefetch=%s pid=%s thread=%s "
@@ -3456,61 +2676,7 @@ class ExpertOffloadManager:
             details_text,
         )
 
-    def log_exclusive_sharded_numeric(self, layer, tensor: object,
-                                      stage: str) -> None:
-        """Report the first finite result and every non-finite local result.
-
-        This diagnostic is deliberately limited to rank-local exclusive mode.
-        ``item()`` synchronizes the NPU, which is acceptable under
-        ``moe_offload_debug`` while validating an eager path but is forbidden
-        while ACL Graph capture is active. Diagnostics must not abort model
-        startup if a caller accidentally passes a result wrapper.
-        """
-        if not self._debug or not self.exclusive_sharded_cpu_enabled:
-            return
-        try:
-            layer_idx = self.moe_layers.index(layer)
-        except ValueError:
-            return
-        if not isinstance(tensor, torch.Tensor):
-            logger.warning(
-                "[EXCLUSIVE-SHARDED-NUMERIC] rank=%d/%d layer=%d stage=%s "
-                "input_type=%s status=skip reason=not_tensor",
-                self.ep_rank, self.ep_size, layer_idx, stage,
-                type(tensor).__name__)
-            return
-        if bool(getattr(_EXTRA_CTX, "capturing", False)):
-            logger.info_once(
-                "[EXCLUSIVE-SHARDED-NUMERIC] skip NPU value inspection "
-                "during ACL Graph capture; other offload debug diagnostics "
-                "remain enabled")
-            return
-        nonfinite = int((~torch.isfinite(tensor)).sum().item())
-        comm_type = getattr(_EXTRA_CTX.moe_comm_type, "name",
-                            _EXTRA_CTX.moe_comm_type)
-        if nonfinite:
-            logger.warning(
-                "[EXCLUSIVE-SHARDED-NUMERIC] rank=%d/%d layer=%d stage=%s "
-                "comm=%s shape=%s dtype=%s total=%d nonfinite=%d status=fail",
-                self.ep_rank, self.ep_size, layer_idx, stage, comm_type,
-                tuple(tensor.shape), tensor.dtype, tensor.numel(), nonfinite)
-            return
-        seen = getattr(self, "_exclusive_sharded_numeric_seen", None)
-        if seen is None:
-            seen = set()
-            self._exclusive_sharded_numeric_seen = seen
-        key = (layer_idx, stage, str(comm_type))
-        if key in seen:
-            return
-        seen.add(key)
-        logger.info(
-            "[EXCLUSIVE-SHARDED-NUMERIC] rank=%d/%d layer=%d stage=%s "
-            "comm=%s shape=%s dtype=%s total=%d nonfinite=0 status=ok",
-            self.ep_rank, self.ep_size, layer_idx, stage, comm_type,
-            tuple(tensor.shape), tensor.dtype, tensor.numel())
-
-    def _log_mc_debug_schedule(self, layer_idx: int,
-                               is_prefetch: bool) -> None:
+    def _log_mc_debug_schedule(self, layer_idx: int, is_prefetch: bool) -> None:
         if not self._debug:
             return
         with self._mc_debug_lock:
@@ -3526,8 +2692,7 @@ class ExpertOffloadManager:
             schedule_seq=schedule_seq,
         )
 
-    def _begin_mc_debug_callback(self, layer_idx: int, is_prefetch: bool,
-                                 from_graph_callback: bool):
+    def _begin_mc_debug_callback(self, layer_idx: int, is_prefetch: bool, from_graph_callback: bool):
         if not self._debug:
             return None
         with self._mc_debug_lock:
@@ -3542,21 +2707,18 @@ class ExpertOffloadManager:
             "layer_idx": layer_idx,
             "layer_call": layer_call,
             "callback_seq": callback_seq,
-            "source": ("graph_callback" if from_graph_callback
-                       else "eager_inline"),
+            "source": ("graph_callback" if from_graph_callback else "eager_inline"),
             "is_prefetch": is_prefetch,
             "start_ns": time.perf_counter_ns(),
         }
-        self._log_mc_debug_event(
-            "CB_ENTER", context, active_callbacks=active_callbacks)
+        self._log_mc_debug_event("CB_ENTER", context, active_callbacks=active_callbacks)
         return context
 
     def _end_mc_debug_callback(self, context, status: str) -> None:
         if context is None:
             return
         with self._mc_debug_lock:
-            self._mc_debug_active_callbacks = max(
-                0, self._mc_debug_active_callbacks - 1)
+            self._mc_debug_active_callbacks = max(0, self._mc_debug_active_callbacks - 1)
             active_callbacks = self._mc_debug_active_callbacks
         elapsed_us = (time.perf_counter_ns() - context["start_ns"]) // 1000
         self._log_mc_debug_event(
@@ -3567,15 +2729,12 @@ class ExpertOffloadManager:
             elapsed_us=elapsed_us,
         )
 
-    def _gather_cpu_with_mc_debug(self, local_values, cpu_group, kind: str,
-                                  context):
+    def _gather_cpu_with_mc_debug(self, local_values, cpu_group, kind: str, context):
         """Wrap one Gloo all-reduce with enter/exit sequence diagnostics."""
-        from vllm_ascend.expert_offload.multi_card_planner import (
-            gather_global_counts_cpu)
+        from vllm_ascend.expert_offload.multi_card_planner import gather_global_counts_cpu
 
         if context is None:
-            return self._run_mc_cpu_collective(
-                gather_global_counts_cpu, local_values, cpu_group)
+            return gather_global_counts_cpu(local_values, cpu_group)
         with self._mc_debug_lock:
             self._mc_debug_collective_seq += 1
             collective_seq = self._mc_debug_collective_seq
@@ -3593,8 +2752,7 @@ class ExpertOffloadManager:
             numel=local_values.numel(),
         )
         try:
-            global_values = self._run_mc_cpu_collective(
-                gather_global_counts_cpu, local_values, cpu_group)
+            global_values = gather_global_counts_cpu(local_values, cpu_group)
         except BaseException as exc:
             self._log_mc_debug_event(
                 "GLOO_ERROR",
@@ -3614,80 +2772,21 @@ class ExpertOffloadManager:
         )
         return global_values
 
-    def _initialize_mc_runtime_collectives(self) -> None:
-        """Create an isolated, serial Gloo lane for decode graph callbacks.
-
-        Every distributed worker iterates over the complete EP group list in
-        the same order, matching vLLM's process-group construction contract.
-        The selected local group is used only by dynamic decode placement;
-        initialization and ALLTOALL prefill keep using the ordinary EP CPU
-        group, so their collectives cannot interleave with graph callbacks.
-        """
-        if (not self.enable_multi_card or self.ep_size <= 1
-                or self._mc_runtime_cpu_group is not None):
-            return
-
-        import torch.distributed as dist
-        from vllm.distributed.parallel_state import get_ep_group
-        from vllm.distributed.utils import (
-            get_cpu_distributed_timeout_or_none,
-        )
-
-        if not dist.is_initialized():
-            raise RuntimeError(
-                "Distributed runtime must be initialized before creating "
-                "the expert-offload decode CPU group")
-        ep_group = get_ep_group()
-        global_rank = dist.get_rank()
-        selected_group = None
-        timeout = get_cpu_distributed_timeout_or_none()
-        for ranks in ep_group.group_ranks:
-            group = dist.new_group(ranks, backend="gloo", timeout=timeout)
-            if global_rank in ranks:
-                selected_group = group
-        if selected_group is None:
-            raise RuntimeError(
-                f"Global rank {global_rank} is absent from every EP group")
-
-        self._mc_runtime_cpu_group = selected_group
-        self._mc_collective_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="offload-gloo")
-        # Start the worker before graph capture. Creating a Python thread from
-        # an ACL host callback is avoidable and has produced runtime-dependent
-        # scheduling behaviour under sustained graph replay.
-        self._mc_collective_thread_id = self._mc_collective_executor.submit(
-            threading.get_ident).result()
-        logger.info(
-            "[EXPERT-OFFLOAD] initialized isolated decode Gloo group: "
-            "rank=%d/%d group=%s collective_thread=%s",
-            self.ep_rank, self.ep_size,
-            getattr(selected_group, "group_name", "none"),
-            self._mc_collective_thread_id,
-        )
-
-    def _run_mc_cpu_collective(self, operation, *args, **kwargs):
-        """Run one decode CPU collective on the manager's serial worker.
-
-        Unit tests and partial initialization paths intentionally fall back to
-        an inline call. Production multi-card runtime initializes the executor
-        before profile/capture in :meth:`_finalize_offload`.
-        """
-        executor = getattr(self, "_mc_collective_executor", None)
-        graph_callbacks_registered = getattr(
-            self, "_mc_graph_callbacks_registered", False)
-        if executor is None or not graph_callbacks_registered:
-            return operation(*args, **kwargs)
-        return executor.submit(operation, *args, **kwargs).result()
-
-    def update_weights_multi_card(self, layer, topk_ids, log2phy,
-                                  topk_weights=None, hidden_states=None,
-                                  mc2_mask=None,
-                                  router_logits=None,
-                                  renormalize=False,
-                                  scoring_func="softmax",
-                                  e_score_correction_bias=None,
-                                  routed_scaling_factor=1.0,
-                                  is_hash_routed=False):
+    def update_weights_multi_card(
+        self,
+        layer,
+        topk_ids,
+        log2phy,
+        topk_weights=None,
+        hidden_states=None,
+        mc2_mask=None,
+        router_logits=None,
+        renormalize=False,
+        scoring_func="softmax",
+        e_score_correction_bias=None,
+        routed_scaling_factor=1.0,
+        is_hash_routed=False,
+    ):
         """Multi-card EP offload: planner decides global placement; this rank
         H2D-loads only its assigned experts and writes the placement into
         ``log2phy`` (which the MC2 dispatcher then consumes).
@@ -3701,6 +2800,7 @@ class ExpertOffloadManager:
             layer_idx = self.moe_layers.index(layer)
         except ValueError:
             return
+        self._finish_pending_predict(layer_idx)
         # Wait for this layer's prefetch (if any) to finish H2D before reading
         # the device slots — mirror the single-card update_weights stream-join
         # (graphable: stream wait_event, not host sync). Without it the reactive
@@ -3708,7 +2808,21 @@ class ExpertOffloadManager:
         with self._prefetch_state_lock:
             npu_event = self._prefetch_layer_npu_event.pop(layer_idx, None)
         if npu_event is not None:
-            torch_npu.npu.current_stream().wait_event(npu_event)
+            wait_stream = torch_npu.npu.current_stream()
+            if self._pf_wait_timing:
+                self._pf_wait_begin[layer_idx].record(wait_stream)
+            wait_stream.wait_event(npu_event)
+            if self._pf_wait_timing:
+                self._pf_wait_end[layer_idx].record(wait_stream)
+                self._pf_wait_armed[layer_idx] = True
+        elif (
+            self._pf_wait_timing
+            and layer_idx < len(self._pf_wait_armed)
+            # decode-regime calls only
+            and topk_ids.size(0) <= self.offload_threshold
+        ):
+            self._pf_wait_armed[layer_idx] = False
+
         num_tokens = topk_ids.size(0)
 
         # NOTE: the decode profile dummy must use the real dynamic placement
@@ -3718,8 +2832,8 @@ class ExpertOffloadManager:
         # CPU topk_ids_h, not the live NPU tensor).
 
         # PREFILL regime: the MC2 dispatch kernel caps at 512 tokens, so prefill
-        # uses ALLTOALL + a per-rank EP shard loaded into the prefill pool
-        # (selected by select_moe_comm_method -> ALLTOALL for multi-card large
+        # uses AllGather + a per-rank EP shard loaded into the prefill pool
+        # (selected by select_moe_comm_method -> ALLGATHER for multi-card large
         # batches). Drive off the comm TYPE (MC2=decode, else prefill) — the
         # single source of truth — so this stays in lockstep with apply().
         if self._mc_handle_prefill_regime(layer_idx):
@@ -3731,14 +2845,12 @@ class ExpertOffloadManager:
         # callback (_launch_host_func, re-executed every replay with the current
         # topk) or inline (eager), H2D log2phy back. The host callback's
         # load_stream.synchronize() gates the compute stream until H2D is done.
-        # Cross-rank planning uses the dedicated decode Gloo group because
-        # HCCL all_reduce cannot be captured and the planner needs host data.
-        # The callback submits collectives to one serial CPU worker, keeping
-        # them off the ACL report thread and isolated from prefill barriers.
-        # Every EP rank must still enter them in the same callback order;
-        # MC_DEBUG traces that ordering.
-        per_rank_slots = self.offload_config.num_device_experts_for_rank(
-            layer_idx, self.ep_size)
+        # The cross-rank expert-count all_reduce uses gloo cpu_group
+        # (get_ep_group().cpu_group), while HCCL all_reduce cannot be a captured
+        # graph op and the planner needs the counts on host. Every EP rank must
+        # still enter the Gloo collectives in exactly the same order; MC_DEBUG
+        # traces that ordering across graph host callbacks.
+        per_rank_slots = self.offload_config.num_device_experts_for_rank(layer_idx, self.ep_size)
         topk_ids_h = self.topk_ids_h[:num_tokens]
         log2phy_h = self.log2phy_h
         topk_ids_h.copy_(topk_ids, non_blocking=_EXTRA_CTX.capturing)
@@ -3749,25 +2861,28 @@ class ExpertOffloadManager:
             and router_logits is not None
             and router_logits.shape[-1] == self.num_total_experts
         )
-        if (self.offload_config.expert_substitution_enabled
-                and not is_hash_routed and router_logits is not None
-                and router_logits.shape[-1] != self.num_total_experts):
+        if (
+            self.offload_config.expert_substitution_enabled
+            and not is_hash_routed
+            and router_logits is not None
+            and router_logits.shape[-1] != self.num_total_experts
+        ):
             logger.warning_once(
                 "[SUBST-MC] router_logits width %d != num_total_experts %d; "
                 "expert substitution is disabled for this layer",
-                router_logits.shape[-1], self.num_total_experts)
+                router_logits.shape[-1],
+                self.num_total_experts,
+            )
         router_logits_h = None
         correction_bias_h = None
         if do_substitution:
             router_logits_h = self.router_logits_h[:num_tokens]
-            router_logits_h.copy_(
-                router_logits.to(dtype=torch.float32),
-                non_blocking=_EXTRA_CTX.capturing)
+            router_logits_h.copy_(router_logits.to(dtype=torch.float32), non_blocking=_EXTRA_CTX.capturing)
             if e_score_correction_bias is not None:
                 correction_bias_h = self.e_score_correction_bias_h
                 correction_bias_h.copy_(
-                    e_score_correction_bias.to(dtype=torch.float32),
-                    non_blocking=_EXTRA_CTX.capturing)
+                    e_score_correction_bias.to(dtype=torch.float32), non_blocking=_EXTRA_CTX.capturing
+                )
         # Mirror the per-rank active-token mask to pinned CPU on the same
         # stream as topk_ids_h, so the host callback (graph replay) reads it
         # after the copy lands — same ordering contract as topk_ids_h. None
@@ -3780,8 +2895,7 @@ class ExpertOffloadManager:
             # 107027) because Ascend has no async bool memcpy path. int32 D2H
             # is the same async path topk_ids_h.copy_ already uses, so it
             # records cleanly into the graph.
-            mc2_mask_h.copy_(mc2_mask.to(torch.int32),
-                             non_blocking=_EXTRA_CTX.capturing)
+            mc2_mask_h.copy_(mc2_mask.to(torch.int32), non_blocking=_EXTRA_CTX.capturing)
         else:
             mc2_mask_h = None
         current_compute_stream = torch_npu.npu.current_stream()
@@ -3790,53 +2904,51 @@ class ExpertOffloadManager:
             torch_npu.npu._subscribe_report(current_compute_stream)
             subscribed.add(current_compute_stream)
         topk_weights_h = None
-        if (topk_weights is not None and self.cache_policy is not None
-                and self.offload_config.cache_router_weight != 0):
+        if topk_weights is not None and self.cache_policy is not None and self.offload_config.cache_router_weight != 0:
             topk_weights_h = self.topk_weights_h[:num_tokens]
-            topk_weights_h.copy_(topk_weights.to(dtype=torch.float32),
-                                 non_blocking=_EXTRA_CTX.capturing)
+            topk_weights_h.copy_(topk_weights.to(dtype=torch.float32), non_blocking=_EXTRA_CTX.capturing)
         from_graph_callback = _EXTRA_CTX.capturing
         args = (
-            topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots, False,
-            mc2_mask_h, do_substitution, router_logits_h, scoring_func,
-            correction_bias_h, topk_weights_h,
+            topk_ids_h,
+            log2phy_h,
+            layer,
+            layer_idx,
+            per_rank_slots,
+            False,
+            mc2_mask_h,
+            do_substitution,
+            router_logits_h,
+            scoring_func,
+            correction_bias_h,
+            topk_weights_h,
         )
         if self._debug:
             args += (from_graph_callback,)
+
+        # dispatch through the guarded wrapper rather than calling the tracer directly
         if from_graph_callback:
-            self._mc_graph_callbacks_registered = True
             self._log_mc_debug_schedule(layer_idx, is_prefetch=False)
-            torch_npu.npu._launch_host_func(
-                current_compute_stream, self._update_weights_multi_card, args)
+            torch_npu.npu._launch_host_func(current_compute_stream, self._update_weights_multi_card_guarded, args)
         else:
-            self._update_weights_multi_card(args)
+            self._update_weights_multi_card_guarded(args)
         if do_substitution:
-            topk_ids[:, :self.topk].copy_(
-                topk_ids_h[:, :self.topk], non_blocking=True)
+            topk_ids[:, : self.topk].copy_(topk_ids_h[:, : self.topk], non_blocking=True)
         # Copy the (host-func-mutated) log2phy_h back to the NPU tensor so the
         # MC2 dispatcher reads the fresh placement.
         log2phy.copy_(log2phy_h, non_blocking=_EXTRA_CTX.capturing)
 
-    def _expert_src_storage(self, layer_idx, eid, which='w13'):
+        # same layer-shifted dispatch as single-card update_weights.
+        self._finish_next_layer_predict(layer_idx, current_compute_stream)
+
+    def _expert_src_storage(self, layer_idx, eid, which="w13"):
         """Return expert eid's bytes as UntypedStorage for H2D **read**.
 
         shard-per-rank: eid is GLOBAL; remap to this rank's local shard slot.
         Otherwise: the expert tensor's own (already pinned) storage, global eid.
         """
-        cpu_buf = getattr(self, f'{which}_weights_cpu')[layer_idx]
-        if self.exclusive_dynamic_enabled:
-            local_eid = self._cpu_local(layer_idx, eid)
-            if local_eid is None:
-                raise RuntimeError(
-                    "Requested CPU source for an NPU-owned expert: "
-                    f"layer={layer_idx}, expert={eid}, weight={which}")
-            if self.exclusive_shared_cpu_enabled:
-                return self._torch_shared_cpu_weight_storage(
-                    layer_idx, eid, which)
-            return cpu_buf[local_eid].untyped_storage()
-        if self.torch_shared_cpu_weights_enabled:
-            return self._torch_shared_cpu_weight_storage(
-                layer_idx, eid, which)
+        if self.native_mxfp4_enabled:
+            raise RuntimeError("Native MXFP4 sources must use the shared owner and native upload tasks")
+        cpu_buf = getattr(self, f"{which}_weights_cpu")[layer_idx]
         if self.offload_config.shard_per_rank:
             local_eid = self._shard_local(eid)
             if local_eid is not None:
@@ -3844,139 +2956,46 @@ class ExpertOffloadManager:
             return self._shared_h2d_source(layer_idx, eid, which)
         return cpu_buf[eid].untyped_storage()
 
-    def _expert_device_storage(self, layer, slot: int, which: str):
-        """Return one decode slot's raw device bytes without changing layout."""
-        size = (self.w13_expert_size_bytes if which == "w13"
-                else self.w2_expert_size_bytes)
-        start = slot * size
-        return _expert_weight(
-            layer, f"{which}_weight").data.untyped_storage()[
-                start:start + size]
-
-    def _expert_dst_storage(self, layer_idx, eid, which='w13'):
+    def _expert_dst_storage(self, layer_idx, eid, which="w13"):
         """Return expert eid's storage for fill **write**.
 
         shard-per-rank: eid is GLOBAL; remap to this rank's local shard slot.
         Otherwise: the expert tensor's own storage, global eid.
         """
-        cpu_buf = getattr(self, f'{which}_weights_cpu')[layer_idx]
-        if self.exclusive_dynamic_enabled:
-            local_eid = self._cpu_local(layer_idx, eid)
-            if local_eid is None:
-                raise RuntimeError(
-                    "Requested CPU destination for an NPU-owned expert: "
-                    f"layer={layer_idx}, expert={eid}, weight={which}")
-            if self.exclusive_shared_cpu_enabled:
-                return self._torch_shared_cpu_weight_storage(
-                    layer_idx, eid, which)
-            return cpu_buf[local_eid].untyped_storage()
-        if self.torch_shared_cpu_weights_enabled:
-            return self._torch_shared_cpu_weight_storage(
-                layer_idx, eid, which)
+        if self.native_mxfp4_enabled:
+            raise RuntimeError("Native MXFP4 sources must use the shared owner and native upload tasks")
+        cpu_buf = getattr(self, f"{which}_weights_cpu")[layer_idx]
         if self.offload_config.shard_per_rank:
             return cpu_buf[eid - self._shard_base].untyped_storage()
         return cpu_buf[eid].untyped_storage()
 
-    def _torch_shared_cpu_weight_storage(self, layer_idx, eid, which):
-        tensor = self._torch_shared_cpu_buffers.get((layer_idx, which))
-        if tensor is None:
-            raise RuntimeError(
-                "Missing Torch shared CPU weight buffer: "
-                f"layer={layer_idx}, expert={eid}, name={which}")
-        per_expert = (self.w13_expert_size_bytes if which == "w13"
-                      else self.w2_expert_size_bytes)
-        shared_slot = eid
-        if self.exclusive_shared_cpu_enabled:
-            shared_slot = self._cpu_local(layer_idx, eid)
-            if shared_slot is None:
-                raise RuntimeError(
-                    "Requested shared CPU source for an NPU-owned expert: "
-                    f"layer={layer_idx}, expert={eid}, weight={which}")
-        start = shared_slot * per_expert
-        return tensor.untyped_storage()[start:start + per_expert]
-
-    def _torch_shared_cpu_attr_source(self, layer_idx, eid, name):
-        tensor = self._torch_shared_cpu_buffers.get((layer_idx, name))
-        if tensor is None:
-            raise RuntimeError(
-                "Missing Torch shared CPU quantization buffer: "
-                f"layer={layer_idx}, expert={eid}, name={name}")
-        shared_slot = eid
-        if self.exclusive_shared_cpu_enabled:
-            shared_slot = self._cpu_local(layer_idx, eid)
-            if shared_slot is None:
-                raise RuntimeError(
-                    "Requested shared CPU quantization source for an "
-                    f"NPU-owned expert: layer={layer_idx}, expert={eid}, "
-                    f"name={name}")
-        return tensor[shared_slot]
-
     def _shared_h2d_source(self, layer_idx, eid, name):
-        if self.torch_shared_cpu_weights_enabled:
-            if name in ("w13", "w2"):
-                return self._torch_shared_cpu_weight_storage(
-                    layer_idx, eid, name)
-            return self._torch_shared_cpu_attr_source(
-                layer_idx, eid, name)
         pointer = self._shared_h2d_sources.get((layer_idx, eid, name))
         if pointer is None:
-            raise RuntimeError(
-                "Missing MemFabric SHARED source pointer: "
-                f"layer={layer_idx}, expert={eid}, name={name}")
+            raise RuntimeError(f"Missing MemFabric SHARED source pointer: layer={layer_idx}, expert={eid}, name={name}")
         return HostPointerSource(pointer)
 
     def _shared_h2d_layer_ready(self, layer_idx: int) -> bool:
-        if self.torch_shared_cpu_weights_enabled:
-            return (
-                getattr(self, '_torch_shared_cpu_sources_ready', False)
-                and layer_idx in self._torch_shared_cpu_ready_layers
-                and (layer_idx, "w13") in self._torch_shared_cpu_buffers
-                and (layer_idx, "w2") in self._torch_shared_cpu_buffers
-            )
-        if not getattr(self, '_shared_h2d_sources_ready', False):
+        if not getattr(self, "_shared_h2d_sources_ready", False):
             return False
-        shared_sources = getattr(self, '_shared_h2d_sources', {})
+        shared_sources = getattr(self, "_shared_h2d_sources", {})
         return all(
-            (layer_idx, eid, name) in shared_sources
-            for eid in range(self.num_total_experts)
-            for name in ("w13", "w2"))
+            (layer_idx, eid, name) in shared_sources for eid in range(self.num_total_experts) for name in ("w13", "w2")
+        )
 
     def _publish_shared_h2d_sources(self) -> None:
-        """Make all same-node shared sources visible after conversion."""
-        if self.torch_shared_cpu_weights_enabled:
-            from torch import distributed as dist
-            from vllm.distributed.parallel_state import get_ep_group
-            dist.barrier(group=get_ep_group().cpu_group)
-            self._torch_shared_cpu_ready_layers.update(
-                range(len(self.w13_weights_cpu)))
-            self._torch_shared_cpu_sources_ready = True
-            if not all(self._shared_h2d_layer_ready(layer_idx)
-                       for layer_idx in range(len(self.w13_weights_cpu))):
-                raise RuntimeError("Incomplete Torch shared CPU source table")
-            self._log_torch_shared_cpu_pss()
-            logger.info(
-                "[EXPERT-OFFLOAD-H2D] Torch shared CPU sources ready: "
-                "layers=%d experts=%d ranks=%d",
-                len(self.w13_weights_cpu), self.num_total_experts,
-                self.ep_size)
-            return
-
-        # MemFabric SHARED publishes pointer-valued peer shard sources.
+        """All-gather peer shard pointers once after format conversion."""
         transport = self._get_h2d_transport()
         if not getattr(transport, "supports_remote_sources", False):
             return
 
         local_sources = {}
         for layer_idx in range(len(self.w13_weights_cpu)):
-            for local_eid, tensor in enumerate(
-                    self.w13_weights_cpu[layer_idx]):
+            for local_eid, tensor in enumerate(self.w13_weights_cpu[layer_idx]):
                 eid = self._shard_base + local_eid
                 local_sources[(layer_idx, eid, "w13")] = tensor.data_ptr()
-                local_sources[(layer_idx, eid, "w2")] = (
-                    self.w2_weights_cpu[layer_idx][local_eid].data_ptr())
-        for buffer_dict in (self.scale_cpu_buffers,
-                            self.offset_cpu_buffers,
-                            self.scale_bias_cpu_buffers):
+                local_sources[(layer_idx, eid, "w2")] = self.w2_weights_cpu[layer_idx][local_eid].data_ptr()
+        for buffer_dict in (self.scale_cpu_buffers, self.offset_cpu_buffers, self.scale_bias_cpu_buffers):
             for name, layer_buffers in buffer_dict.items():
                 for layer_idx, expert_buffers in enumerate(layer_buffers):
                     for local_eid, tensor in enumerate(expert_buffers):
@@ -3985,214 +3004,57 @@ class ExpertOffloadManager:
 
         from torch import distributed as dist
         from vllm.distributed.parallel_state import get_ep_group
+
         gathered_sources = [None] * self.ep_size
-        dist.all_gather_object(
-            gathered_sources, local_sources,
-            group=get_ep_group().cpu_group)
+        dist.all_gather_object(gathered_sources, local_sources, group=get_ep_group().cpu_group)
         shared_sources = {}
         for rank_sources in gathered_sources:
             overlap = shared_sources.keys() & rank_sources.keys()
             if overlap:
-                raise RuntimeError(
-                    "Duplicate MemFabric SHARED expert sources: "
-                    f"{list(overlap)[:4]}")
+                raise RuntimeError(f"Duplicate MemFabric SHARED expert sources: {list(overlap)[:4]}")
             shared_sources.update(rank_sources)
         self._shared_h2d_sources = shared_sources
         self._shared_h2d_sources_ready = True
-        if not all(self._shared_h2d_layer_ready(layer_idx)
-                   for layer_idx in range(len(self.w13_weights_cpu))):
+        if not all(self._shared_h2d_layer_ready(layer_idx) for layer_idx in range(len(self.w13_weights_cpu))):
             raise RuntimeError("Incomplete MemFabric SHARED source table")
         logger.info(
-            "[EXPERT-OFFLOAD-H2D] published %d SHARED source pointers "
-            "across %d EP ranks", len(shared_sources), self.ep_size)
-
-    def _initialize_exclusive_shared_runtime_state(self) -> None:
-        """Publish initial global NPU ownership to decode runtime state."""
-        per_rank_slots_by_layer = [
-            self.offload_config.num_device_experts_for_rank(
-                layer_idx, self.ep_size)
-            for layer_idx in range(len(self.moe_layers))
-        ]
-        for layer_idx, layer in enumerate(self.moe_layers):
-            placement = torch.full(
-                (self.num_total_experts,), -1, dtype=torch.int32)
-            for physical_slot, eid in enumerate(
-                    self._npu_slot_to_eid[layer_idx]):
-                placement[eid] = physical_slot
-            per_rank_slots = per_rank_slots_by_layer[layer_idx]
-            base = self.ep_rank * per_rank_slots
-            local_eids = self._npu_slot_to_eid[layer_idx][
-                base:base + per_rank_slots]
-            self._mc_prev_log2phy[layer_idx] = placement.clone()
-            self._mc_resident[layer_idx] = {
-                slot: int(eid) for slot, eid in enumerate(local_eids)
-            }
-            layer.log2phy.copy_(placement)
-            self._validate_exclusive_ownership(layer_idx)
-        logger.info(
-            "[EXCLUSIVE-SHARED] initialized global canonical ownership: "
-            "layers=%d global_npu_experts=%s compact_cpu_experts=%s "
-            "ranks=%d",
-            len(self.moe_layers),
-            [len(slots) for slots in self._npu_slot_to_eid],
-            [len(slots) for slots in self._cpu_slot_to_eid],
-            self.ep_size)
-
-    def _initialize_exclusive_sharded_runtime_state(self) -> None:
-        """Publish deterministic rank-local ownership to decode state."""
-        for layer_idx, layer in enumerate(self.moe_layers):
-            per_rank_slots = self.offload_config.num_device_experts_for_rank(
-                layer_idx, self.ep_size)
-            placement = torch.full(
-                (self.num_total_experts,), -1, dtype=torch.int32)
-            for rank in range(self.ep_size):
-                rank_eids = (
-                    self.offload_config.initial_device_experts_for_rank(
-                        layer_idx, self.num_total_experts,
-                        self.ep_size, rank))
-                for local_slot, eid in enumerate(rank_eids):
-                    placement[eid] = rank * per_rank_slots + local_slot
-
-            expected_local = (
-                self.offload_config.initial_device_experts_for_rank(
-                    layer_idx, self.num_total_experts,
-                    self.ep_size, self.ep_rank))
-            if self._npu_slot_to_eid[layer_idx] != expected_local:
-                raise RuntimeError(
-                    "Rank-local exclusive NPU initialization mismatch: "
-                    f"rank={self.ep_rank}, layer={layer_idx}, "
-                    f"expected={expected_local}, "
-                    f"actual={self._npu_slot_to_eid[layer_idx]}")
-            self._mc_prev_log2phy[layer_idx] = placement.clone()
-            self._mc_resident[layer_idx] = {
-                slot: int(eid)
-                for slot, eid in enumerate(expected_local)
-            }
-            layer.log2phy.copy_(placement)
-            self._validate_exclusive_ownership(layer_idx)
-        logger.info(
-            "[EXCLUSIVE-SHARDED] initialized rank-local canonical ownership: "
-            "rank=%d/%d layers=%d shard=[%d,%d) "
-            "cpu_experts_per_layer=%s npu_experts_per_layer=%s "
-            "cross_rank_weight_transfer=False",
-            self.ep_rank, self.ep_size, len(self.moe_layers),
-            self._shard_base, self._shard_base + self._shard_size,
-            [len(slots) for slots in self._cpu_slot_to_eid],
-            [len(slots) for slots in self._npu_slot_to_eid])
-
-    def _log_exclusive_shared_canonical_memory(self) -> None:
-        """Audit that compact CPU plus all decode NPU slots equal one model."""
-        if not self._debug or not self.exclusive_shared_cpu_enabled:
-            return
-        from torch import distributed as dist
-        from vllm.distributed.parallel_state import get_ep_group
-
-        canonical_attr_names = (
-            "w13_weight_scale",
-            "w2_weight_scale",
-            "w13_weight_offset",
-            "w2_weight_offset",
-            "w13_scale_bias",
-            "w2_scale_bias",
+            "[EXPERT-OFFLOAD-H2D] published %d SHARED source pointers across %d EP ranks",
+            len(shared_sources),
+            self.ep_size,
         )
-        local_device_tensors = []
-        for layer in self.moe_layers:
-            local_device_tensors.extend((
-                _expert_weight(layer, "w13_weight").data,
-                _expert_weight(layer, "w2_weight").data,
-            ))
-            local_device_tensors.extend(
-                getattr(layer, name).data
-                for name in canonical_attr_names
-                if hasattr(layer, name)
-            )
-        local_npu_bytes = self._cpu_tensor_storage_bytes(
-            local_device_tensors)
-        shared_cpu_bytes = self._cpu_tensor_storage_bytes(
-            self._torch_shared_cpu_buffers)
-        expected_full_bytes = 0
-        for (layer_idx, _), tensor in self._torch_shared_cpu_buffers.items():
-            cpu_experts = len(self._cpu_slot_to_eid[layer_idx])
-            expected_full_bytes += (
-                tensor.untyped_storage().nbytes()
-                // cpu_experts * self.num_total_experts)
 
-        snapshots = [None] * self.ep_size
-        dist.all_gather_object(
-            snapshots,
-            (shared_cpu_bytes, local_npu_bytes),
-            group=get_ep_group().cpu_group,
-        )
-        if self.ep_rank != 0:
-            return
-        cpu_sizes = [snapshot[0] for snapshot in snapshots]
-        global_npu_bytes = sum(snapshot[1] for snapshot in snapshots)
-        actual_full_bytes = shared_cpu_bytes + global_npu_bytes
-        ownership_ok = all(
-            len(self._cpu_slot_to_eid[layer_idx])
-            + len(self._npu_slot_to_eid[layer_idx])
-            == self.num_total_experts
-            for layer_idx in range(len(self.moe_layers))
-        )
-        result = (
-            "PASS_ONE_CANONICAL_MODEL"
-            if (ownership_ok and len(set(cpu_sizes)) == 1
-                and actual_full_bytes == expected_full_bytes)
-            else "FAIL_CANONICAL_MEMORY_MISMATCH"
-        )
-        mib = 1024 ** 2
-        logger.info(
-            "[EXCLUSIVE-SHARED-AUDIT] ranks=%d layers=%d "
-            "compact_shared_cpu_mib=%.1f global_decode_npu_mib=%.1f "
-            "canonical_total_mib=%.1f expected_one_model_mib=%.1f "
-            "cpu_experts_per_layer=%s global_npu_experts_per_layer=%s "
-            "result=%s",
-            self.ep_size, len(self.moe_layers),
-            shared_cpu_bytes / mib, global_npu_bytes / mib,
-            actual_full_bytes / mib, expected_full_bytes / mib,
-            [len(slots) for slots in self._cpu_slot_to_eid],
-            [len(slots) for slots in self._npu_slot_to_eid],
-            result)
-
-    def _build_quant_attr_h2d_tasks(self, layer, layer_idx, eid,
-                                    slot) -> list[H2DCopyTask]:
+    def _build_quant_attr_h2d_tasks(self, layer, layer_idx, eid, slot) -> list[H2DCopyTask]:
         """Build scale/offset/scale_bias H2D tasks for one expert slot."""
         tasks = []
-        for buffer_dict in (self.scale_cpu_buffers,
-                            self.offset_cpu_buffers,
-                            self.scale_bias_cpu_buffers):
+        for buffer_dict in (self.scale_cpu_buffers, self.offset_cpu_buffers, self.scale_bias_cpu_buffers):
             for attr_name, buffers in buffer_dict.items():
-                local_eid = self._cpu_local(layer_idx, eid)
+                local_eid = self._shard_local(eid)
                 dev_tensor = getattr(layer, attr_name, None)
                 if dev_tensor is None or layer_idx >= len(buffers):
                     continue
                 dst = dev_tensor.data[slot]
-                if (not self.exclusive_shared_cpu_enabled
-                        and local_eid is not None
-                        and local_eid < len(buffers[layer_idx])):
+                if local_eid is not None and local_eid < len(buffers[layer_idx]):
                     src_tensor = buffers[layer_idx][local_eid]
                     source = src_tensor.reshape(dst.shape)
                     nbytes = src_tensor.numel() * src_tensor.element_size()
-                elif (self.torch_shared_cpu_weights_enabled
-                      or getattr(self._get_h2d_transport(),
-                                 "supports_remote_sources", False)):
-                    source = self._shared_h2d_source(
-                        layer_idx, eid, attr_name)
+                elif getattr(self._get_h2d_transport(), "supports_remote_sources", False):
+                    source = self._shared_h2d_source(layer_idx, eid, attr_name)
                     nbytes = dst.numel() * dst.element_size()
                 else:
                     continue
-                tasks.append(H2DCopyTask(
-                    source=source,
-                    destination=dst,
-                    nbytes=nbytes,
-                    name=f"{attr_name}[L{layer_idx},E{eid}->S{slot}]",
-                ))
+                tasks.append(
+                    H2DCopyTask(
+                        source=source,
+                        destination=dst,
+                        nbytes=nbytes,
+                        name=f"{attr_name}[L{layer_idx},E{eid}->S{slot}]",
+                    )
+                )
         return tasks
 
     def _copy_quant_attrs_into_slot(self, layer, layer_idx, eid, slot):
         """Copy one expert's quant attributes through the H2D transport."""
-        self._get_h2d_transport().copy_batch(
-            self._build_quant_attr_h2d_tasks(layer, layer_idx, eid, slot))
+        self._get_h2d_transport().copy_batch(self._build_quant_attr_h2d_tasks(layer, layer_idx, eid, slot))
 
     def _apply_multi_card_substitution(
         self,
@@ -4204,24 +3066,20 @@ class ExpertOffloadManager:
         scoring_func,
         correction_bias_h,
         cpu_group=None,
-        debug_context=None,
     ):
         """Atomically substitute source experts across all active EP rows."""
         if mc2_mask_h is None:
             active_rows = torch.arange(topk_ids_h.shape[0])
         else:
-            active_rows = mc2_mask_h.bool().nonzero(
-                as_tuple=True)[0]
+            active_rows = mc2_mask_h.bool().nonzero(as_tuple=True)[0]
 
-        original_ids = topk_ids_h.index_select(
-            0, active_rows)[:, :self.topk]
+        original_ids = topk_ids_h.index_select(0, active_rows)[:, : self.topk]
         active_logits = router_logits_h.index_select(0, active_rows)
         plan = plan_expert_substitutions(
             active_logits,
             original_ids,
             log2phy_h,
-            expert_substitution_threshold=(
-                self.offload_config.expert_substitution_threshold),
+            expert_substitution_threshold=(self.offload_config.expert_substitution_threshold),
             scoring_func=scoring_func,
             e_score_correction_bias=correction_bias_h,
         )
@@ -4229,13 +3087,8 @@ class ExpertOffloadManager:
             gather_global_substitution_state_cpu,
         )
 
-        if debug_context is not None:
-            debug_context["stage"] = "substitution_consensus"
-        global_referenced, global_blocked = self._run_mc_cpu_collective(
-            gather_global_substitution_state_cpu,
-            plan.referenced,
-            plan.blocked,
-            cpu_group,
+        global_referenced, global_blocked = gather_global_substitution_state_cpu(
+            plan.referenced, plan.blocked, cpu_group
         )
         allowed = global_referenced & ~global_blocked
         substituted_ids = commit_expert_substitutions(
@@ -4244,10 +3097,9 @@ class ExpertOffloadManager:
             original_ids,
         )
         if self._debug:
-            self._log_expert_substitution(
-                layer_idx, original_ids, substituted_ids)
+            self._log_expert_substitution(layer_idx, original_ids, substituted_ids)
         updated_ids = topk_ids_h.index_select(0, active_rows)
-        updated_ids[:, :self.topk].copy_(substituted_ids)
+        updated_ids[:, : self.topk].copy_(substituted_ids)
         topk_ids_h.index_copy_(0, active_rows, updated_ids)
 
     def _update_weights_multi_card(self, args):
@@ -4256,35 +3108,14 @@ class ExpertOffloadManager:
             return self._update_weights_multi_card_impl(args)
         layer_idx = args[3]
         is_prefetch = bool(args[5])
-        from_graph_callback = (
-            (len(args) == 8 and bool(args[7]))
-            or (len(args) == 13 and bool(args[12])))
-        context = self._begin_mc_debug_callback(
-            layer_idx, is_prefetch, from_graph_callback)
-        context["stage"] = "callback_body"
+        from_graph_callback = (len(args) == 8 and bool(args[7])) or (len(args) == 13 and bool(args[12]))
+        context = self._begin_mc_debug_callback(layer_idx, is_prefetch, from_graph_callback)
         status = "ok"
         try:
             return self._update_weights_multi_card_impl(args, context)
         except BaseException as exc:
             status = f"error:{type(exc).__name__}"
-            error_stage = (context or {}).get("stage", "unknown")
-            self._log_mc_debug_event(
-                "CB_ERROR",
-                context,
-                error_stage=error_stage,
-                error_type=type(exc).__name__,
-                error_message=repr(exc),
-            )
-            logger.exception(
-                "[MC_DEBUG] callback traceback rank=%s layer=%s "
-                "source=%s prefetch=%s stage=%s error=%r",
-                self.ep_rank,
-                layer_idx,
-                context.get("source", "unknown"),
-                is_prefetch,
-                error_stage,
-                exc,
-            )
+            self._log_mc_debug_event("CB_ERROR", context, error_type=type(exc).__name__)
             raise
         finally:
             self._end_mc_debug_callback(context, status)
@@ -4292,43 +3123,51 @@ class ExpertOffloadManager:
     def _update_weights_multi_card_impl(self, args, debug_context=None):
         """Host callback (graph replay) / inline (eager) for multi-card DECODE
         placement + H2D. Reads the pinned CPU topk_ids_h, does CPU bincount +
-        serial Gloo all_reduce for global expert counts, plans the
+        gloo all_reduce (cpu_group) for global expert counts, plans the
         load-balanced placement, H2D-loads misses on load_stream (synced to gate
         the compute stream), and writes placement.log2phy into the pinned
         log2phy_h (the wrapper H2D-copies it back to the NPU tensor).
         """
         if len(args) in (7, 8):
-            (topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots,
-             is_prefetch, mc2_mask_h) = args[:7]
+            (topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots, is_prefetch, mc2_mask_h) = args[:7]
             do_substitution = False
             topk_weights_h = None
         else:
-            (topk_ids_h, log2phy_h, layer, layer_idx, per_rank_slots,
-             is_prefetch, mc2_mask_h, do_substitution, router_logits_h,
-             scoring_func, correction_bias_h, topk_weights_h) = args[:12]
+            (
+                topk_ids_h,
+                log2phy_h,
+                layer,
+                layer_idx,
+                per_rank_slots,
+                is_prefetch,
+                mc2_mask_h,
+                do_substitution,
+                router_logits_h,
+                scoring_func,
+                correction_bias_h,
+                topk_weights_h,
+            ) = args[:12]
         decode_start = time.perf_counter() if self._debug else None
         from vllm.distributed.parallel_state import get_ep_group
 
         from vllm_ascend.expert_offload.multi_card_planner import plan_placement
 
-        if self.ep_size > 1:
-            ep_cpu_group = get_ep_group().cpu_group
-            cpu_group = getattr(self, "_mc_runtime_cpu_group", None)
-            if cpu_group is None:
-                cpu_group = ep_cpu_group
-        else:
-            cpu_group = None
+        cpu_group = get_ep_group().cpu_group if self.ep_size > 1 else None
 
         # Substitute against the previous FULL global placement before global
         # counting. Each rank changes only its active local rows; the following
         # all-reduce makes the substituted route counts globally consistent.
         if do_substitution:
-            if debug_context is not None:
-                debug_context["stage"] = "substitution"
             self._apply_multi_card_substitution(
-                layer_idx, topk_ids_h, router_logits_h, log2phy_h,
-                mc2_mask_h, scoring_func, correction_bias_h, cpu_group,
-                debug_context)
+                layer_idx,
+                topk_ids_h,
+                router_logits_h,
+                log2phy_h,
+                mc2_mask_h,
+                scoring_func,
+                correction_bias_h,
+                cpu_group,
+            )
 
         # Drop pad-token rows (mc2_mask==0) BEFORE any counting / placing / LRU.
         # Under single-batch TP the ranks past the real-token count hold PAD
@@ -4342,8 +3181,7 @@ class ExpertOffloadManager:
         if mc2_mask_h is not None:
             active_mask = mc2_mask_h.bool()
             topk_for_count = topk_ids_h[active_mask]
-            weights_for_count = (topk_weights_h[active_mask]
-                                 if topk_weights_h is not None else None)
+            weights_for_count = topk_weights_h[active_mask] if topk_weights_h is not None else None
         else:
             topk_for_count = topk_ids_h
             weights_for_count = topk_weights_h
@@ -4351,44 +3189,29 @@ class ExpertOffloadManager:
         if self._debug:
             self._log_mc_router_observation(layer_idx, topk_for_count)
 
-        if debug_context is not None:
-            debug_context["stage"] = "count_and_hotness"
         counts_start = time.perf_counter() if self._debug else None
-        global_counts, cache_on, hotness, prev_log2phy = \
-            self._gather_global_counts_and_hotness(layer_idx, topk_for_count,
-                                                    cpu_group,
-                                                    weights_for_count,
-                                                    debug_context)
-        counts_ms = ((time.perf_counter() - counts_start) * 1000.0
-                     if counts_start is not None else 0.0)
+        global_counts, cache_on, hotness, prev_log2phy = self._gather_global_counts_and_hotness(
+            layer_idx, topk_for_count, cpu_group, weights_for_count, debug_context
+        )
+        counts_ms = (time.perf_counter() - counts_start) * 1000.0 if counts_start is not None else 0.0
 
         # MemFabric SHARED exposes peer shard pointers, so published layers may
         # use global load-balanced placement. Unpublished late layers (MTP)
         # retain owner-shard placement until their pointers are available.
-        if debug_context is not None:
-            debug_context["stage"] = "shared_layer_ready"
-        if (self.exclusive_shared_cpu_enabled
-                and not self._shared_h2d_layer_ready(layer_idx)):
-            raise RuntimeError(
-                "Exclusive shared decode cannot run before the compact "
-                f"shared CPU layer is finalized: layer={layer_idx}")
         force_shard = (
-            getattr(self, '_shard_size', None)
-            if (self.offload_config.shard_per_rank
-                and not self._shared_h2d_layer_ready(layer_idx)) else None)
-        if debug_context is not None:
-            debug_context["stage"] = "placement"
+            getattr(self, "_shard_size", None)
+            if (self.offload_config.shard_per_rank and not self._shared_h2d_layer_ready(layer_idx))
+            else None
+        )
         placement_start = time.perf_counter() if self._debug else None
-        placement = plan_placement(global_counts, self.ep_size, per_rank_slots,
-                                   prev_log2phy, hotness, force_shard=force_shard)
-        placement_ms = ((time.perf_counter() - placement_start) * 1000.0
-                        if placement_start is not None else 0.0)
-        if cache_on and not self.exclusive_dynamic_enabled:
+        placement = plan_placement(
+            global_counts, self.ep_size, per_rank_slots, prev_log2phy, hotness, force_shard=force_shard
+        )
+        placement_ms = (time.perf_counter() - placement_start) * 1000.0 if placement_start is not None else 0.0
+        if cache_on:
             self._mc_prev_log2phy[layer_idx] = placement.log2phy.clone()
         if self._debug:
-            self._log_mc_decode_plan(
-                layer_idx, global_counts, placement, per_rank_slots,
-                counts_ms, placement_ms)
+            self._log_mc_decode_plan(layer_idx, global_counts, placement, per_rank_slots, counts_ms, placement_ms)
 
         # Communication selection should conservatively keep an overflowing
         # batch out of MC2.  Reaching this point means the admission invariant
@@ -4396,16 +3219,10 @@ class ExpertOffloadManager:
         # late to switch collectives safely: every rank has already entered the
         # MC2 execution path.  Fail explicitly instead of mapping experts to
         # unrelated weights via a spread log2phy and silently corrupting output.
-        if debug_context is not None:
-            debug_context["stage"] = "capacity_check"
         if placement.unassigned:
             layer_capacity = per_rank_slots * self.ep_size
-            cpu_mode = (
-                "torch_shared" if self.torch_shared_cpu_weights_enabled else
-                "sharded" if self.offload_config.shard_per_rank else
-                "replicated")
-            sample = [int(eid) for eid in placement.unassigned[
-                :self._DEBUG_EXPERT_SAMPLE_LIMIT]]
+            cpu_mode = "sharded" if self.offload_config.shard_per_rank else "replicated"
+            sample = [int(eid) for eid in placement.unassigned[: self._DEBUG_EXPERT_SAMPLE_LIMIT]]
             raise RuntimeError(
                 "multi-card expert-offload MC2 placement overflow: "
                 f"rank={self.ep_rank} layer={layer_idx} cpu_mode={cpu_mode} "
@@ -4423,55 +3240,32 @@ class ExpertOffloadManager:
         # cached but aren't counted as hits — matching single-card's
         # needed-based rate so multi vs single hit rates are comparable now
         # that placement retains a persistent hot set across steps.
-        active_set = (set(global_counts.nonzero(as_tuple=True)[0].tolist())
-                      if global_counts is not None else None)
-        if debug_context is not None:
-            debug_context["stage"] = "resident_diff"
-        resident_map, hits, misses = self._compute_resident_hits(
-            layer_idx, my_experts, cache_on, active_set)
+        active_set = set(global_counts.nonzero(as_tuple=True)[0].tolist()) if global_counts is not None else None
+        resident_map, hits, misses = self._compute_resident_hits(layer_idx, my_experts, cache_on, active_set)
         h2d_start = time.perf_counter() if self._debug and misses else None
-        if self.exclusive_shared_cpu_enabled:
-            if debug_context is not None:
-                debug_context["stage"] = "shared_swap_lock"
-            lock = self._exclusive_layer_locks[layer_idx]
-            with lock:
-                self._swap_expert_weights_multi_card_shared(
-                    layer, layer_idx, placement, per_rank_slots,
-                    log2phy_h, debug_context)
-            resident_map = self._mc_resident[layer_idx]
-        elif self.exclusive_sharded_cpu_enabled:
-            if debug_context is not None:
-                debug_context["stage"] = "sharded_swap"
-            lock = self._exclusive_layer_locks[layer_idx]
-            with lock:
-                self._swap_expert_weights_multi_card_sharded(
-                    layer, layer_idx, placement, per_rank_slots,
-                    log2phy_h)
-            resident_map = self._mc_resident[layer_idx]
-        elif misses:
-            if debug_context is not None:
-                debug_context["stage"] = "h2d_load"
-            self._h2d_load_mc_misses(layer, layer_idx, misses, resident_map,
-                                     debug_context)
-        h2d_ms = ((time.perf_counter() - h2d_start) * 1000.0
-                  if h2d_start is not None else 0.0)
+        if misses:
+            self._h2d_load_mc_misses(layer, layer_idx, misses, resident_map, debug_context)
+        h2d_ms = (time.perf_counter() - h2d_start) * 1000.0 if h2d_start is not None else 0.0
         # Write the FULL global placement into the pinned log2phy_h; the wrapper
         # H2D-copies it back to the NPU log2phy. Must be the FULL placement (not
         # just this rank) so MC2 routes tokens cross-rank correctly — writing only
         # my_experts would leave remote experts at -1 -> clamp 0 -> zero cross-
         # rank traffic -> MC2 uniform-mode dispatch deadlocks.
-        if not self.exclusive_shared_cpu_enabled:
-            if debug_context is not None:
-                debug_context["stage"] = "publish_log2phy"
-            log2phy_h.copy_(placement.log2phy)
+        log2phy_h.copy_(placement.log2phy)
         if self._debug:
-            if debug_context is not None:
-                debug_context["stage"] = "cache_log"
             total_ms = (time.perf_counter() - decode_start) * 1000.0
             self._log_mc_decode_cache(
-                layer_idx, my_experts, hits, misses, resident_map,
-                placement.log2phy, per_rank_slots, is_prefetch, h2d_ms,
-                total_ms)
+                layer_idx,
+                my_experts,
+                hits,
+                misses,
+                resident_map,
+                placement.log2phy,
+                per_rank_slots,
+                is_prefetch,
+                h2d_ms,
+                total_ms,
+            )
 
     def _log_mc_router_observation(self, layer_idx, topk_ids_h):
         if not self._debug or not logger.isEnabledFor(logging.DEBUG):
@@ -4481,13 +3275,17 @@ class ExpertOffloadManager:
         counts = Counter(int(e) for e in topk_ids_h.reshape(-1).tolist())
         hottest = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:8]
         logger.debug(
-            "[MC_OBS] rank=%s L=%s router: tokens=%s topk=%s "
-            "uniq_experts=%d/%d top8(expert:count)=%s",
-            self.ep_rank, layer_idx, num_tokens, topk, len(counts),
-            self.num_total_experts, hottest)
+            "[MC_OBS] rank=%s L=%s router: tokens=%s topk=%s uniq_experts=%d/%d top8(expert:count)=%s",
+            self.ep_rank,
+            layer_idx,
+            num_tokens,
+            topk,
+            len(counts),
+            self.num_total_experts,
+            hottest,
+        )
 
-    def _log_mc_decode_plan(self, layer_idx, global_counts, placement,
-                            per_rank_slots, counts_ms, placement_ms):
+    def _log_mc_decode_plan(self, layer_idx, global_counts, placement, per_rank_slots, counts_ms, placement_ms):
         """Log one compact copy of the deterministic global placement plan."""
         if not self._debug or self.ep_rank != 0:
             return
@@ -4499,18 +3297,9 @@ class ExpertOffloadManager:
                 rank = physical_id // per_rank_slots
                 if 0 <= rank < self.ep_size:
                     active_per_rank[rank] += 1
-        assigned_per_rank = [
-            sum(int(eid) >= 0 for eid in experts)
-            for experts in placement.per_rank_experts
-        ]
-        capacity_ok = (
-            not placement.unassigned
-            and all(count <= per_rank_slots for count in assigned_per_rank)
-        )
-        cpu_mode = (
-            "torch_shared" if self.torch_shared_cpu_weights_enabled else
-            "sharded" if self.offload_config.shard_per_rank else
-            "replicated")
+        assigned_per_rank = [sum(int(eid) >= 0 for eid in experts) for experts in placement.per_rank_experts]
+        capacity_ok = not placement.unassigned and all(count <= per_rank_slots for count in assigned_per_rank)
+        cpu_mode = "sharded" if self.offload_config.shard_per_rank else "replicated"
         unassigned = [int(eid) for eid in placement.unassigned]
         logger.info(
             "[MC_OBS] rank=%s L=%s DECODE plan: cpu_mode=%s "
@@ -4519,17 +3308,25 @@ class ExpertOffloadManager:
             "global_counts_checksum=%d log2phy_checksum=%d "
             "unassigned_count=%d unassigned_sample=%s per_rank_load=%s "
             "timing_ms{counts_lrc=%.3f,placement=%.3f}",
-            self.ep_rank, layer_idx, cpu_mode, int(global_counts.sum()),
-            len(active_ids), per_rank_slots * self.ep_size, active_per_rank,
-            assigned_per_rank, capacity_ok,
+            self.ep_rank,
+            layer_idx,
+            cpu_mode,
+            int(global_counts.sum()),
+            len(active_ids),
+            per_rank_slots * self.ep_size,
+            active_per_rank,
+            assigned_per_rank,
+            capacity_ok,
             _stable_int_checksum(global_counts),
             _stable_int_checksum(placement.log2phy),
-            len(unassigned), unassigned[:self._DEBUG_EXPERT_SAMPLE_LIMIT],
+            len(unassigned),
+            unassigned[: self._DEBUG_EXPERT_SAMPLE_LIMIT],
             placement.per_rank_load,
-            counts_ms, placement_ms)
+            counts_ms,
+            placement_ms,
+        )
 
-    def _log_mc_lrc_state(self, layer_idx, global_counts,
-                          global_router_score, hotness):
+    def _log_mc_lrc_state(self, layer_idx, global_counts, global_router_score, hotness):
         """Log identical-on-every-rank LRC inputs/state for verification."""
         if not self._debug or self._mc_lrc is None:
             return
@@ -4551,97 +3348,56 @@ class ExpertOffloadManager:
             }
             for eid in hottest
         ]
-        router_input_checksum = (
-            _stable_float_checksum(global_router_score)
-            if global_router_score is not None else None)
+        router_input_checksum = _stable_float_checksum(global_router_score) if global_router_score is not None else None
         logger.info(
             "[MC_LRC] rank=%s/%s L=%s step=%s global_routes=%s "
             "global_active=%s counts_checksum=%s freq_sum=%s "
             "freq_checksum=%s ema_checksum=%s router_enabled=%s "
             "router_input_checksum=%s router_state_checksum=%s "
             "hotness_checksum=%s top_hot=%s",
-            self.ep_rank, self.ep_size, layer_idx, state.step,
-            int(global_counts.sum()), len(active_ids),
-            _stable_int_checksum(global_counts), sum(state.freq),
+            self.ep_rank,
+            self.ep_size,
+            layer_idx,
+            state.step,
+            int(global_counts.sum()),
+            len(active_ids),
+            _stable_int_checksum(global_counts),
+            sum(state.freq),
             _stable_int_checksum(state.freq),
             _stable_float_checksum(state.ema),
-            global_router_score is not None, router_input_checksum,
+            global_router_score is not None,
+            router_input_checksum,
             _stable_float_checksum(state.router_score),
-            _stable_float_checksum(hotness), hot_sample)
+            _stable_float_checksum(hotness),
+            hot_sample,
+        )
 
-    def _sanitize_mc_router_scores(self, layer_idx, scores, expert_ids=None,
-                                   stage="local_topk", debug_context=None):
-        """Keep non-finite router scores out of the optional LRC heuristic.
-
-        ``scores`` and ``expert_ids`` are CPU tensors copied for placement
-        accounting; the router output used by model execution is untouched.
-        Logging local values before Gloo identifies the originating rank,
-        layer, route position and expert. A second call after Gloo protects
-        against non-finite reduction results as well.
-        """
-        finite = torch.isfinite(scores)
-        if bool(finite.all()):
-            return scores
-
-        invalid_positions = (~finite).nonzero(as_tuple=True)[0]
-        nan_count = int(torch.isnan(scores).sum())
-        infinite = torch.isinf(scores)
-        posinf_count = int((infinite & (scores > 0)).sum())
-        neginf_count = int((infinite & (scores < 0)).sum())
-        sample = []
-        for position in invalid_positions[
-                :self._DEBUG_EXPERT_SAMPLE_LIMIT].tolist():
-            number = float(scores[position])
-            value = ("nan" if math.isnan(number) else
-                     "+inf" if number > 0 else "-inf")
-            expert_id = (int(expert_ids[position])
-                         if expert_ids is not None else int(position))
-            sample.append({
-                "position": int(position),
-                "expert": expert_id,
-                "value": value,
-            })
-        source = (debug_context or {}).get("source", "-")
-        logger.warning(
-            "[MC_ROUTER_NONFINITE] rank=%s/%s layer=%s stage=%s "
-            "source=%s total=%s nonfinite=%s nan=%s posinf=%s neginf=%s "
-            "action=zero_for_lrc sample=%s",
-            self.ep_rank, self.ep_size, layer_idx, stage, source,
-            scores.numel(), invalid_positions.numel(), nan_count,
-            posinf_count, neginf_count, sample)
-        return scores.masked_fill(~finite, 0.0)
-
-    def _gather_global_counts_and_hotness(self, layer_idx, topk_ids_h,
-                                          cpu_group, topk_weights_h=None,
-                                          debug_context=None):
+    def _gather_global_counts_and_hotness(
+        self, layer_idx, topk_ids_h, cpu_group, topk_weights_h=None, debug_context=None
+    ):
         """CPU bincount + gloo all_reduce -> global expert counts, then update
         the LRC hotness policy (the same one single-card uses: recent freq +
         EMA + age + optional router score) from the real GLOBAL route counts
         and return its per-expert hotness. global_counts and router score sums
         are all-reduced EVERY step (identical across ranks after the mc2_mask
         filter), so the LRC state + hotness are too -> placement/eviction stay
-        deterministic. Gloo runs on the isolated decode CPU group through one
-        serial worker rather than the captured NPU stream; all callbacks must
-        still submit collectives in the same order on every rank."""
-        from vllm_ascend.expert_offload.multi_card_planner import (
-            local_expert_counts_cpu)
+        deterministic. Gloo runs on cpu_group rather than the captured NPU
+        stream, but all callbacks must still enter its collectives in the same
+        order on every rank."""
+        from vllm_ascend.expert_offload.multi_card_planner import local_expert_counts_cpu
+
         local_counts = local_expert_counts_cpu(topk_ids_h, self.num_total_experts)
-        global_counts = self._gather_cpu_with_mc_debug(
-            local_counts, cpu_group, "count", debug_context)
+        global_counts = self._gather_cpu_with_mc_debug(local_counts, cpu_group, "count", debug_context)
         cache_on = self.offload_config.cache_policy_enabled
         if not cache_on:
-            retain_exclusive = self.exclusive_dynamic_enabled
-            return (global_counts, retain_exclusive, None,
-                    self._mc_prev_log2phy.get(layer_idx)
-                    if retain_exclusive else None)
+            return global_counts, cache_on, None, None
         # Reuse the configured single-card policy so every cache tuning knob
         # has identical meaning in multi-card mode.  The lazy fallback only
         # protects unusual unit-test/partial-initialization paths.
         if self._mc_lrc is None:
             self._mc_lrc = self.cache_policy
         if self._mc_lrc is None:
-            return (global_counts, False, None,
-                    self._mc_prev_log2phy.get(layer_idx))
+            return (global_counts, False, None, self._mc_prev_log2phy.get(layer_idx))
         while len(self._mc_lrc.layer_states) <= layer_idx:
             self._mc_lrc.add_layer()
 
@@ -4649,31 +3405,18 @@ class ExpertOffloadManager:
         if topk_weights_h is not None:
             ids = topk_ids_h.reshape(-1).to(torch.int64)
             scores = topk_weights_h.reshape(-1).to(torch.float32)
-            scores = self._sanitize_mc_router_scores(
-                layer_idx, scores, ids, "local_topk", debug_context)
-            local_score_sum = torch.zeros(self.num_total_experts,
-                                          dtype=torch.float32)
+            local_score_sum = torch.zeros(self.num_total_experts, dtype=torch.float32)
             local_score_sum.scatter_add_(0, ids, scores)
-            global_score_sum = self._gather_cpu_with_mc_debug(
-                local_score_sum, cpu_group, "router_score", debug_context)
-            global_score_sum = self._sanitize_mc_router_scores(
-                layer_idx, global_score_sum, stage="global_sum",
-                debug_context=debug_context)
+            global_score_sum = self._gather_cpu_with_mc_debug(local_score_sum, cpu_group, "router_score", debug_context)
             global_router_score = torch.zeros_like(global_score_sum)
             active = global_counts > 0
-            global_router_score[active] = (
-                global_score_sum[active] /
-                global_counts[active].to(global_score_sum.dtype))
-        self._mc_lrc.observe_global_counts(
-            layer_idx, global_counts, global_router_score)
+            global_router_score[active] = global_score_sum[active] / global_counts[active].to(global_score_sum.dtype)
+        self._mc_lrc.observe_global_counts(layer_idx, global_counts, global_router_score)
         hotness = self._mc_lrc.hotness_array(layer_idx)
-        self._log_mc_lrc_state(
-            layer_idx, global_counts, global_router_score, hotness)
-        return (global_counts, cache_on, hotness,
-                self._mc_prev_log2phy.get(layer_idx))
+        self._log_mc_lrc_state(layer_idx, global_counts, global_router_score, hotness)
+        return (global_counts, cache_on, hotness, self._mc_prev_log2phy.get(layer_idx))
 
-    def _compute_resident_hits(self, layer_idx, my_experts, cache_on,
-                               active_set=None):
+    def _compute_resident_hits(self, layer_idx, my_experts, cache_on, active_set=None):
         """Split this rank's ACTIVE placed experts into cache hits (expert
         already resident in its assigned slot) vs misses (need H2D). Returns
         (resident_map, hits, misses).
@@ -4685,8 +3428,9 @@ class ExpertOffloadManager:
         (backward-compatible fallback)."""
         if not cache_on:
             # No cache: every (active) expert is a miss (full H2D every step).
-            misses = [(s, int(e)) for s, e in enumerate(my_experts)
-                      if e >= 0 and (active_set is None or int(e) in active_set)]
+            misses = [
+                (s, int(e)) for s, e in enumerate(my_experts) if e >= 0 and (active_set is None or int(e) in active_set)
+            ]
             return {}, [], misses
         resident_map = self._mc_resident.setdefault(layer_idx, {})
         hits, misses = [], []
@@ -4701,10 +3445,12 @@ class ExpertOffloadManager:
 
     def _get_h2d_transport(self):
         """Return the transport, lazily initializing collective SHARED."""
-        if not hasattr(self, 'h2d_transport'):
+        if not hasattr(self, "h2d_transport"):
             self.h2d_transport = TorchCopyH2DTransport()
         elif self.h2d_transport is None:
             self.h2d_transport = self._create_h2d_transport()
+        if self.native_mxfp4_enabled and not isinstance(self.h2d_transport, NativeMXFP4H2DTransport):
+            self.h2d_transport = NativeMXFP4H2DTransport(self.h2d_transport)
         return self.h2d_transport
 
     def _allocate_expert_host_tensor(self, shape, dtype) -> torch.Tensor:
@@ -4717,498 +3463,61 @@ class ExpertOffloadManager:
 
     def close(self) -> None:
         """Release H2D backend resources; safe to call more than once."""
-        collective_executor = getattr(
-            self, "_mc_collective_executor", None)
-        if collective_executor is not None:
-            collective_executor.shutdown(wait=True, cancel_futures=True)
-            self._mc_collective_executor = None
-            self._mc_collective_thread_id = None
-        runtime_cpu_group = getattr(self, "_mc_runtime_cpu_group", None)
-        if runtime_cpu_group is not None:
-            import torch.distributed as dist
-            if dist.is_initialized():
-                dist.destroy_process_group(runtime_cpu_group)
-            self._mc_runtime_cpu_group = None
-        transport = getattr(self, 'h2d_transport', None)
+        device_transfers = getattr(self, "_device_expert_transfers", [])
+        if device_transfers:
+            torch.npu.synchronize()
+            for transfer in device_transfers:
+                transfer.copier.close()
+            device_transfers.clear()
+        transport = getattr(self, "h2d_transport", None)
         if transport is not None:
             transport.synchronize(self.load_stream)
             transport.close()
-        shared_pool = getattr(self, '_torch_shared_cpu_pool', None)
-        if shared_pool is not None:
-            shared_pool.close()
-        prefill_pyhccl = getattr(
-            self, '_exclusive_prefill_pyhccl', None)
-        if prefill_pyhccl is not None:
-            prefill_pyhccl.close()
-            self._exclusive_prefill_pyhccl = None
-        comm_buffers = getattr(
-            self, '_exclusive_prefill_comm_buffers', None)
-        if comm_buffers is not None:
-            comm_buffers.clear()
 
-    def _build_expert_h2d_tasks(self, layer, layer_idx, eid,
-                                slot) -> list[H2DCopyTask]:
+    def _build_expert_h2d_tasks(self, layer, layer_idx, eid, slot) -> list[H2DCopyTask]:
         """Build format-preserving weight and quant H2D tasks for one expert."""
+        if self.native_mxfp4_enabled:
+            return [self._native_upload_task(
+                layer_idx, eid, _expert_weight(layer, "w13_weight"), _expert_weight(layer, "w2_weight"),
+                layer.w13_weight_scale, layer.w2_weight_scale, slot,
+                f"native-decode[L{layer_idx},E{eid}->S{slot}]",
+            )]
         w13_start = slot * self.w13_expert_size_bytes
         w2_start = slot * self.w2_expert_size_bytes
         w13_dst = _expert_weight(layer, "w13_weight").data.untyped_storage()[
-            w13_start:w13_start + self.w13_expert_size_bytes]
+            w13_start : w13_start + self.w13_expert_size_bytes
+        ]
         w2_dst = _expert_weight(layer, "w2_weight").data.untyped_storage()[
-            w2_start:w2_start + self.w2_expert_size_bytes]
+            w2_start : w2_start + self.w2_expert_size_bytes
+        ]
         tasks = [
             H2DCopyTask(
-                source=self._expert_src_storage(layer_idx, eid, 'w13'),
+                source=self._expert_src_storage(layer_idx, eid, "w13"),
                 destination=w13_dst,
                 nbytes=self.w13_expert_size_bytes,
                 name=f"w13[L{layer_idx},E{eid}->S{slot}]",
             ),
             H2DCopyTask(
-                source=self._expert_src_storage(layer_idx, eid, 'w2'),
+                source=self._expert_src_storage(layer_idx, eid, "w2"),
                 destination=w2_dst,
                 nbytes=self.w2_expert_size_bytes,
                 name=f"w2[L{layer_idx},E{eid}->S{slot}]",
             ),
         ]
-        tasks.extend(
-            self._build_quant_attr_h2d_tasks(layer, layer_idx, eid, slot))
+        tasks.extend(self._build_quant_attr_h2d_tasks(layer, layer_idx, eid, slot))
         return tasks
-
-    def _iter_cpu_expert_buffers(self, layer_idx: int):
-        """Yield every canonical CPU buffer participating in a swap."""
-        if self.exclusive_shared_cpu_enabled:
-            yield "w13", self._torch_shared_cpu_buffers[(layer_idx, "w13")]
-            yield "w2", self._torch_shared_cpu_buffers[(layer_idx, "w2")]
-            for buffer_dict in (self.scale_cpu_buffers,
-                                self.offset_cpu_buffers,
-                                self.scale_bias_cpu_buffers):
-                for attr_name, layer_buffers in buffer_dict.items():
-                    if (layer_idx < len(layer_buffers)
-                            and (layer_idx, attr_name)
-                            in self._torch_shared_cpu_buffers):
-                        yield attr_name, self._torch_shared_cpu_buffers[
-                            (layer_idx, attr_name)]
-            return
-        yield "w13", self.w13_weights_cpu[layer_idx]
-        yield "w2", self.w2_weights_cpu[layer_idx]
-        for buffer_dict in (self.scale_cpu_buffers,
-                            self.offset_cpu_buffers,
-                            self.scale_bias_cpu_buffers):
-            for attr_name, layer_buffers in buffer_dict.items():
-                if (layer_idx < len(layer_buffers)
-                        and layer_buffers[layer_idx]):
-                    yield attr_name, layer_buffers[layer_idx]
-
-    def _allocate_exclusive_swap_bundle(
-            self, layer_idx: int, cpu_slot: int) -> dict[str, torch.Tensor]:
-        """Allocate transient pinned storage for one evicted expert.
-
-        A miss cannot overwrite its incoming CPU buffer until that buffer has
-        finished H2D.  One transient bundle per simultaneously swapped expert
-        is therefore required.  Bundles are transaction-local, so canonical
-        storage remains exactly ``CPU experts + NPU experts == all experts``
-        and the extra peak is limited to misses of the active layer.
-        """
-        bundle = {}
-        for name, buffers in self._iter_cpu_expert_buffers(layer_idx):
-            template = buffers[cpu_slot]
-            bundle[name] = self._allocate_expert_host_tensor(
-                template.shape, template.dtype)
-        return bundle
-
-    def _build_expert_d2h_tasks(
-        self,
-        layer,
-        layer_idx: int,
-        victim_eid: int,
-        victim_slot: int,
-        scratch: dict[str, torch.Tensor],
-    ) -> list[H2DCopyTask]:
-        """Build device-to-host copies for one evicted expert."""
-        tasks = [
-            H2DCopyTask(
-                source=self._expert_device_storage(
-                    layer, victim_slot, "w13"),
-                destination=scratch["w13"].untyped_storage(),
-                nbytes=self.w13_expert_size_bytes,
-                name=(f"swap-d2h-w13[L{layer_idx},E{victim_eid}"
-                      f"<-S{victim_slot}]"),
-                direction=CopyDirection.D2H,
-            ),
-            H2DCopyTask(
-                source=self._expert_device_storage(
-                    layer, victim_slot, "w2"),
-                destination=scratch["w2"].untyped_storage(),
-                nbytes=self.w2_expert_size_bytes,
-                name=(f"swap-d2h-w2[L{layer_idx},E{victim_eid}"
-                      f"<-S{victim_slot}]"),
-                direction=CopyDirection.D2H,
-            ),
-        ]
-        for buffer_dict in (self.scale_cpu_buffers,
-                            self.offset_cpu_buffers,
-                            self.scale_bias_cpu_buffers):
-            for attr_name, layer_buffers in buffer_dict.items():
-                if (layer_idx >= len(layer_buffers)
-                        or attr_name not in scratch):
-                    continue
-                dev_tensor = getattr(layer, attr_name, None)
-                if dev_tensor is None:
-                    continue
-                source = dev_tensor.data[victim_slot]
-                destination = scratch[attr_name].reshape(source.shape)
-                tasks.append(H2DCopyTask(
-                    source=source,
-                    destination=destination,
-                    nbytes=source.numel() * source.element_size(),
-                    name=(f"swap-d2h-{attr_name}[L{layer_idx},"
-                          f"E{victim_eid}<-S{victim_slot}]"),
-                    direction=CopyDirection.D2H,
-                ))
-        return tasks
-
-    def _commit_exclusive_swap(
-        self,
-        layer_idx: int,
-        log2phy_np,
-        swap,
-        scratch: dict[str, torch.Tensor],
-        physical_slot_base: int = 0,
-    ) -> None:
-        """Commit one synchronized swap to CPU buffers and ownership maps."""
-        slot, incoming_eid, victim_eid, cpu_slot = swap
-        for name, buffers in self._iter_cpu_expert_buffers(layer_idx):
-            buffers[cpu_slot] = scratch[name]
-
-        self._cpu_slot_to_eid[layer_idx][cpu_slot] = victim_eid
-        self._eid_to_cpu_slot[layer_idx][incoming_eid] = -1
-        self._eid_to_cpu_slot[layer_idx][victim_eid] = cpu_slot
-        self._npu_slot_to_eid[layer_idx][slot] = incoming_eid
-        self._eid_to_npu_slot[layer_idx][victim_eid] = -1
-        self._eid_to_npu_slot[layer_idx][incoming_eid] = slot
-        log2phy_np[victim_eid] = -1
-        log2phy_np[incoming_eid] = physical_slot_base + slot
-
-    def _swap_expert_weights(self, layer, layer_idx: int, swaps,
-                             log2phy_np, physical_slot_base: int = 0) -> None:
-        """Execute a batch of exclusive CPU↔NPU swaps atomically.
-
-        All victim D2H copies are queued before any incoming H2D copy.  The
-        load stream then refreshes derived fp32 scales and synchronizes once.
-        Only after that barrier do the canonical CPU buffer references,
-        inverse ownership maps and log2phy change.
-        """
-        swaps = list(swaps)
-        if not swaps:
-            return
-        if len({swap[0] for swap in swaps}) != len(swaps):
-            raise RuntimeError(
-                f"Duplicate NPU slots in exclusive swap plan: {swaps}")
-        if len({swap[3] for swap in swaps}) != len(swaps):
-            raise RuntimeError(
-                f"Duplicate CPU slots in exclusive swap plan: {swaps}")
-
-        scratch_bundles = [
-            self._allocate_exclusive_swap_bundle(layer_idx, cpu_slot)
-            for _, _, _, cpu_slot in swaps
-        ]
-        d2h_tasks = []
-        h2d_tasks = []
-        for (slot, incoming_eid, victim_eid, _), scratch in zip(
-                swaps, scratch_bundles):
-            d2h_tasks.extend(self._build_expert_d2h_tasks(
-                layer, layer_idx, victim_eid, slot, scratch))
-            h2d_tasks.extend(self._build_expert_h2d_tasks(
-                layer, layer_idx, incoming_eid, slot))
-
-        self._get_h2d_transport().copy_batch(d2h_tasks + h2d_tasks)
-        for slot, _, _, _ in swaps:
-            self._refresh_expert_fp32_scale(layer, slot)
-        self._synchronize_h2d()
-
-        for swap, scratch in zip(swaps, scratch_bundles):
-            self._commit_exclusive_swap(
-                layer_idx, log2phy_np, swap, scratch,
-                physical_slot_base=physical_slot_base)
-        self._validate_exclusive_ownership(layer_idx)
-
-    def _swap_expert_weights_multi_card_sharded(
-        self,
-        layer,
-        layer_idx: int,
-        placement,
-        per_rank_slots: int,
-        log2phy_h,
-    ) -> None:
-        """Apply an owner-constrained placement using local swaps only."""
-        my_experts = list(placement.per_rank_experts[self.ep_rank])
-        if (len(my_experts) != per_rank_slots
-                or any(int(eid) < 0 for eid in my_experts)):
-            raise RuntimeError(
-                "Rank-local exclusive placement must keep every local NPU "
-                "slot populated: "
-                f"rank={self.ep_rank}, layer={layer_idx}, "
-                f"expected_slots={per_rank_slots}, experts={my_experts}")
-        local_start = self._shard_base
-        local_end = local_start + self._shard_size
-        swaps = []
-        for slot, incoming_eid in enumerate(my_experts):
-            incoming_eid = int(incoming_eid)
-            if not local_start <= incoming_eid < local_end:
-                raise RuntimeError(
-                    "Rank-local exclusive placement selected a remote expert: "
-                    f"rank={self.ep_rank}, layer={layer_idx}, "
-                    f"expert={incoming_eid}, shard=[{local_start},{local_end})")
-            victim_eid = self._npu_slot_to_eid[layer_idx][slot]
-            if incoming_eid == victim_eid:
-                continue
-            cpu_slot = self._eid_to_cpu_slot[layer_idx][incoming_eid]
-            if cpu_slot < 0:
-                raise RuntimeError(
-                    "Rank-local exclusive placement attempted a non-CPU "
-                    "incoming expert: "
-                    f"rank={self.ep_rank}, layer={layer_idx}, "
-                    f"expert={incoming_eid}")
-            swaps.append((slot, incoming_eid, int(victim_eid), cpu_slot))
-
-        physical_slot_base = self.ep_rank * per_rank_slots
-        with torch_npu.npu.stream(self.load_stream):
-            self._swap_expert_weights(
-                layer, layer_idx, swaps, log2phy_h.numpy(),
-                physical_slot_base=physical_slot_base)
-        log2phy_h.copy_(placement.log2phy)
-        self._mc_prev_log2phy[layer_idx] = placement.log2phy.clone()
-        self._mc_resident[layer_idx] = {
-            slot: int(eid)
-            for slot, eid in enumerate(self._npu_slot_to_eid[layer_idx])
-        }
-        if self._debug and swaps:
-            logger.info(
-                "[EXCLUSIVE-SHARDED-SWAP] layer=%d rank=%d swaps=%d "
-                "cross_rank_weight_transfer=False",
-                layer_idx, self.ep_rank, len(swaps))
-
-    def _exclusive_shared_swaps_from_placement(
-        self,
-        layer_idx: int,
-        placement,
-        per_rank_slots: int,
-    ) -> list[tuple[int, int, int, int]]:
-        """Diff a deterministic global placement into CPU/NPU swaps."""
-        target_by_slot = [-1] * (per_rank_slots * self.ep_size)
-        for rank, experts in enumerate(placement.per_rank_experts):
-            for local_slot, eid in enumerate(experts):
-                if int(eid) >= 0:
-                    target_by_slot[rank * per_rank_slots + local_slot] = int(eid)
-        swaps = []
-        for physical_slot, incoming_eid in enumerate(target_by_slot):
-            if incoming_eid < 0:
-                continue
-            victim_eid = self._npu_slot_to_eid[layer_idx][physical_slot]
-            if incoming_eid == victim_eid:
-                continue
-            cpu_slot = self._eid_to_cpu_slot[layer_idx][incoming_eid]
-            if cpu_slot < 0:
-                raise RuntimeError(
-                    "Exclusive placement attempted to move an NPU resident "
-                    "instead of retaining its physical slot: "
-                    f"layer={layer_idx}, expert={incoming_eid}, "
-                    f"old_physical={self._eid_to_npu_slot[layer_idx][incoming_eid]}, "
-                    f"new_physical={physical_slot}")
-            swaps.append((physical_slot, incoming_eid,
-                          int(victim_eid), cpu_slot))
-        if len({swap[3] for swap in swaps}) != len(swaps):
-            raise RuntimeError(
-                f"Duplicate compact CPU slots in global swap plan: {swaps}")
-        return swaps
-
-    @staticmethod
-    def _raise_distributed_swap_errors(stage: str, errors) -> None:
-        failures = [error for error in errors if error is not None]
-        if failures:
-            raise RuntimeError(
-                f"Exclusive shared swap failed during {stage}: "
-                + "; ".join(failures))
-
-    def _swap_expert_weights_multi_card_shared(
-        self,
-        layer,
-        layer_idx: int,
-        placement,
-        per_rank_slots: int,
-        log2phy_h,
-        debug_context=None,
-    ) -> None:
-        """Atomically swap this rank's slots and commit global ownership.
-
-        Each rank performs only the D2H/H2D operations for its physical NPU
-        slots. Device-copy and shared-CPU-commit status are gathered before
-        any ownership map changes, so all ranks either publish the same new
-        mapping or fail closed.
-        """
-        from torch import distributed as dist
-        from vllm.distributed.parallel_state import get_ep_group
-
-        ep_cpu_group = get_ep_group().cpu_group
-        cpu_group = getattr(self, "_mc_runtime_cpu_group", None)
-        if cpu_group is None:
-            cpu_group = ep_cpu_group
-        if debug_context is not None:
-            debug_context["stage"] = "shared_swap_plan_diff"
-        global_swaps = self._exclusive_shared_swaps_from_placement(
-            layer_idx, placement, per_rank_slots)
-        base = self.ep_rank * per_rank_slots
-        local_swaps = [
-            (physical_slot - base, incoming_eid, victim_eid, cpu_slot)
-            for physical_slot, incoming_eid, victim_eid, cpu_slot
-            in global_swaps
-            if base <= physical_slot < base + per_rank_slots
-        ]
-        if self._debug:
-            sample_limit = getattr(
-                self, "_DEBUG_EXPERT_SAMPLE_LIMIT", 8)
-            self._log_mc_debug_event(
-                "SHARED_SWAP_PLAN",
-                debug_context,
-                global_swaps=len(global_swaps),
-                local_swaps=len(local_swaps),
-                swap_sample=global_swaps[:sample_limit],
-            )
-        scratch_bundles = []
-        local_error = None
-        if debug_context is not None:
-            debug_context["stage"] = "shared_swap_device_copy"
-        try:
-            scratch_bundles = [
-                self._allocate_exclusive_swap_bundle(layer_idx, cpu_slot)
-                for _, _, _, cpu_slot in local_swaps
-            ]
-            if local_swaps:
-                d2h_tasks = []
-                h2d_tasks = []
-                for swap, scratch in zip(local_swaps, scratch_bundles):
-                    local_slot, incoming_eid, victim_eid, _ = swap
-                    d2h_tasks.extend(self._build_expert_d2h_tasks(
-                        layer, layer_idx, victim_eid, local_slot, scratch))
-                    h2d_tasks.extend(self._build_expert_h2d_tasks(
-                        layer, layer_idx, incoming_eid, local_slot))
-                with torch_npu.npu.stream(self.load_stream):
-                    self._get_h2d_transport().copy_batch(
-                        d2h_tasks + h2d_tasks)
-                    for local_slot, _, _, _ in local_swaps:
-                        self._refresh_expert_fp32_scale(layer, local_slot)
-                    self._synchronize_h2d()
-        except BaseException as exc:
-            local_error = (
-                f"rank={self.ep_rank} {type(exc).__name__}: {exc}")
-            self._log_mc_debug_event(
-                "SHARED_SWAP_LOCAL_ERROR",
-                debug_context,
-                error_stage="device_copy",
-                error_type=type(exc).__name__,
-                error_message=repr(exc),
-            )
-            if self._debug:
-                logger.exception(
-                    "[EXCLUSIVE-SHARED-SWAP] local traceback rank=%s "
-                    "layer=%s stage=device_copy error=%r",
-                    self.ep_rank,
-                    layer_idx,
-                    exc,
-                )
-        device_errors = [None] * self.ep_size
-        if debug_context is not None:
-            debug_context["stage"] = "shared_swap_device_consensus"
-        self._run_mc_cpu_collective(
-            dist.all_gather_object,
-            device_errors,
-            local_error,
-            group=cpu_group,
-        )
-        self._raise_distributed_swap_errors("device copy", device_errors)
-
-        local_error = None
-        if debug_context is not None:
-            debug_context["stage"] = "shared_swap_cpu_commit"
-        try:
-            for (_, _, _, cpu_slot), scratch in zip(
-                    local_swaps, scratch_bundles):
-                for name, buffers in self._iter_cpu_expert_buffers(layer_idx):
-                    buffers[cpu_slot].copy_(scratch[name])
-        except BaseException as exc:
-            local_error = (
-                f"rank={self.ep_rank} {type(exc).__name__}: {exc}")
-            self._log_mc_debug_event(
-                "SHARED_SWAP_LOCAL_ERROR",
-                debug_context,
-                error_stage="shared_cpu_commit",
-                error_type=type(exc).__name__,
-                error_message=repr(exc),
-            )
-            if self._debug:
-                logger.exception(
-                    "[EXCLUSIVE-SHARED-SWAP] local traceback rank=%s "
-                    "layer=%s stage=shared_cpu_commit error=%r",
-                    self.ep_rank,
-                    layer_idx,
-                    exc,
-                )
-        cpu_errors = [None] * self.ep_size
-        if debug_context is not None:
-            debug_context["stage"] = "shared_swap_cpu_consensus"
-        self._run_mc_cpu_collective(
-            dist.all_gather_object,
-            cpu_errors,
-            local_error,
-            group=cpu_group,
-        )
-        self._raise_distributed_swap_errors("shared CPU commit", cpu_errors)
-
-        if debug_context is not None:
-            debug_context["stage"] = "shared_swap_ownership_commit"
-        for physical_slot, incoming_eid, victim_eid, cpu_slot in global_swaps:
-            self._cpu_slot_to_eid[layer_idx][cpu_slot] = victim_eid
-            self._eid_to_cpu_slot[layer_idx][incoming_eid] = -1
-            self._eid_to_cpu_slot[layer_idx][victim_eid] = cpu_slot
-            self._npu_slot_to_eid[layer_idx][physical_slot] = incoming_eid
-            self._eid_to_npu_slot[layer_idx][victim_eid] = -1
-            self._eid_to_npu_slot[layer_idx][incoming_eid] = physical_slot
-        self._mc_prev_log2phy[layer_idx] = placement.log2phy.clone()
-        my_experts = placement.per_rank_experts[self.ep_rank]
-        self._mc_resident[layer_idx] = {
-            slot: int(eid) for slot, eid in enumerate(my_experts)
-            if int(eid) >= 0
-        }
-        log2phy_h.copy_(placement.log2phy)
-        if debug_context is not None:
-            debug_context["stage"] = "shared_swap_ownership_validate"
-        self._validate_exclusive_ownership(layer_idx)
-        if debug_context is not None:
-            debug_context["stage"] = "shared_swap_complete"
-        if self._debug and global_swaps:
-            logger.info(
-                "[EXCLUSIVE-SHARED-SWAP] layer=%d rank=%d "
-                "global_swaps=%d local_swaps=%d",
-                layer_idx, self.ep_rank, len(global_swaps), len(local_swaps))
-
-    def _write_exclusive_log2phy(self, layer_idx: int, log2phy_np) -> None:
-        """Rebuild staged log2phy from the authoritative ownership map."""
-        log2phy_np.fill(-1)
-        for slot, eid in enumerate(self._npu_slot_to_eid[layer_idx]):
-            log2phy_np[eid] = slot
 
     @staticmethod
     def _refresh_expert_fp32_scale(layer, slot):
-        if hasattr(layer, 'w13_weight_scale_fp32'):
-            layer.w13_weight_scale_fp32[slot].copy_(
-                layer.w13_weight_scale.data[slot].to(torch.float32))
+        if hasattr(layer, "w13_weight_scale_fp32"):
+            layer.w13_weight_scale_fp32[slot].copy_(layer.w13_weight_scale.data[slot].to(torch.float32))
 
     def _load_expert_weights_into_slots(self, layer, layer_idx, loads):
         """Batch H2D-copy ``(slot, eid)`` loads, then refresh derived data."""
         loads = list(loads)
         tasks = []
         for slot, eid in loads:
-            tasks.extend(
-                self._build_expert_h2d_tasks(layer, layer_idx, eid, slot))
+            tasks.extend(self._build_expert_h2d_tasks(layer, layer_idx, eid, slot))
         self._get_h2d_transport().copy_batch(tasks)
         for slot, _ in loads:
             self._refresh_expert_fp32_scale(layer, slot)
@@ -5217,46 +3526,36 @@ class ExpertOffloadManager:
         """Compatibility wrapper for loading one expert into one device slot."""
         self._load_expert_weights_into_slots(layer, layer_idx, [(slot, eid)])
 
-    def _h2d_load_mc_misses(self, layer, layer_idx, misses, resident_map,
-                            debug_context=None):
+    def _h2d_load_mc_misses(self, layer, layer_idx, misses, resident_map, debug_context=None):
         """H2D-load missed experts (w13/w2 + quant attrs) into their slots on
         load_stream, then synchronize to gate the compute stream."""
-        if (self._debug and self._shared_h2d_layer_ready(layer_idx)
-                and misses):
-            remote_count = sum(
-                self._shard_local(eid) is None for _, eid in misses)
-            shared_backend = (
-                "TORCH-SHARED-CPU-H2D"
-                if self.torch_shared_cpu_weights_enabled
-                else "MEMFABRIC-SHARED-H2D")
+        if self._debug and self._shared_h2d_layer_ready(layer_idx) and misses:
+            remote_count = sum(self._shard_local(eid) is None for _, eid in misses)
             logger.info(
-                "[%s] layer=%d rank=%d loads=%d "
-                "remote=%d local=%d",
-                shared_backend, layer_idx, self.ep_rank, len(misses),
+                "[MEMFABRIC-SHARED-H2D] layer=%d rank=%d loads=%d remote=%d local=%d",
+                layer_idx,
+                self.ep_rank,
+                len(misses),
                 remote_count,
-                len(misses) - remote_count)
+                len(misses) - remote_count,
+            )
         if not self._debug:
             with torch_npu.npu.stream(self.load_stream):
-                self._load_expert_weights_into_slots(
-                    layer, layer_idx, misses)
+                self._load_expert_weights_into_slots(layer, layer_idx, misses)
                 for slot, eid in misses:
                     resident_map[slot] = eid
                 self._synchronize_h2d()
             return
         start_ns = time.perf_counter_ns()
-        self._log_mc_debug_event(
-            "H2D_ENTER", debug_context, misses=len(misses))
+        self._log_mc_debug_event("H2D_ENTER", debug_context, misses=len(misses))
         try:
             with torch_npu.npu.stream(self.load_stream):
-                self._load_expert_weights_into_slots(
-                    layer, layer_idx, misses)
+                self._load_expert_weights_into_slots(layer, layer_idx, misses)
                 for slot, eid in misses:
                     resident_map[slot] = eid
-                self._log_mc_debug_event(
-                    "H2D_SYNC_ENTER", debug_context, misses=len(misses))
+                self._log_mc_debug_event("H2D_SYNC_ENTER", debug_context, misses=len(misses))
                 self._synchronize_h2d()
-                self._log_mc_debug_event(
-                    "H2D_SYNC_EXIT", debug_context, misses=len(misses))
+                self._log_mc_debug_event("H2D_SYNC_EXIT", debug_context, misses=len(misses))
         except BaseException as exc:
             self._log_mc_debug_event(
                 "H2D_ERROR",
@@ -5273,15 +3572,22 @@ class ExpertOffloadManager:
             elapsed_us=elapsed_us,
         )
 
-    def _log_mc_decode_cache(self, layer_idx, my_experts, hits, misses,
-                             resident_map, log2phy, per_rank_slots,
-                             is_prefetch=False, h2d_ms=0.0, total_ms=0.0):
+    def _log_mc_decode_cache(
+        self,
+        layer_idx,
+        my_experts,
+        hits,
+        misses,
+        resident_map,
+        log2phy,
+        per_rank_slots,
+        is_prefetch=False,
+        h2d_ms=0.0,
+        total_ms=0.0,
+    ):
         if not self._debug:
             return
-        expected = {
-            slot: int(eid)
-            for slot, eid in enumerate(my_experts) if int(eid) >= 0
-        }
+        expected = {slot: int(eid) for slot, eid in enumerate(my_experts) if int(eid) >= 0}
         resident_mismatches = {
             slot: {"expected": eid, "resident": resident_map.get(slot)}
             for slot, eid in expected.items()
@@ -5297,10 +3603,7 @@ class ExpertOffloadManager:
         }
         requests = len(hits) + len(misses)
         hit_rate = len(hits) / requests if requests else 1.0
-        cpu_mode = (
-            "torch_shared" if self.torch_shared_cpu_weights_enabled else
-            "sharded" if self.offload_config.shard_per_rank else
-            "replicated")
+        cpu_mode = "sharded" if self.offload_config.shard_per_rank else "replicated"
         if not misses and not resident_mismatches and not mapping_mismatches:
             return
         sample_limit = self._DEBUG_EXPERT_SAMPLE_LIMIT
@@ -5309,17 +3612,28 @@ class ExpertOffloadManager:
             "hit=%d miss=%d hit_rate=%.4f resident_ok=%s mapping_ok=%s "
             "h2d_load_sample=%s prefetch=%s "
             "timing_ms{h2d=%.3f,total=%.3f}",
-            self.ep_rank, layer_idx, cpu_mode, len(expected), len(hits),
-            len(misses), hit_rate, not resident_mismatches,
-            not mapping_mismatches, misses[:sample_limit], is_prefetch,
-            h2d_ms, total_ms)
+            self.ep_rank,
+            layer_idx,
+            cpu_mode,
+            len(expected),
+            len(hits),
+            len(misses),
+            hit_rate,
+            not resident_mismatches,
+            not mapping_mismatches,
+            misses[:sample_limit],
+            is_prefetch,
+            h2d_ms,
+            total_ms,
+        )
         if resident_mismatches or mapping_mismatches:
             logger.warning(
-                "[MC_OBS] rank=%s L=%s DECODE cache mismatch: "
-                "resident_sample=%s mapping_sample=%s",
-                self.ep_rank, layer_idx,
+                "[MC_OBS] rank=%s L=%s DECODE cache mismatch: resident_sample=%s mapping_sample=%s",
+                self.ep_rank,
+                layer_idx,
                 list(resident_mismatches.items())[:sample_limit],
-                list(mapping_mismatches.items())[:sample_limit])
+                list(mapping_mismatches.items())[:sample_limit],
+            )
 
     def _log_expert_substitution(
         self,
@@ -5346,8 +3660,7 @@ class ExpertOffloadManager:
             return
         sample_limit = self._DEBUG_EXPERT_SAMPLE_LIMIT
         logger.info(
-            "[SUBST] layer=%d replacement_count=%d threshold=%.4f "
-            "replacement_sample=%s truncated=%d",
+            "[SUBST] layer=%d replacement_count=%d threshold=%.4f replacement_sample=%s truncated=%d",
             layer_idx,
             len(replacements),
             self.offload_config.expert_substitution_threshold,
@@ -5355,206 +3668,221 @@ class ExpertOffloadManager:
             max(0, len(replacements) - sample_limit),
         )
 
-    @staticmethod
-    def _ordered_unique_experts(topk_ids_h) -> list[int]:
-        """Flatten routed experts while retaining first-seen order."""
-        ordered = []
-        seen = set()
-        for eid in topk_ids_h.reshape(-1).tolist():
-            eid = int(eid)
-            if eid >= 0 and eid not in seen:
-                seen.add(eid)
-                ordered.append(eid)
-        return ordered
+    def _note_cb_failure(self, where: str) -> None:
+        """Turn a report-thread exception into a log line.
 
-    def _update_weights_exclusive_dynamic(
-        self,
-        topk_ids_h,
-        log2phy_np,
-        layer,
-        layer_idx: int,
-        topk_weights_h,
-        is_prefetch: bool,
-    ) -> None:
-        """Single-card decode/prefetch planner for exclusive ownership."""
-        lock = self._exclusive_layer_locks[layer_idx]
-        with lock:
-            with torch_npu.npu.stream(self.load_stream):
-                # CPU/NPU ownership is authoritative.  Rebuild the staged map
-                # before planning so a delayed host callback cannot reintroduce
-                # an older mapping snapshot.
-                self._write_exclusive_log2phy(layer_idx, log2phy_np)
-                ordered = self._ordered_unique_experts(topk_ids_h)
-                if not is_prefetch and self.cache_policy is not None:
-                    router_scores = (
-                        topk_weights_h.tolist()
-                        if topk_weights_h is not None else None)
-                    needed = self.cache_policy.observe(
-                        layer_idx,
-                        topk_ids_h.tolist(),
-                        router_scores=router_scores,
-                    )
-                else:
-                    needed = set(ordered)
+        Under ACL-graph replay these callbacks run on the report thread,
+        where an exception reaches neither the forward thread nor the log — the
+        run just silently stops paging and stops recording statistics. The
+        counter is lazily initialised so this needs no __init__ edit.
+        """
+        count = getattr(self, "_cb_failures", 0) + 1
+        self._cb_failures = count
+        if count <= 5:
+            logger.exception(
+                "[EXPERT-OFFLOAD] %s host callback failed (#%d) — this layer's paging did not complete", where, count
+            )
+        elif count == 6:
+            logger.error("[EXPERT-OFFLOAD] %s host callback keeps failing; further tracebacks suppressed", where)
 
-                slot_owner = {
-                    slot: eid for slot, eid in enumerate(
-                        self._npu_slot_to_eid[layer_idx])
-                }
-                on_device = set(slot_owner.values())
-                ordered_misses = [
-                    eid for eid in ordered if eid not in on_device]
-                if is_prefetch:
-                    ordered_misses = ordered_misses[:self.prefetch_topk]
-                else:
-                    # LRC observe currently returns the routed set.  Include
-                    # any future policy-added experts deterministically.
-                    ordered_misses.extend(sorted(
-                        (needed - on_device) - set(ordered_misses)))
-                need_to_load = set(ordered_misses)
-                already_there = needed & on_device
+    def _update_weights_guarded(self, args):
+        """_update_weights, with the report-thread exception made visible."""
+        try:
+            self._update_weights(args)
+        except Exception:
+            self._note_cb_failure("update_weights")
 
-                if self.cache_policy is not None:
-                    self._record_cache_stats(
-                        layer_idx, already_there, need_to_load,
-                        needed, on_device)
+    def _update_weights_multi_card_guarded(self, args):
+        """_update_weights_multi_card, same guard.
 
-                reusable_slots = [
-                    slot for slot, eid in slot_owner.items()
-                    if eid not in needed
-                ]
-                victims = None
-                if self.cache_policy is not None:
-                    victims = iter(self.cache_policy.choose_victims(
-                        layer_idx,
-                        slot_owner,
-                        protected=needed,
-                        count=len(ordered_misses),
-                    ))
+        Note this also catches the deliberate placement-overflow RuntimeError.
+        That was already being swallowed under replay; the guard only makes it
+        loud. It is a hard configuration error, not a recoverable condition.
+        """
+        try:
+            self._update_weights_multi_card(args)
+        except Exception:
+            self._note_cb_failure("update_weights_multi_card")
 
-                swaps = []
-                used_slots = set()
-                for incoming_eid in ordered_misses:
-                    cpu_slot = self._eid_to_cpu_slot[
-                        layer_idx][incoming_eid]
-                    if cpu_slot < 0:
-                        raise RuntimeError(
-                            "Exclusive ownership expected incoming expert on "
-                            f"CPU: layer={layer_idx}, expert={incoming_eid}")
-                    if victims is not None:
-                        victim_eid = next(victims, None)
-                        slot = (-1 if victim_eid is None else
-                                self._eid_to_npu_slot[layer_idx][victim_eid])
-                    elif reusable_slots:
-                        slot = reusable_slots.pop()
-                        victim_eid = slot_owner[slot]
-                    else:
-                        slot = -1
-                        victim_eid = None
-                    if slot < 0 or slot in used_slots:
-                        if is_prefetch:
-                            break
-                        raise RuntimeError(
-                            "No evictable NPU expert slot for reactive "
-                            f"exclusive swap: layer={layer_idx}, "
-                            f"needed={sorted(needed)}, "
-                            f"resident={sorted(on_device)}")
-                    used_slots.add(slot)
-                    swaps.append((slot, incoming_eid,
-                                  int(victim_eid), cpu_slot))
+    def _update_weights(self, args):
+        # The reactive form is a 9-tuple. Substitution runs on device in
+        # update_weights; topk_ids_gt_h carries the pre-substitution IDs and
+        # prune_debug_h carries optional pruning diagnostics. The 6-element
+        # prefetch form is unchanged.
+        if len(args) == 6:
+            (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h, is_prefetch) = args
+            do_substitution = False
+            topk_ids_gt_h = None
+            prune_debug_h = None
+        else:
+            (
+                topk_ids_h,
+                log2phy_np,
+                layer,
+                layer_idx,
+                topk_weights_h,
+                is_prefetch,
+                do_substitution,
+                topk_ids_gt_h,
+                prune_debug_h,
+            ) = args
 
-                if self._debug:
-                    flag = ("[PREFETCH-SWAP]" if is_prefetch
-                            else "[UPDATE-SWAP]")
-                    already_there_layer = (
-                        set(topk_ids_h[0].tolist()) & on_device)
-                    requests = len(already_there) + len(need_to_load)
-                    hit_rate = (len(already_there) / requests
-                                if requests else 0.0)
-                    logger.info(
-                        "%s l=%d expert_hit=%s expert_miss=%s "
-                        "hit_rate=%.2f layer_expert_hit=%s needed=%s "
-                        "topk_ids_h=%s swaps=%s",
-                        flag, layer_idx, sorted(already_there),
-                        sorted(need_to_load), hit_rate,
-                        already_there_layer, needed, topk_ids_h,
-                        [(slot, incoming, victim)
-                         for slot, incoming, victim, _ in swaps],
-                    )
-                    if len(swaps) < len(ordered_misses):
-                        logger.info(
-                            "%s l=%d SHORTFALL: need %d load but only %d "
-                            "swaps planned, to_load=%s",
-                            flag, layer_idx, len(ordered_misses), len(swaps),
-                            ordered_misses[len(swaps):][:20],
-                        )
-                self._swap_expert_weights(
-                    layer, layer_idx, swaps, log2phy_np)
+        if self.offload_config.experts_pruning_enabled and not is_prefetch and prune_debug_h is not None:
+            miss_routes = [int(x) for x in prune_debug_h[:, 0, :].reshape(-1).tolist() if int(x) >= 0]
+            pruned_routes = [int(x) for x in prune_debug_h[:, 1, :].reshape(-1).tolist() if int(x) >= 0]
+            remaining_routes = [int(x) for x in prune_debug_h[:, 2, :].reshape(-1).tolist() if int(x) >= 0]
+            miss_ids = sorted(set(miss_routes))
+            pruned_ids = sorted(set(pruned_routes))
+            saved_h2d_ids = sorted(set(miss_routes) - set(remaining_routes))
+            prune_record = {
+                "layer": layer_idx,
+                "num_tokens": topk_ids_h.shape[0],
+                "miss_ids": miss_ids,
+                "miss_count": len(miss_ids),
+                "miss_routes": len(miss_routes),
+                "pruned_ids": pruned_ids,
+                "pruned_unique_count": len(pruned_ids),
+                "pruned_routes": len(pruned_routes),
+                "remaining_miss_ids": sorted(set(remaining_routes)),
+                "saved_h2d_ids": saved_h2d_ids,
+                "saved_h2d_count": len(saved_h2d_ids),
+            }
+            logger.info(
+                "[EXPERT-PRUNE-LAYER-JSON] %s",
+                json.dumps(
+                    prune_record,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
 
-    def _update_weights_replicated(
-        self,
-        topk_ids_h,
-        log2phy_np,
-        layer,
-        layer_idx: int,
-        topk_weights_h,
-        is_prefetch: bool,
-    ) -> None:
-        """Single-card decode/prefetch planner for replicated CPU storage."""
+        # Resolve the collector once per call. ``collecting`` is false during
+        # profile runs, warmups, and graph capture, and is re-read on replay.
+        stats = self._stats if (self._stats is not None and self._stats.collecting) else None
+        gt_ids = None
+        subst_count = 0.0
+        # Substitution already happened on NPU before this callback. Only the
+        # pre- and post-substitution ID buffers remain to be inspected here.
+        if do_substitution and topk_ids_gt_h is not None:
+            if self._debug:
+                self._log_expert_substitution(layer_idx, topk_ids_gt_h, topk_ids_h)
+            if stats is not None:
+                gt_ids = set(topk_ids_gt_h.reshape(-1).tolist())
+                subst_count = float((topk_ids_gt_h != topk_ids_h).sum())
         with torch_npu.npu.stream(self.load_stream):
             # Hotness observation only on the reactive (non-prefetch) H2D path
             # with LRC policy enabled.
+            def _valid_eids(ids_t):
+                return [e for e in ids_t.reshape(-1).tolist() if 0 <= e < self.num_total_experts]
+
             if not is_prefetch and self.cache_policy is not None:
+                id_rows = topk_ids_h.tolist()
                 router_scores = topk_weights_h.tolist() if topk_weights_h is not None else None
+
                 needed = self.cache_policy.observe(
                     layer_idx,
-                    topk_ids_h.tolist(),
+                    id_rows,
                     router_scores=router_scores,
                 )
             else:
-                needed = set(topk_ids_h.reshape(-1).tolist())
+                needed = set(_valid_eids(topk_ids_h))
 
             l2p_list = log2phy_np.tolist()
             slot_owner = {s: e for e, s in enumerate(l2p_list) if s >= 0}
             on_device = set(slot_owner.values())
 
             if is_prefetch:
-                # Prefetch: only load the truly-missing top-N predicted experts.
-                ordered_misses = [e for e in topk_ids_h.reshape(-1).tolist() if e not in on_device]
-                need_to_load = set(ordered_misses[:self.prefetch_topk])
+                # Prefetch: load at most prefetch_topk experts for the layer — a
+                # GLOBAL cap across all predicted token rows, not one per token —
+                # chosen as the highest-scoring predictions not already resident.
+                # An expert predicted by several tokens is one transfer and takes
+                # its best score across them.
+                rows_ids = topk_ids_h.tolist()
+                rows_w = topk_weights_h.tolist() if topk_weights_h is not None else None
+                n_rows = len(rows_ids)
+                best_score: dict[int, float] = {}
+                for r, row in enumerate(rows_ids):
+                    for c, eid in enumerate(row):
+                        if eid in on_device:
+                            continue  # resident: nothing to transfer
+                        if rows_w is not None:
+                            score = rows_w[r][c]
+                        else:
+                            # No scores available: interleave rows by rank so
+                            # every row's rank-0 outranks every row's rank-1,
+                            # rather than concatenating rows — the bias this
+                            # block exists to remove. At one row this is plain
+                            # column order.
+                            score = -float(c * n_rows + r)
+                        if score > best_score.get(eid, float("-inf")):
+                            best_score[eid] = score
+                need_to_load = set(sorted(best_score, key=best_score.get, reverse=True)[: self.prefetch_topk])
             else:
                 need_to_load = needed - on_device
-            already_there = needed & on_device              # for cache_stats / debug
 
-            if self.cache_policy is not None:
+            already_there = needed & on_device  # for cache_stats / debug
+
+            # both hit-rate numerators must be taken HERE — the load loop
+            # below mutates on_device. `needed` is the post-substitution routed
+            # set; gt_set is what the router originally selected (identical when
+            # substitution is off, which is what makes the two series equal in
+            # that case, exactly).
+            stat_hit_post = stat_hit_pre = None
+            gt_set = None
+            if stats is not None and not is_prefetch:
+                gt_set = gt_ids if gt_ids is not None else needed
+                stat_hit_post = len(already_there) / len(needed) if needed else 0.0
+                stat_hit_pre = len(gt_set & on_device) / len(gt_set) if gt_set else 0.0
+
+            # Reactive pass only. On the prefetch pass `needed` is the
+            # PREDICTED set, so these legacy counters were mixing predicted with
+            # actual routing and their hit rate moved when prefetch was toggled.
+            if self.cache_policy is not None and not is_prefetch:
                 self._record_cache_stats(layer_idx, already_there, need_to_load, needed, on_device)
-            reusable_slots = [s for s, e in slot_owner.items()
-                            if e not in needed]          # slots to recycle
+            reusable_slots = [s for s, e in slot_owner.items() if e not in needed]  # slots to recycle
 
             if self._debug:
-                flag = '[PREFETCH-W]' if is_prefetch else '[UPDATE-W]'
-                already_there_layer = set(topk_ids_h[0].tolist()) & on_device
-                logger.info("%s l=%d expert_hit=%s expert_miss=%s hit_rate=%.2f layer_expert_hit=%s needed=%s topk_ids_h=%s" ,
-                            flag,layer_idx, sorted(already_there),
-                            # sorted(need_to_load), len(already_there_layer) / topk_ids_h.shape[1],
-                            sorted(need_to_load), len(already_there) / (len(already_there) + len(need_to_load)) if len(already_there) + len(need_to_load) > 0 else 0,
-                            already_there_layer, needed, topk_ids_h)
+                flag = "[PREFETCH-W]" if is_prefetch else "[UPDATE-W]"
+                already_there_layer = set(_valid_eids(topk_ids_h[0:1])) & on_device
+                logger.info(
+                    "%s l=%d expert_hit=%s expert_miss=%s hit_rate=%.2f layer_expert_hit=%s needed=%s topk_ids_h=%s",
+                    flag,
+                    layer_idx,
+                    sorted(already_there),
+                    # sorted(need_to_load), len(already_there_layer) / topk_ids_h.shape[1],
+                    sorted(need_to_load),
+                    len(already_there) / (len(already_there) + len(need_to_load))
+                    if len(already_there) + len(need_to_load) > 0
+                    else 0,
+                    already_there_layer,
+                    needed,
+                    topk_ids_h,
+                )
                 if need_to_load and len(need_to_load) > len(reusable_slots):
-                    logger.info("%s l=%d SHORTFALL: need %d load but only %d slots, "
-                                "to_load=%s",
-                                flag,layer_idx, len(need_to_load), len(reusable_slots),
-                                sorted(need_to_load)[:20])
+                    logger.info(
+                        "%s l=%d SHORTFALL: need %d load but only %d slots, to_load=%s",
+                        flag,
+                        layer_idx,
+                        len(need_to_load),
+                        len(reusable_slots),
+                        sorted(need_to_load)[:20],
+                    )
 
+            # (merge): rank all resident candidates once with
+            # choose_victims(count=len(need_to_load)) instead of calling
+            # choose_victim() per miss.
             n_copies = 0
             planned_loads = []
             victims = None
             if self.cache_policy is not None:
-                victims = iter(self.cache_policy.choose_victims(
-                    layer_idx,
-                    slot_owner,
-                    protected=needed,
-                    count=len(need_to_load),
-                ))
+                victims = iter(
+                    self.cache_policy.choose_victims(
+                        layer_idx,
+                        slot_owner,
+                        protected=needed,
+                        count=len(need_to_load),
+                    )
+                )
             for eid in need_to_load:
                 if self.cache_policy is not None:
                     victim = next(victims, None)
@@ -5567,247 +3895,190 @@ class ExpertOffloadManager:
                     victim = None
 
                 if slot < 0:
+                    # count the shortfall
+                    if stats is not None and not is_prefetch:
+                        stats.note_shortfall()
                     if self._debug:
                         logger.info(
-                            "[UPDATE-W] l=%d NO SLOTS: %d experts could not be loaded, "
-                            "missed=%s",
-                            layer_idx, len(need_to_load) - n_copies,
-                            sorted(list(need_to_load))[n_copies:][:20])
+                            "[UPDATE-W] l=%d NO SLOTS: %d experts could not be loaded, missed=%s",
+                            layer_idx,
+                            len(need_to_load) - n_copies,
+                            sorted(list(need_to_load))[n_copies:][:20],
+                        )
                     break  # no free slots — should not happen in normal usage
-                
+
+                # (merge): defer the copy. The H2D is submitted as one
+                # transport batch after the loop so MemFabric sparse_copy sees a single descriptor list
                 planned_loads.append((slot, eid))
                 # Update mapping
                 if victim is None:
                     victim = slot_owner[slot]
-                log2phy_np[victim] = -1             # evict old occupant
+                log2phy_np[victim] = -1  # evict old occupant
                 on_device.discard(victim)
-                log2phy_np[eid] = slot               # assign slot to new expert
+                log2phy_np[eid] = slot  # assign slot to new expert
                 slot_owner[slot] = eid
                 on_device.add(eid)
                 if slot in reusable_slots:
                     reusable_slots.remove(slot)
                 n_copies += 1
 
-            self._load_expert_weights_into_slots(
-                layer, layer_idx, planned_loads)
+            # (merge): submit the batch first so the CPU-only stats
+            # bookkeeping below overlaps the transfer, then synchronize
+            self._load_expert_weights_into_slots(layer, layer_idx, planned_loads)
+
+            # what was ACTUALLY transferred this pass — identical to the
+            # per-expert loop's `loaded_ids`, derived from planned_loads.
+            loaded_ids = [eid for _slot, eid in planned_loads]
+
+            # hand the prefetch pass's set arithmetic across to the
+            # reactive pass, then record. Placed after the load loop
+            if stats is not None:
+                if is_prefetch:
+                    # P = predicted set, |A| = predicted-and-already-resident,
+                    # N = actually transferred. G is not known on this pass.
+                    # Last-writer-wins; the reactive pass for this same layer
+                    # pops it later in this very forward.
+                    with self._prefetch_state_lock:
+                        self._prefetch_stats_pending[layer_idx] = (set(needed), len(already_there), set(loaded_ids))
+                else:
+                    with self._prefetch_state_lock:
+                        pending = self._prefetch_stats_pending.pop(layer_idx, None)
+                    pred_acc = pred_prec = pf_in_lrc = pf_useful = None
+                    psize = pf_loads = pf_hit = pf_waste = None
+                    # the compute stream's block at this layer's prefetch
+                    # join. Read here because this callback is stream-ordered
+                    # after the `end` record and runs on every graph replay.
+                    pf_wait = self._read_pf_wait(layer_idx) if self._pf_wait_timing else None
+                    if pending is not None:
+                        predicted, n_already, transferred = pending
+                        psize = float(len(predicted))
+                        pf_loads = float(len(transferred))
+                        overlap = len(predicted & gt_set) if gt_set else 0
+                        # |N&G| computed ONCE and shared with pf_useful
+                        transferred_hits = len(transferred & gt_set) if gt_set else 0
+                        pf_hit = float(transferred_hits)
+                        pf_waste = float(len(transferred) - transferred_hits)
+                        if gt_set:
+                            pred_acc = overlap / len(gt_set)
+                            if predicted:
+                                pred_prec = overlap / len(predicted)
+                        if predicted:
+                            pf_in_lrc = n_already / len(predicted)
+                        if transferred:
+                            # reuses transferred_hits. Still no sample when nothing was transferred.
+                            pf_useful = transferred_hits / len(transferred)
+                    stats.record_layer(
+                        layer_idx,
+                        # |G| is the layer's unique routed-expert count, which
+                        # is what shows how much MTP's extra token positions
+                        # overlap: 3 positions x topk 6 = 18 routing slots collapse to |G| unique experts.
+                        gsize=float(len(gt_set)) if gt_set else 0.0,
+                        psize=psize,
+                        hit_post=stat_hit_post,
+                        hit_pre=stat_hit_pre,
+                        loads=float(n_copies),
+                        pf_loads=pf_loads,
+                        pf_hit=pf_hit,
+                        pf_waste=pf_waste,
+                        subst=subst_count,
+                        pred_acc=pred_acc,
+                        pred_prec=pred_prec,
+                        pf_in_lrc=pf_in_lrc,
+                        pf_useful=pf_useful,
+                        pf_wait=pf_wait,
+                    )
+
+            # (merge): _synchronize_h2d() replaces load_stream.synchronize(). On the torch backend they are the same
+            # call; on MemFabric it also retires the in-flight sparse-copy
+            # descriptors. Still load-bearing under replay.
             self._synchronize_h2d()
 
-    def _update_weights(self, args):
-        """Apply common routing updates, then dispatch by storage strategy."""
-        if len(args) == 6:
-            (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
-             is_prefetch) = args
-            do_substitution = False
-            router_logits_h = None
-            scoring_func = "softmax"
-            correction_bias_h = None
-        else:
-            (topk_ids_h, log2phy_np, layer, layer_idx, topk_weights_h,
-             is_prefetch, do_substitution, router_logits_h, scoring_func,
-             correction_bias_h) = args
-        if do_substitution:
-            original_ids = (
-                topk_ids_h[:, :self.topk].clone()
-                if self._debug else None
-            )
-            substituted_ids = substitute_experts(
-                router_logits_h,
-                topk_ids_h[:, :self.topk],
-                torch.from_numpy(log2phy_np),
-                expert_substitution_threshold=(
-                    self.offload_config.expert_substitution_threshold),
-                scoring_func=scoring_func,
-                e_score_correction_bias=correction_bias_h,
-            )
-            if original_ids is not None:
-                self._log_expert_substitution(
-                    layer_idx, original_ids, substituted_ids)
-            topk_ids_h[:, :self.topk].copy_(substituted_ids)
-
-        update_strategy = (
-            self._update_weights_exclusive_dynamic
-            if self.exclusive_dynamic_enabled
-            else self._update_weights_replicated
-        )
-        update_strategy(
-            topk_ids_h,
-            log2phy_np,
-            layer,
-            layer_idx,
-            topk_weights_h,
-            is_prefetch,
-        )
-
-    def _seed_single_card_hot_experts(self) -> None:
-        """Seed cache state for experts already placed during weight load."""
-        for layer_idx in range(len(self.moe_layers)):
-            pairs = self.offload_config.hot_expert_pairs_for_layer(
-                layer_idx, self.num_total_experts)
-            if not pairs:
-                logger.warning("[HOT-PRELOAD] l=%d missing in json; "
-                               "using ordinary initial placement", layer_idx)
-                continue
-            ndev = self.num_device_experts_for_layer(layer_idx)
-            weights = dict(pairs[:ndev])
-            if self.exclusive_dynamic_enabled:
-                expected = (
-                    self.offload_config.initial_device_experts_for_layer(
-                        layer_idx, self.num_total_experts))
-                actual = self._npu_slot_to_eid[layer_idx]
-                if actual != expected:
-                    raise RuntimeError(
-                        "Exclusive hot experts were not placed during weight "
-                        f"initialization: layer={layer_idx}, "
-                        f"expected={expected}, actual={actual}")
-                self._validate_exclusive_ownership(layer_idx)
-            if self.cache_policy is not None:
-                self.cache_policy.seed_layer_hotness(layer_idx, weights)
-            if self._debug:
-                logger.info(
-                    "[HOT-PRELOAD] l=%d initialized %d hot experts, ids=%s",
-                    layer_idx, len(weights), list(weights)[:20])
-
     def _preload_hot_experts(self):
-        """Finalize offline hot-expert placement and seed LRC hotness.
+        """Preload each layer's top-N hot experts into device resident slots
+        from offline statistics, and seed LRC hotness so they aren't evicted
+        before runtime observe() builds up real stats.
 
         Triggered from _finalize_offload() when hot_expert_preload is on.
-        Single-card weights are already loaded directly into their ranked
-        device slots, so this path only seeds the cache. Multi-card placement
-        still requires its collective rank planner and retains the historical
-        post-load H2D path. No-op when the switch is off.
+        Reads hot_experts_file: {"<layer_idx>": [[expert_id, weight], ...]},
+        weight descending. Slot i = the i-th hottest expert. Fully rewrites
+        layer.log2phy (non-preloaded experts -> -1). No-op when the switch
+        is off, so default behavior is unchanged.
         """
         if not self.offload_config.hot_expert_preload:
             return
-        if not self.enable_multi_card:
-            self._seed_single_card_hot_experts()
+        path = self.offload_config.hot_experts_file
+        if not path:
+            logger.warning("[HOT-PRELOAD] hot_expert_preload=true but hot_experts_file empty, skip")
             return
-        if self.exclusive_shared_cpu_enabled:
-            if self.cache_policy is not None:
-                self._mc_lrc = self.cache_policy
-            for layer_idx in range(len(self.moe_layers)):
-                expected = (
-                    self.offload_config.initial_device_experts_for_layer(
-                        layer_idx, self.num_total_experts))
-                actual = self._npu_slot_to_eid[layer_idx]
-                if actual != expected:
-                    raise RuntimeError(
-                        "Exclusive shared hot experts were not loaded "
-                        "directly into their initial global NPU slots: "
-                        f"layer={layer_idx}, expected={expected}, "
-                        f"actual={actual}")
-                pairs = dict(
-                    self.offload_config.hot_expert_pairs_for_layer(
-                        layer_idx, self.num_total_experts))
-                weights = {
-                    eid: pairs[eid] for eid in actual if eid in pairs
-                }
-                if self.cache_policy is not None:
-                    self.cache_policy.seed_layer_hotness(layer_idx, weights)
-                self._validate_exclusive_ownership(layer_idx)
-            logger.info(
-                "[HOT-PRELOAD] exclusive shared experts were loaded "
-                "directly during checkpoint initialization")
-            return
-        if self.exclusive_sharded_cpu_enabled:
-            if self.cache_policy is not None:
-                self._mc_lrc = self.cache_policy
-            for layer_idx in range(len(self.moe_layers)):
-                expected_local = (
-                    self.offload_config.initial_device_experts_for_rank(
-                        layer_idx, self.num_total_experts,
-                        self.ep_size, self.ep_rank))
-                if self._npu_slot_to_eid[layer_idx] != expected_local:
-                    raise RuntimeError(
-                        "Rank-local exclusive hot experts were not loaded "
-                        "directly into their initial NPU slots: "
-                        f"rank={self.ep_rank}, layer={layer_idx}, "
-                        f"expected={expected_local}, "
-                        f"actual={self._npu_slot_to_eid[layer_idx]}")
-                all_initial = []
-                for rank in range(self.ep_size):
-                    all_initial.extend(
-                        self.offload_config.initial_device_experts_for_rank(
-                            layer_idx, self.num_total_experts,
-                            self.ep_size, rank))
-                pairs = dict(
-                    self.offload_config.hot_expert_pairs_for_layer(
-                        layer_idx, self.num_total_experts))
-                weights = {
-                    eid: pairs[eid] for eid in all_initial if eid in pairs
-                }
-                if self.cache_policy is not None:
-                    self.cache_policy.seed_layer_hotness(layer_idx, weights)
-                self._validate_exclusive_ownership(layer_idx)
-            logger.info(
-                "[HOT-PRELOAD] rank-local exclusive experts were loaded "
-                "directly during checkpoint initialization")
-            return
-        if self.cache_policy is not None:
+        # 相对路径相对 expert_offload 模块目录 resolve（热点 JSON 始终放该目录）
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(__file__), path)
+        import json
+
+        with open(path) as f:
+            hot = json.load(f)  # {"<layer_idx>": [[eid,w],...]}
+        if self.enable_multi_card and self.cache_policy is not None:
             # Multi-card decode uses _mc_lrc; share the already configured
             # per-layer policy so offline seeds and runtime observations evolve
             # from the same state.
             self._mc_lrc = self.cache_policy
         with torch_npu.npu.stream(self.load_stream):
             for layer_idx, layer in enumerate(self.moe_layers):
-                pairs = self.offload_config.hot_expert_pairs_for_layer(
-                    layer_idx, self.num_total_experts)
+                pairs = hot.get(str(layer_idx))
                 if not pairs:
-                    logger.warning("[HOT-PRELOAD] l=%d missing in json, skip",
-                                   layer_idx)
+                    logger.warning("[HOT-PRELOAD] l=%d missing in json, skip", layer_idx)
                     continue
-                from vllm_ascend.expert_offload.multi_card_planner import (
-                    plan_hot_preload)
-                per_rank_slots = (
-                    self.offload_config.num_device_experts_for_rank(
-                        layer_idx, self.ep_size))
-                force_shard = (
-                    getattr(self, '_shard_size', None)
-                    if (self.offload_config.shard_per_rank
-                        and not self._shared_h2d_layer_ready(layer_idx))
-                    else None)
-                placement = plan_hot_preload(
-                    pairs,
-                    global_num_experts=self.num_total_experts,
-                    ep_size=self.ep_size,
-                    num_device_experts=per_rank_slots,
-                    force_shard=force_shard,
-                )
-                my_experts = placement.per_rank_experts[self.ep_rank]
-                for slot, eid in enumerate(my_experts):
-                    if eid >= 0:
-                        self._load_expert_weights_into_slot(
-                            layer, layer_idx, eid, slot)
-                self.log2phy_h.copy_(placement.log2phy)
-                self._mc_prev_log2phy[layer_idx] = placement.log2phy.clone()
-                self._mc_resident[layer_idx] = {
-                    slot: int(eid)
-                    for slot, eid in enumerate(my_experts) if eid >= 0
-                }
-                pair_weights = dict(pairs)
-                weights = {
-                    eid: pair_weights[eid]
-                    for eid, physical_id in enumerate(
-                        placement.log2phy.tolist())
-                    if physical_id >= 0
-                }
-                layer.log2phy.copy_(self.log2phy_h)         # H2D writeback
-                if self.torch_shared_cpu_weights_enabled:
-                    # Release pageable->pinned staging after each layer so
-                    # offline hot preload cannot retain a model-wide pinned
-                    # duplicate until the final synchronization.
-                    self._synchronize_h2d()
+                if self.enable_multi_card:
+                    from vllm_ascend.expert_offload.multi_card_planner import plan_hot_preload
+
+                    per_rank_slots = self.offload_config.num_device_experts_for_rank(layer_idx, self.ep_size)
+                    force_shard = (
+                        getattr(self, "_shard_size", None)
+                        if (self.offload_config.shard_per_rank and not self._shared_h2d_layer_ready(layer_idx))
+                        else None
+                    )
+                    placement = plan_hot_preload(
+                        pairs,
+                        global_num_experts=self.num_total_experts,
+                        ep_size=self.ep_size,
+                        num_device_experts=per_rank_slots,
+                        force_shard=force_shard,
+                    )
+                    my_experts = placement.per_rank_experts[self.ep_rank]
+                    for slot, eid in enumerate(my_experts):
+                        if eid >= 0:
+                            self._load_expert_weights_into_slot(layer, layer_idx, eid, slot)
+                    self.log2phy_h.copy_(placement.log2phy)
+                    self._mc_prev_log2phy[layer_idx] = placement.log2phy.clone()
+                    self._mc_resident[layer_idx] = {slot: int(eid) for slot, eid in enumerate(my_experts) if eid >= 0}
+                    pair_weights = {int(eid): float(weight) for eid, weight in pairs}
+                    weights = {
+                        eid: pair_weights[eid]
+                        for eid, physical_id in enumerate(placement.log2phy.tolist())
+                        if physical_id >= 0
+                    }
+                else:
+                    ndev = self.num_device_experts_for_layer(layer_idx)
+                    selected_pairs = pairs[:ndev]
+                    self.log2phy_np[:] = -1
+                    weights = {}
+                    for slot, (eid, weight) in enumerate(selected_pairs):
+                        self._load_expert_weights_into_slot(layer, layer_idx, eid, slot)
+                        self.log2phy_np[eid] = slot
+                        weights[eid] = weight
+                layer.log2phy.copy_(self.log2phy_h)  # H2D writeback
                 if self.cache_policy is not None:
                     self.cache_policy.seed_layer_hotness(layer_idx, weights)
                 if self._debug:
                     logger.info(
-                        "[HOT-PRELOAD] l=%d loaded %d hot experts, ids=%s",
-                        layer_idx, len(weights), list(weights)[:20])
+                        "[HOT-PRELOAD] l=%d loaded %d hot experts, ids=%s", layer_idx, len(weights), list(weights)[:20]
+                    )
             self._synchronize_h2d()
 
     def predict_next_layer_experts_npu(
         self,
         layer_idx: int,
-        hidden_states: torch.Tensor | None,
+        hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Predict which experts layer layer_idx+1 will need, on NPU.
 
@@ -5818,15 +4089,17 @@ class ExpertOffloadManager:
         - Hash-routed layers (first num_hash_layers): experts come from the
           tid2eid table indexed by token id (deterministic, 100% accurate).
         - Learned layers (the rest): softmax + topk on the gate logits of the
-          first token.
+          first `expert_prefetch_tokens` token rows.
 
         Args:
             layer_idx: Current layer index.
             hidden_states: [num_tokens, hidden_dim] NPU tensor.
 
         Returns:
-            (topk_weights, topk_ids) for the first token only, both
-            [1, topk] NPU tensors, or None if prediction is not possible.
+            (topk_weights, topk_ids), both [n_tok, topk] NPU tensors where
+            n_tok = min(expert_prefetch_tokens, forward rows), or None if
+            prediction is not possible. CHANGE: was "[1, topk], first token
+            only" — that stopped being true when expert_prefetch_tokens landed.
         """
         next_idx = layer_idx + 1
         if next_idx >= len(self.moe_layers):
@@ -5850,58 +4123,50 @@ class ExpertOffloadManager:
             input_ids = get_forward_context().input_ids
             if input_ids is None:
                 return None
-            # [1] on the tid2eid device -> index_select -> [1, topk] int32.
-            first_id = input_ids[:1].to(tid2eid.device).long()
-            topk_ids = tid2eid.index_select(0, first_id)
+            # n rows, was input_ids[:1]. min() against both the hidden
+            # rows and the context's id count: they agree on the decode path
+            n_tok = min(self.prefetch_tokens, hidden_states.shape[0], input_ids.shape[0])
+            if n_tok < 1:
+                return None
+            # [n_tok] on the tid2eid device -> index_select -> [n_tok, topk] int32.
+            tok_ids = input_ids[:n_tok].to(tid2eid.device).long()
+            topk_ids = tid2eid.index_select(0, tok_ids)
             # Selection does not depend on affinity for hash layers, so the
             # router weight is meaningless; uniform placeholders keep the
-            # [1, topk] shape the caller expects (cache_router_weight is
-            # optional).
+            # [n_tok, topk] shape the caller expects. NOTE this leaves every hash
+            # candidate score-tied, so the single-card ranking in _update_weights
+            # falls back to insertion order for these layers — harmless, since
+            # tid2eid prediction is exact and any miss is equally worth fetching.
             topk_weights = torch.full(
-                (1, self.topk), 1.0 / self.topk,
-                dtype=torch.float32, device=topk_ids.device,
+                (n_tok, self.topk),
+                1.0 / self.topk,
+                dtype=torch.float32,
+                device=topk_ids.device,
             )
             return topk_weights, topk_ids
 
-        # Predict the first token's full top-k candidate list. The H2D path
-        # independently caps transfers with prefetch_topk, so if a higher-ranked
-        # candidate is already resident it can still prefetch the next miss.
-        # Keeping the full width also matches the fixed-width CPU staging buffer.
-        # Latent-MoE models such as Kimi K3 route with the full-width residual
-        # stream but execute their experts on a down-projected hidden state. A
-        # quant method must never make that optimization fatal if it supplies
-        # the routed latent by mistake.
-        if hidden_states is None or hidden_states.ndim != 2:
-            logger.warning_once(
-                "[PREFETCH] skip learned-router prediction because the "
-                "hidden state is unavailable or not a matrix: layer=%d "
-                "next_layer=%d shape=%s",
-                layer_idx,
-                next_idx,
-                None if hidden_states is None else tuple(hidden_states.shape),
-            )
-            return None
-        hidden_width = hidden_states.shape[-1]
-        gate_input_width = gate_w.shape[-1]
-        if hidden_width != gate_input_width:
-            logger.warning_once(
-                "[PREFETCH] skip learned-router prediction because the "
-                "hidden width does not match the next gate: layer=%d "
-                "next_layer=%d hidden_width=%s gate_input_width=%s",
-                layer_idx,
-                next_idx,
-                hidden_width,
-                gate_input_width,
-            )
-            return None
-        # On-device prediction: [1, hidden_dim] x [n_experts, hidden_dim]^T
-        router_logits = F.linear(hidden_states[:1].float(), gate_w)
+        # Previous behavior: Predict from the first token only — one representative token's
+        # experts is enough for prefetch; others are handled reactively by
+        # update_weights(). prefetch_topk (= min(topk, expert_prefetch_num))
+        # caps how many experts are prefetched per layer — single-card uses 1
+        # (cheap, conservative); raise expert_prefetch_num for more coverage.
+        # New behavior TO BE CHECKED: first token may not be enough for MTP
+        # Changed to n rows, was hidden_states[:1]. The [:1] was an identity slice
+        # when written — without speculative decoding and at MAX_NUM_SEQS=1 the
+        # decode path carries exactly one token — and only became a one-in-N
+        # sample when MTP raised the forward to 1 + num_speculative_tokens rows.
+        # Rows always fit the pinned staging buffers, which are
+        # [offload_threshold, topk], because a prefetch is only triggered when
+        # num_tokens <= offload_threshold.
+        # Shape is fixed per captured graph, so this stays capture-safe.
+        # On-device prediction: [n_tok, hidden_dim] x [n_experts, hidden_dim]
+        n_tok = min(self.prefetch_tokens, hidden_states.shape[0])
+        router_logits = F.linear(hidden_states[:n_tok].float(), gate_w)
         probs = router_logits.softmax(dim=-1)
         topk_weights, topk_ids = probs.topk(self.topk, dim=-1)
         return topk_weights, topk_ids
 
-    def trigger_next_layer_prefetch(self, layer,
-                        hidden_states: torch.Tensor | None = None) -> int:
+    def trigger_next_layer_prefetch(self, layer, hidden_states: torch.Tensor | None = None) -> None:
         """Trigger next-layer expert prefetch after the GMM kernel submits.
 
         Graph-compatible (mirrors the reactive update_weights path — NO stream
@@ -5909,8 +4174,14 @@ class ExpertOffloadManager:
         on the compute stream, then _launch_host_func registers the prefetch as
         a host callback (re-run every replay). The callback runs the planner+H2D
         inner (load_stream inside gives overlap with subsequent compute) and
-        records load_done_event on load_stream for the next layer's reactive to
-        stream-join. Eager mode keeps the prefetch-stream overlap path.
+        records load_done_event for the next layer's reactive to stream-join.
+        Eager mode keeps the prefetch-stream overlap path.
+
+        The fork/callback/write-back/record block lives in _dispatch_prefetch,
+        which both this driver and a trained predictor end in. Nothing below
+        may reference topk_ids_h / next_layer / mc2_mask_h: those are elements
+        of the tuple _stage_predicted_topk returns, and they are unpacked
+        inside _dispatch_prefetch.
         """
         if not self.offload_config.expert_prefetch_enabled:
             return
@@ -5920,24 +4191,39 @@ class ExpertOffloadManager:
             layer_idx = self.moe_layers.index(layer)
         except ValueError:
             return
-
-        # MoERunner keeps the original full-width residual stream alongside a
-        # transformed routed-expert input. Prefer that original tensor for the
-        # next layer's gate prediction (Kimi K3: 7168 rather than latent 3584).
-        full_width_hidden_states = getattr(
-            layer, "_expert_offload_prefetch_hidden_states", None)
-        if full_width_hidden_states is not None:
-            hidden_states = full_width_hidden_states
+        # Arbitrate by TARGET COVERAGE, not by hash membership. This driver
+        # keeps every target the trained head does not own: the hash-routed
+        # layers (tid2eid is exact and free) and, for a layer-shifted method
+        # like mode2_prevhfr, the first covered MoE layer, whose predecessor was
+        # zero-filled during training. The two target sets stay disjoint, so
+        # _prefetch_layer_npu_event never collides.
+        if self.expert_predictor is not None and self.expert_predictor.covers(layer_idx + 1):
+            return
 
         staged = self._stage_predicted_topk(layer_idx, hidden_states)
         if staged is None:
             return
-        topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx = staged
 
         ready_to_load_event = torch_npu.npu.Event()
-        torch_npu.npu.current_stream().record_event(ready_to_load_event) 
+        torch_npu.npu.current_stream().record_event(ready_to_load_event)
+        self._dispatch_prefetch(staged, ready_to_load_event)
+
+    def _dispatch_prefetch(self, staged, ready_event) -> None:
+        """Fork the prefetch stream, plan+H2D, publish log2phy, record the join.
+
+        The tail of trigger_next_layer_prefetch, extracted so every prefetch
+        method ends in one execution path. The heuristic method stages on the
+        compute stream and passes an event to fork behind; a trained predictor
+        stages on the prefetch stream itself and passes ready_event=None for
+        layer_delta=0 (same-stream FIFO already orders the callback), or the
+        on-demand-done event for layer_delta=1.
+
+        `staged` is exactly _stage_predicted_topk's return tuple.
+        """
+        (topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx, mc2_mask_h) = staged
         with torch_npu.npu.stream(self._prefetch_stream):
-            self._prefetch_stream.wait_event(ready_to_load_event)
+            if ready_event is not None:
+                self._prefetch_stream.wait_event(ready_event)
             current_compute_stream = torch_npu.npu.current_stream()
             subscribed_compute_streams = get_subscribed_compute_streams()
             if current_compute_stream not in subscribed_compute_streams:
@@ -5945,20 +4231,28 @@ class ExpertOffloadManager:
                 subscribed_compute_streams.add(current_compute_stream)
 
             prefetch_fn, prefetch_args = self._build_prefetch_call(
-                topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx)
+                topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx, mc2_mask_h
+            )
             nxt = next_idx
 
             def _prefetch_host_cb(_args):
-                prefetch_fn(_args)
-                
+                # snapshot the staged mapping first, and restore it if
+                # the callback dies. log2phy_h is mutated in place, and the H2D
+                # write-back below is a recorded node that replays regardless —
+                # so a partial failure would publish residency for experts whose
+                # H2D never happened (log2phy applied then clamped -> slot 0,
+                # silent misroute). Restoring makes the write-back a no-op.
+                saved = log2phy_h.clone()
+                try:
+                    prefetch_fn(_args)
+                except Exception:
+                    log2phy_h.copy_(saved)
+                    self._note_cb_failure("prefetch")
 
             if _EXTRA_CTX.capturing:
                 if self.enable_multi_card:
-                    self._mc_graph_callbacks_registered = True
-                    self._log_mc_debug_schedule(
-                        next_idx, is_prefetch=True)
-                torch_npu.npu._launch_host_func(
-                    current_compute_stream, _prefetch_host_cb, prefetch_args)
+                    self._log_mc_debug_schedule(next_idx, is_prefetch=True)
+                torch_npu.npu._launch_host_func(current_compute_stream, _prefetch_host_cb, prefetch_args)
             else:
                 _prefetch_host_cb(prefetch_args)
 
@@ -5975,59 +4269,71 @@ class ExpertOffloadManager:
         log2phy_np, next_layer, next_idx), or None if prefetch isn't possible
         (last layer / missing gate weights / prediction failed)."""
         next_idx = layer_idx + 1
-        if next_idx >= len(self.moe_layers) - 1:
+        # TO BE CHECKED: was `>= len(self.moe_layers) - 1`, which excluded the LAST MoE
+        # layer from being prefetched for.
+        if next_idx >= len(self.moe_layers):
             return None
-        next_layer = self.moe_layers[next_idx]
-        # Guard the layer being prefetched, not the one calling: prefetch
-        # loads the *next* layer's experts, and a mixed run can have a hybrid
-        # layer on either side of a purely-NPU one.  A hybrid layer's NPU
-        # resident set is fixed for the whole run, so there is nothing to page
-        # in -- paging would also rewrite the log2phy its split derives from.
-        # Bailing here also skips the gate prediction below.
-        from vllm_ascend.expert_offload.hybrid_executor import (
-            get_hybrid_expert_executor,
-        )
-        if get_hybrid_expert_executor(next_layer) is not None:
+        from vllm_ascend.expert_offload.hybrid_executor import get_hybrid_expert_executor
+        if get_hybrid_expert_executor(self.moe_layers[next_idx]) is not None:
             return None
         predicted = self.predict_next_layer_experts_npu(layer_idx, hidden_states)
         if predicted is None:
             return None
         topk_weights, topk_ids = predicted
+        next_layer = self.moe_layers[next_idx]
         num_tokens = topk_ids.size(0)
-        topk_ids_h = self.topk_ids_h[:num_tokens]
+        # Prediction shape for this call. Derived per tensor rather than shared,
+        # so the two branches cannot drift apart silently.
+        # Changed to num_tokens is min(expert_prefetch_tokens, forward rows), no
+        # longer always 1. The slice stays contiguous because k_ids == topk ==
+        # the buffer's full width, and the rows fit because a prefetch only
+        # triggers when num_tokens <= offload_threshold — exactly how these
+        # buffers are sized. Multi-card needs nothing further: it bincounts these
+        # rows into global_counts, so extra rows simply make the placement better
+        # informed, with multiplicity carrying the weight.
+        k_ids = topk_ids.size(1)
+        topk_ids_h = self.topk_ids_h[:num_tokens, :k_ids]
         topk_ids_h.copy_(topk_ids.to(torch.int32), non_blocking=_EXTRA_CTX.capturing)
+        # staged whenever the predictor produced weights, was gated on
+        # the LRC policy plus a non-zero cache_router_weight. The single-card
+        # load selection below now ranks candidates by router score across token
+        # rows, so the scores are needed whatever the eviction policy is. This
+        # copy was previously staged and never read on the single-card prefetch
+        # path. _build_prefetch_call's multi-card branch builds a 7-tuple that
+        # omits topk_weights_h entirely, so multi-card cannot observe this.
         topk_weights_h = None
-        if (self.cache_policy is not None and topk_weights is not None
-                and self.offload_config.cache_router_weight != 0):
-            topk_weights_h = self.topk_weights_h[:num_tokens]
-            topk_weights_h.copy_(topk_weights.to(dtype=torch.float32),
-                                 non_blocking=_EXTRA_CTX.capturing)
+        if topk_weights is not None:
+            k_w = topk_weights.size(1)
+            topk_weights_h = self.topk_weights_h[:num_tokens, :k_w]
+            topk_weights_h.copy_(topk_weights.to(dtype=torch.float32), non_blocking=_EXTRA_CTX.capturing)
         log2phy_h = self._prefetch_log2phy_h
         log2phy_h.copy_(next_layer.log2phy, non_blocking=_EXTRA_CTX.capturing)
-        return (topk_ids_h, topk_weights_h, log2phy_h, self._prefetch_log2phy_np,
-                next_layer, next_idx)
+        # (multi-card): mirror the active-token mask for the rows we predicted from
+        mc2_mask_h = None
+        if self.enable_multi_card:
+            mc2_mask = getattr(get_forward_context(), "mc2_mask", None)
+            if mc2_mask is not None:
+                mc2_mask_h = self.mc2_mask_h[:num_tokens]
+                # int32, not bool: Ascend has no async bool D2H, and a sync here
+                # would break graph capture. Same path topk_ids_h already uses.
+                mc2_mask_h.copy_(mc2_mask[:num_tokens].to(torch.int32), non_blocking=_EXTRA_CTX.capturing)
 
-    def _build_prefetch_call(self, topk_ids_h, topk_weights_h, log2phy_h,
-                             log2phy_np, next_layer, next_idx):
+        return (topk_ids_h, topk_weights_h, log2phy_h, self._prefetch_log2phy_np, next_layer, next_idx, mc2_mask_h)
+
+    def _build_prefetch_call(
+        self, topk_ids_h, topk_weights_h, log2phy_h, log2phy_np, next_layer, next_idx, mc2_mask_h=None
+    ):
         """Pick the single-card vs multi-card planner+H2D inner and its args."""
         self._is_prefetch = True
         if self.enable_multi_card:
-            per_rank_slots = self.offload_config.num_device_experts_for_rank(
-                next_idx, self.ep_size)
-            # mc2_mask_h=None: prefetch predicts the NEXT layer whose
-            # active-token mask isn't known yet, so don't filter. Prefetch
-            # placement is corrected by the next layer's reactive update
-            # (which does filter), and prefetch calls are excluded from
-            # hit-rate stats via is_prefetch=True.
-            args = (
-                topk_ids_h, log2phy_h, next_layer, next_idx, per_rank_slots,
-                True, None)
+            per_rank_slots = self.offload_config.num_device_experts_for_rank(next_idx, self.ep_size)
+            # (merge): pass the real mc2_mask, not None.
+            args = (topk_ids_h, log2phy_h, next_layer, next_idx, per_rank_slots, True, mc2_mask_h)
             if getattr(self, "_debug", False):
                 args += (_EXTRA_CTX.capturing,)
             return self._update_weights_multi_card, args
-        return self._update_weights, (
-            topk_ids_h, log2phy_np, next_layer, next_idx, topk_weights_h,
-            self._is_prefetch)
+        # SINGLE-CARD. Unchanged
+        return self._update_weights, (topk_ids_h, log2phy_np, next_layer, next_idx, topk_weights_h, self._is_prefetch)
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #
@@ -6045,8 +4351,6 @@ class ExpertOffloadManager:
         self.cache_requests[layer_idx] += len(needed)
         self.cache_hits[layer_idx] += len(hit_experts)
         self.cache_misses[layer_idx] += len(miss_experts)
-        self.last_hit_experts[layer_idx] = sorted(hit_experts)
-        self.last_miss_experts[layer_idx] = sorted(miss_experts)
 
         interval = self.offload_config.cache_stats_log_interval
         if interval == 0 or self.cache_calls[layer_idx] % interval != 0:
@@ -6057,21 +4361,24 @@ class ExpertOffloadManager:
         policy_step = -1
         if self.cache_policy is not None:
             policy_step = self.cache_policy.layer_step(layer_idx)
-        logger.info(
-            "[EXPERT-OFFLOAD-CACHE] layer=%d cache_step=%d calls=%d policy_step=%d "
-            "hit_rate=%.4f hits=%d misses=%d last_hit=%s last_miss=%s resident=%s",
-            layer_idx,
-            self.cache_calls[layer_idx],
-            self.cache_calls[layer_idx],
-            policy_step,
-            hit_rate,
-            self.cache_hits[layer_idx],
-            self.cache_misses[layer_idx],
-            self.last_hit_experts[layer_idx],
-            self.last_miss_experts[layer_idx],
-            sorted(on_device),
-        )
-
+        # (merge): the two sorted() calls sit here rather than at the top of the function.
+        self.last_hit_experts[layer_idx] = sorted(hit_experts)
+        self.last_miss_experts[layer_idx] = sorted(miss_experts)
+        if self._debug:
+            logger.info(
+                "[EXPERT-OFFLOAD-CACHE] layer=%d cache_step=%d calls=%d policy_step=%d "
+                "hit_rate=%.4f hits=%d misses=%d last_hit=%s last_miss=%s resident=%s",
+                layer_idx,
+                self.cache_calls[layer_idx],
+                self.cache_calls[layer_idx],
+                policy_step,
+                hit_rate,
+                self.cache_hits[layer_idx],
+                self.cache_misses[layer_idx],
+                self.last_hit_experts[layer_idx],
+                self.last_miss_experts[layer_idx],
+                sorted(on_device),
+            )
 
 
 _EXPERT_OFFLOAD_MANAGER: ExpertOffloadManager = None
@@ -6090,7 +4397,5 @@ def has_expert_offload_manager():
 
 
 def get_expert_offload_manager():
-    assert _EXPERT_OFFLOAD_MANAGER is not None, (
-        "Expert Offload Manager is not initialized"
-    )
+    assert _EXPERT_OFFLOAD_MANAGER is not None, "Expert Offload Manager is not initialized"
     return _EXPERT_OFFLOAD_MANAGER

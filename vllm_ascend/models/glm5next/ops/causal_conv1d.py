@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""AscendC short convolution for GLM prefill, decode and MTP verification."""
+
+import torch
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+from vllm_ascend.ops.triton.kda.conv_state import copy_conv_state
+
+
+def causal_conv1d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor,
+    *,
+    run_mode: int,
+    initial_state_mode: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Consume GDN metadata and update the caller's [cache, state_len, dim] state."""
+    # Padded requests can be skipped by the kernel; their output must stay zero.
+    output = torch.zeros_like(x)
+    if cache_indices.shape[0] == 0:
+        return output
+    kernel_state = conv_state
+    kernel_indices = cache_indices
+    # aclnnCausalConv1d materializes a non-contiguous state without writing its
+    # mutations back to the view. Stage only this batch's rows, retaining both
+    # page strides and DS layouts; never copy the entire persistent cache.
+    if not conv_state.is_contiguous():
+        requests = cache_indices.shape[0]
+        state_len, dim = conv_state.shape[1:]
+        kernel_state = torch.empty((requests, state_len, dim), dtype=conv_state.dtype, device=conv_state.device)
+        kernel_indices = torch.empty(requests, dtype=torch.int32, device=cache_indices.device)
+        copy_conv_state(conv_state, kernel_state, cache_indices, query_start_loc, kernel_indices, write_back=False)
+    # Return the declared result so graph functionalization retains the call.
+    result = torch.ops._C_ascend.npu_causal_conv1d_custom(
+        output,
+        x,
+        weight,
+        conv_state=kernel_state,
+        bias_opt=None,
+        query_start_loc_opt=query_start_loc,
+        cache_indices_opt=kernel_indices,
+        initial_state_mode_opt=initial_state_mode,
+        num_accepted_tokens_opt=num_accepted_tokens,
+        activation_mode=1,
+        pad_slot_id=PAD_SLOT_ID,
+        run_mode=run_mode,
+    )
+    if not conv_state.is_contiguous():
+        copy_conv_state(conv_state, kernel_state, cache_indices, query_start_loc, kernel_indices, write_back=True)
+    return result

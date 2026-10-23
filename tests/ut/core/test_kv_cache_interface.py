@@ -1,37 +1,52 @@
-#
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# This file is a part of the vllm-ascend project.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+
+from types import SimpleNamespace
 
 import torch
+from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendMLAAttentionSpec,
+    AscendSlidingWindowMLASpec,
+    get_kv_cache_compression_ratio,
+    get_storage_block_size,
+)
 
 
-def test_ascend_mla_page_size_honors_hybrid_cache_padding():
-    spec = AscendMLAAttentionSpec(
-        block_size=768,
+def _mla_spec():
+    return AscendMLAAttentionSpec(
+        block_size=16,
         num_kv_heads=1,
-        head_size=576,
+        head_size=128,
         dtype=torch.bfloat16,
-        page_size_padded=912384,
     )
 
-    assert spec.real_page_size_bytes == 884736
-    assert spec.page_size_bytes == 912384
 
-    merged = AscendMLAAttentionSpec.merge([spec, spec])
-    assert merged.real_page_size_bytes == 884736
-    assert merged.page_size_padded == 912384
-    assert merged.page_size_bytes == 912384
+def test_get_storage_block_size_and_dcp_memory():
+    spec = _mla_spec()
+    # On main, storage_block_size is an optional dataclass field and may be
+    # None. Ascend derives physical rows from block_size / compression ratio.
+    expected = spec.block_size // get_kv_cache_compression_ratio(spec)
+    assert get_storage_block_size(spec) == expected
+
+    uniform = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"layer": spec})
+    assert get_storage_block_size(uniform) == expected
+
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=128),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+    )
+    assert spec.max_memory_usage_bytes(vllm_config) > 0
+
+
+def test_sliding_window_mla_storage_and_page_size():
+    spec = AscendSlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=64,
+    )
+    assert spec.storage_block_size == 16
+    assert spec.real_page_size_bytes == 16 * 128 * 2

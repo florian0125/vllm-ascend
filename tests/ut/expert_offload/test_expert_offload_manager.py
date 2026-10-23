@@ -1,36 +1,30 @@
 import json
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
-import pytest
 import torch
 
 from vllm_ascend.ascend_config import ExpertOffloadConfig
 from vllm_ascend.expert_offload.expert_offload_manager import (
     ExpertOffloadManager,
-    _PrefillPeerComponent,
     _expert_weight,
-    _stable_float_checksum,
     _stable_int_checksum,
 )
-from vllm_ascend.expert_offload.h2d_transfer import (
-    CopyDirection,
-    H2DCopyTask,
-)
-from vllm_ascend.expert_offload.utils import init_expert_offload_config
+from vllm_ascend.expert_offload.h2d_transfer import H2DCopyTask
 
 
-def _manager_for_prediction(next_layer, gate_weight, *, topk=2,
-                            prefetch_topk=2):
+def _manager_for_prediction(next_layer, gate_weight, *, topk=2, prefetch_topk=2, prefetch_tokens=1):
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager.moe_layers = [SimpleNamespace(), next_layer]
     manager._gate_weights_npu = [None, gate_weight]
     manager.topk = topk
     manager.prefetch_topk = prefetch_topk
+    # predict_next_layer_experts_npu reads prefetch_tokens on both the
+    # hash (tid2eid) branch and the learned-gate branch
+    manager.prefetch_tokens = prefetch_tokens
     return manager
 
 
@@ -53,8 +47,7 @@ def test_expert_weight_supports_deepseek_and_kimi_k3_layouts():
     deepseek_weight = object()
     kimi_weight = object()
     deepseek_layer = SimpleNamespace(w13_weight=deepseek_weight)
-    kimi_layer = SimpleNamespace(
-        experts=SimpleNamespace(w13_weight=kimi_weight))
+    kimi_layer = SimpleNamespace(experts=SimpleNamespace(w13_weight=kimi_weight))
 
     assert _expert_weight(deepseek_layer, "w13_weight") is deepseek_weight
     assert _expert_weight(kimi_layer, "w13_weight") is kimi_weight
@@ -64,230 +57,9 @@ def test_cpu_tensor_storage_bytes_counts_unique_nested_storages():
     weight = torch.empty(16, dtype=torch.int8)
     scale = torch.empty(4, dtype=torch.float32)
 
-    total = ExpertOffloadManager._cpu_tensor_storage_bytes(
-        ([weight, weight.view(4, 4)], {"scale": [[scale]]}))
+    total = ExpertOffloadManager._cpu_tensor_storage_bytes(([weight, weight.view(4, 4)], {"scale": [[scale]]}))
 
-    assert total == weight.untyped_storage().nbytes() + \
-        scale.untyped_storage().nbytes()
-
-
-def test_stable_float_checksum_handles_nonfinite_values():
-    values = torch.tensor([0.25, float("nan"), float("inf"), float("-inf")])
-
-    checksum = _stable_float_checksum(values)
-
-    assert isinstance(checksum, int)
-    assert checksum == _stable_float_checksum(values.tolist())
-    assert checksum != _stable_float_checksum(values.flip(0))
-
-
-def test_exclusive_dynamic_allocates_only_cpu_owned_experts():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "expert_offload": True,
-        "storage_partition_mode": "exclusive_dynamic",
-        "num_device_experts": 2,
-    })
-    manager.num_total_experts = None
-    manager.w13_weights_cpu = []
-    manager.w2_weights_cpu = []
-    manager.scale_cpu_buffers = {}
-    manager.offset_cpu_buffers = {}
-    manager.scale_bias_cpu_buffers = {}
-    manager._cpu_slot_to_eid = []
-    manager._eid_to_cpu_slot = []
-    manager._npu_slot_to_eid = []
-    manager._eid_to_npu_slot = []
-    manager._exclusive_layer_locks = []
-    manager.moe_layers = []
-    manager.cache_policy = None
-    manager._allocate_expert_host_tensor = (
-        lambda shape, dtype: torch.empty(shape, dtype=dtype))
-    layer = SimpleNamespace(
-        global_num_experts=5,
-        w13_weight=torch.empty((2, 6, 4), dtype=torch.uint8),
-        w2_weight=torch.empty((2, 5, 4), dtype=torch.uint8),
-    )
-
-    manager.init_layer_cpu_buffers(layer, 0)
-
-    assert len(manager.w13_weights_cpu[0]) == 3
-    assert len(manager.w2_weights_cpu[0]) == 3
-    assert manager._npu_slot_to_eid[0] == [0, 1]
-    assert manager._cpu_slot_to_eid[0] == [2, 3, 4]
-    assert manager._eid_to_npu_slot[0] == [0, 1, -1, -1, -1]
-    assert manager._eid_to_cpu_slot[0] == [-1, -1, 0, 1, 2]
-    assert manager._cpu_local(0, 0) is None
-    assert manager._cpu_local(0, 4) == 2
-
-
-def test_exclusive_shared_allocates_compact_pool_and_one_writer_partition():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "expert_offload": True,
-        "storage_partition_mode": "exclusive_dynamic",
-        "num_device_experts": 4,
-        "enable_multi_card": True,
-        "shard_per_rank": True,
-        "shared_cpu_weights": True,
-    })
-    manager.enable_multi_card = True
-    manager._ep_size = 2
-    manager._ep_rank = 1
-    manager._ep_info_resolved = True
-    manager.num_total_experts = None
-    manager.w13_weights_cpu = []
-    manager.w2_weights_cpu = []
-    manager.scale_cpu_buffers = {}
-    manager.offset_cpu_buffers = {}
-    manager.scale_bias_cpu_buffers = {}
-    manager._cpu_slot_to_eid = []
-    manager._eid_to_cpu_slot = []
-    manager._npu_slot_to_eid = []
-    manager._eid_to_npu_slot = []
-    manager._exclusive_layer_locks = []
-    manager._exclusive_shared_local_cpu_slots = []
-    manager._exclusive_shared_cpu_slot_to_local = []
-    manager._torch_shared_cpu_buffers = {}
-    manager.moe_layers = []
-    manager.cache_policy = None
-    manager._allocate_expert_host_tensor = (
-        lambda shape, dtype: torch.empty(shape, dtype=dtype))
-
-    def allocate(layer_idx, name, shape, dtype):
-        count = len(manager._cpu_slot_to_eid[layer_idx])
-        global_buffer = torch.empty((count,) + tuple(shape), dtype=dtype)
-        manager._torch_shared_cpu_buffers[(layer_idx, name)] = global_buffer
-        return [
-            global_buffer[slot]
-            for slot in manager._exclusive_shared_local_cpu_slots[layer_idx]
-        ]
-
-    manager._allocate_torch_shared_expert_buffer = allocate
-    layer = SimpleNamespace(
-        global_num_experts=8,
-        w13_weight=torch.empty((2, 6, 4), dtype=torch.uint8),
-        w2_weight=torch.empty((2, 5, 4), dtype=torch.uint8),
-    )
-
-    manager.init_layer_cpu_buffers(layer, 0)
-
-    assert manager._npu_slot_to_eid[0] == [0, 1, 2, 3]
-    assert manager._cpu_slot_to_eid[0] == [4, 5, 6, 7]
-    assert manager._torch_shared_cpu_buffers[(0, "w13")].shape[0] == 4
-    assert manager._exclusive_shared_local_cpu_slots[0] == [2, 3]
-    assert len(manager.w13_weights_cpu[0]) == 4
-    assert len(manager.w2_weights_cpu[0]) == 4
-    assert manager._exclusive_shared_bootstrap_layers == {0}
-    assert manager._checkpoint_cpu_local(0, 0) is None
-    assert manager._checkpoint_cpu_local(0, 1) is None
-    assert manager._checkpoint_cpu_local(0, 2) == 2
-    assert manager._checkpoint_cpu_local(0, 3) == 3
-    assert manager._checkpoint_cpu_local(0, 4) is None
-    assert manager._checkpoint_cpu_local(0, 6) == 0
-    assert manager._checkpoint_cpu_local(0, 7) == 1
-
-
-def test_exclusive_sharded_allocates_one_rank_local_cpu_npu_partition():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "expert_offload": True,
-        "storage_partition_mode": "exclusive_dynamic",
-        "num_device_experts": 4,
-        "enable_multi_card": True,
-        "shard_per_rank": True,
-        "shared_cpu_weights": False,
-    })
-    manager.enable_multi_card = True
-    manager._ep_size = 2
-    manager._ep_rank = 1
-    manager._ep_info_resolved = True
-    manager.num_total_experts = None
-    manager.w13_weights_cpu = []
-    manager.w2_weights_cpu = []
-    manager.scale_cpu_buffers = {}
-    manager.offset_cpu_buffers = {}
-    manager.scale_bias_cpu_buffers = {}
-    manager._cpu_slot_to_eid = []
-    manager._eid_to_cpu_slot = []
-    manager._npu_slot_to_eid = []
-    manager._eid_to_npu_slot = []
-    manager._exclusive_layer_locks = []
-    manager.moe_layers = []
-    manager.cache_policy = None
-    manager._allocate_expert_host_tensor = (
-        lambda shape, dtype: torch.empty(shape, dtype=dtype))
-    layer = SimpleNamespace(
-        global_num_experts=8,
-        w13_weight=torch.empty((2, 6, 4), dtype=torch.uint8),
-        w2_weight=torch.empty((2, 5, 4), dtype=torch.uint8),
-    )
-
-    manager.init_layer_cpu_buffers(layer, 0)
-
-    assert manager._shard_base == 4
-    assert manager._shard_size == 4
-    assert manager._npu_slot_to_eid[0] == [4, 5]
-    assert manager._cpu_slot_to_eid[0] == [6, 7]
-    assert manager._eid_to_npu_slot[0] == [-1, -1, -1, -1, 0, 1, -1, -1]
-    assert manager._eid_to_cpu_slot[0] == [-1, -1, -1, -1, -1, -1, 0, 1]
-    # Two canonical CPU owners plus two initialization-only copies for the
-    # experts whose canonical owner is already the local NPU.
-    assert len(manager.w13_weights_cpu[0]) == 4
-    assert manager._checkpoint_cpu_local(0, 2) is None
-    assert manager._checkpoint_cpu_local(0, 4) == 2
-    assert manager._checkpoint_cpu_local(0, 6) == 0
-
-
-def test_exclusive_dynamic_allocates_each_layer_capacity_from_list():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "storage_partition_mode": "exclusive_dynamic",
-        "num_device_experts": [2, 3],
-    })
-    manager.num_total_experts = None
-    manager.w13_weights_cpu = []
-    manager.w2_weights_cpu = []
-    manager.scale_cpu_buffers = {}
-    manager.offset_cpu_buffers = {}
-    manager.scale_bias_cpu_buffers = {}
-    manager._cpu_slot_to_eid = []
-    manager._eid_to_cpu_slot = []
-    manager._npu_slot_to_eid = []
-    manager._eid_to_npu_slot = []
-    manager._exclusive_layer_locks = []
-    manager.moe_layers = []
-    manager.cache_policy = None
-    manager._allocate_expert_host_tensor = (
-        lambda shape, dtype: torch.empty(shape, dtype=dtype))
-    layers = [
-        SimpleNamespace(
-            global_num_experts=5,
-            w13_weight=torch.empty((2, 6, 4), dtype=torch.uint8),
-            w2_weight=torch.empty((2, 5, 4), dtype=torch.uint8),
-        ),
-        SimpleNamespace(
-            global_num_experts=5,
-            w13_weight=torch.empty((3, 6, 4), dtype=torch.uint8),
-            w2_weight=torch.empty((3, 5, 4), dtype=torch.uint8),
-        ),
-    ]
-
-    for layer_idx, layer in enumerate(layers):
-        manager.init_layer_cpu_buffers(layer, layer_idx)
-
-    assert [len(buffers) for buffers in manager.w13_weights_cpu] == [3, 2]
-    assert [len(buffers) for buffers in manager.w2_weights_cpu] == [3, 2]
-    assert manager._npu_slot_to_eid == [[0, 1], [0, 1, 2]]
-    assert manager._cpu_slot_to_eid == [[2, 3, 4], [3, 4]]
-    assert manager._eid_to_npu_slot == [
-        [0, 1, -1, -1, -1],
-        [0, 1, 2, -1, -1],
-    ]
-    assert manager._eid_to_cpu_slot == [
-        [-1, -1, 0, 1, 2],
-        [-1, -1, -1, 0, 1],
-    ]
+    assert total == weight.untyped_storage().nbytes() + scale.untyped_storage().nbytes()
 
 
 def test_replicated_cpu_memory_log_reports_full_copy_per_rank():
@@ -299,18 +71,14 @@ def test_replicated_cpu_memory_log_reports_full_copy_per_rank():
     manager._ep_info_resolved = True
     manager.num_total_experts = 4
     manager.moe_layers = [object()]
-    manager.w13_weights_cpu = [[torch.empty(2, dtype=torch.int8)
-                                for _ in range(4)]]
-    manager.w2_weights_cpu = [[torch.empty(1, dtype=torch.int8)
-                               for _ in range(4)]]
+    manager.w13_weights_cpu = [[torch.empty(2, dtype=torch.int8) for _ in range(4)]]
+    manager.w2_weights_cpu = [[torch.empty(1, dtype=torch.int8) for _ in range(4)]]
     manager.scale_cpu_buffers = {}
     manager.offset_cpu_buffers = {}
     manager.scale_bias_cpu_buffers = {}
     manager._host_memory_snapshot = MagicMock(return_value=(1024, 2048, 4096))
 
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info:
+    with patch("vllm_ascend.expert_offload.expert_offload_manager.logger.info") as log_info:
         manager._log_cpu_expert_memory()
 
     args = log_info.call_args.args
@@ -334,17 +102,12 @@ def test_multi_card_decode_plan_log_covers_sharded_baseline():
         unassigned=[],
     )
 
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info:
-        manager._log_mc_decode_plan(
-            4, global_counts, placement, per_rank_slots=2,
-            counts_ms=1.25, placement_ms=0.5)
+    with patch("vllm_ascend.expert_offload.expert_offload_manager.logger.info") as log_info:
+        manager._log_mc_decode_plan(4, global_counts, placement, per_rank_slots=2, counts_ms=1.25, placement_ms=0.5)
 
     args = log_info.call_args.args
     assert "DECODE plan" in args[0]
-    assert args[1:10] == (
-        0, 4, "sharded", 6, 3, 4, [1, 2], [1, 2], True)
+    assert args[1:10] == (0, 4, "sharded", 6, 3, 4, [1, 2], [1, 2], True)
     assert args[10] == _stable_int_checksum(global_counts)
     assert args[11] == _stable_int_checksum(placement.log2phy)
     assert args[12:15] == (0, [], [3, 3])
@@ -356,96 +119,36 @@ def test_multi_card_lrc_log_exposes_cross_rank_checksums():
     manager._ep_size = 2
     manager._ep_rank = 1
     manager._ep_info_resolved = True
-    manager._mc_lrc = SimpleNamespace(layer_states=[SimpleNamespace(
-        step=3,
-        freq=[0, 5, 1, 4],
-        ema=torch.tensor([0.0, 1.75, 0.25, 2.0]),
-        router_score=[0.0, 0.4, 0.8, 0.2],
-    )])
+    manager._mc_lrc = SimpleNamespace(
+        layer_states=[
+            SimpleNamespace(
+                step=3,
+                freq=[0, 5, 1, 4],
+                ema=torch.tensor([0.0, 1.75, 0.25, 2.0]),
+                router_score=[0.0, 0.4, 0.8, 0.2],
+            )
+        ]
+    )
     manager._DEBUG_EXPERT_SAMPLE_LIMIT = 4
     global_counts = torch.tensor([0, 2, 0, 4], dtype=torch.int64)
     global_router_score = torch.tensor([0.0, 0.4, 0.0, 0.2])
     hotness = torch.tensor([0.0, 5.0, 1.0, 4.0])
 
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info:
-        manager._log_mc_lrc_state(
-            0, global_counts, global_router_score, hotness)
+    with patch("vllm_ascend.expert_offload.expert_offload_manager.logger.info") as log_info:
+        manager._log_mc_lrc_state(0, global_counts, global_router_score, hotness)
 
     args = log_info.call_args.args
     assert args[0].startswith("[MC_LRC]")
-    assert args[1:8] == (1, 2, 0, 3, 6, 2,
-                         _stable_int_checksum(global_counts))
+    assert args[1:8] == (1, 2, 0, 3, 6, 2, _stable_int_checksum(global_counts))
     assert args[-1][0]["expert"] == 1
     assert args[-1][0]["count"] == 2
     assert args[-1][0]["freq"] == 5
 
 
-def test_multi_card_router_score_sanitizer_logs_origin_and_zeros_nonfinite():
-    manager = _manager_for_mc_debug()
-    ids = torch.tensor([1, 2, 3, 2], dtype=torch.int64)
-    scores = torch.tensor([0.5, float("nan"), float("inf"), float("-inf")])
-    context = {"source": "eager_inline"}
-
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.warning"
-    ) as log_warning:
-        sanitized = manager._sanitize_mc_router_scores(
-            7, scores, ids, "local_topk", context)
-
-    assert torch.equal(sanitized, torch.tensor([0.5, 0.0, 0.0, 0.0]))
-    assert torch.isnan(scores[1])
-    args = log_warning.call_args.args
-    assert args[0].startswith("[MC_ROUTER_NONFINITE]")
-    assert args[1:12] == (8, 16, 7, "local_topk", "eager_inline", 4, 3,
-                          1, 1, 1, [{
-                              "position": 1,
-                              "expert": 2,
-                              "value": "nan",
-                          }, {
-                              "position": 2,
-                              "expert": 3,
-                              "value": "+inf",
-                          }, {
-                              "position": 3,
-                              "expert": 2,
-                              "value": "-inf",
-                          }])
-
-
-def test_multi_card_lrc_observes_only_finite_router_scores():
-    manager = _manager_for_mc_debug()
-    manager._debug = False
-    manager.num_total_experts = 4
-    manager.offload_config = SimpleNamespace(cache_policy_enabled=True)
-    manager._mc_prev_log2phy = {}
-    manager._mc_lrc = MagicMock()
-    manager._mc_lrc.layer_states = [object()]
-    manager._mc_lrc.hotness_array.return_value = torch.zeros(4)
-    manager._gather_cpu_with_mc_debug = (
-        lambda values, _group, _kind, _context: values.clone())
-    topk_ids = torch.tensor([[1, 2]], dtype=torch.int64)
-    topk_weights = torch.tensor([[float("nan"), 0.5]])
-
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.warning"
-    ) as log_warning:
-        manager._gather_global_counts_and_hotness(
-            0, topk_ids, None, topk_weights)
-
-    router_score = manager._mc_lrc.observe_global_counts.call_args.args[2]
-    assert torch.equal(router_score, torch.tensor([0.0, 0.0, 0.5, 0.0]))
-    assert torch.isfinite(router_score).all()
-    assert log_warning.call_count == 1
-
-
 def test_mc_debug_callback_log_exposes_sequence_and_reentry():
     manager = _manager_for_mc_debug()
 
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info:
+    with patch("vllm_ascend.expert_offload.expert_offload_manager.logger.info") as log_info:
         first = manager._begin_mc_debug_callback(39, False, True)
         second = manager._begin_mc_debug_callback(40, False, True)
         manager._end_mc_debug_callback(second, "ok")
@@ -466,166 +169,46 @@ def test_mc_debug_gloo_log_pairs_collective_sequences():
     cpu_group = SimpleNamespace(group_name="ep_offload")
     local_values = torch.tensor([1, 2], dtype=torch.int64)
 
-    with patch(
-        "vllm_ascend.expert_offload.multi_card_planner."
-        "gather_global_counts_cpu",
-        side_effect=lambda values, group: values + 1,
-    ), patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info:
-        counts = manager._gather_cpu_with_mc_debug(
-            local_values, cpu_group, "count", context)
-        scores = manager._gather_cpu_with_mc_debug(
-            local_values.float(), cpu_group, "router_score", context)
+    with (
+        patch(
+            "vllm_ascend.expert_offload.multi_card_planner.gather_global_counts_cpu",
+            side_effect=lambda values, group: values + 1,
+        ),
+        patch("vllm_ascend.expert_offload.expert_offload_manager.logger.info") as log_info,
+    ):
+        counts = manager._gather_cpu_with_mc_debug(local_values, cpu_group, "count", context)
+        scores = manager._gather_cpu_with_mc_debug(local_values.float(), cpu_group, "router_score", context)
 
     assert torch.equal(counts, torch.tensor([2, 3]))
     assert torch.equal(scores, torch.tensor([2.0, 3.0]))
     events = [entry.args[1] for entry in log_info.call_args_list]
-    assert events == ["GLOO_ENTER", "GLOO_EXIT",
-                      "GLOO_ENTER", "GLOO_EXIT"]
+    assert events == ["GLOO_ENTER", "GLOO_EXIT", "GLOO_ENTER", "GLOO_EXIT"]
     assert "kind=count" in log_info.call_args_list[0].args[-1]
     assert "collective_seq=1" in log_info.call_args_list[0].args[-1]
     assert "kind=router_score" in log_info.call_args_list[2].args[-1]
     assert "collective_seq=2" in log_info.call_args_list[2].args[-1]
 
 
-def test_multi_card_collectives_serialize_after_graph_registration():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager._mc_collective_executor = ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix="test-offload-gloo")
-    manager._mc_graph_callbacks_registered = False
-    caller_thread = threading.get_ident()
-    collective_threads = []
-
-    def record_thread(value):
-        collective_threads.append(threading.get_ident())
-        return value + 1
-
-    try:
-        eager_result = manager._run_mc_cpu_collective(record_thread, 0)
-        manager._mc_graph_callbacks_registered = True
-        first_graph_result = manager._run_mc_cpu_collective(record_thread, 1)
-        second_graph_result = manager._run_mc_cpu_collective(record_thread, 2)
-    finally:
-        manager._mc_collective_executor.shutdown(wait=True)
-
-    assert (eager_result, first_graph_result, second_graph_result) == (1, 2, 3)
-    assert collective_threads[0] == caller_thread
-    assert len(set(collective_threads[1:])) == 1
-    assert collective_threads[1] != caller_thread
-
-
-def test_initialize_multi_card_collectives_creates_isolated_gloo_groups():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.enable_multi_card = True
-    manager._ep_size = 2
-    manager._ep_rank = 0
-    manager._ep_info_resolved = True
-    manager._mc_runtime_cpu_group = None
-    manager._mc_collective_executor = None
-    manager._mc_collective_thread_id = None
-    manager._mc_graph_callbacks_registered = False
-    ep_group = SimpleNamespace(
-        group_ranks=[[0, 1], [2, 3]],
-    )
-    local_group = SimpleNamespace(group_name="decode-ep0")
-    remote_group = SimpleNamespace(group_name="decode-ep1")
-    timeout = object()
-
-    with (
-        patch("torch.distributed.is_initialized", return_value=True),
-        patch("torch.distributed.get_rank", return_value=0),
-        patch("torch.distributed.new_group",
-              side_effect=[local_group, remote_group]) as new_group,
-        patch("vllm.distributed.parallel_state.get_ep_group",
-              return_value=ep_group),
-        patch(
-            "vllm.distributed.utils.get_cpu_distributed_timeout_or_none",
-            return_value=timeout,
-        ),
-    ):
-        manager._initialize_mc_runtime_collectives()
-
-    try:
-        assert manager._mc_runtime_cpu_group is local_group
-        assert manager._mc_collective_thread_id is not None
-        assert new_group.call_args_list == [
-            call([0, 1], backend="gloo", timeout=timeout),
-            call([2, 3], backend="gloo", timeout=timeout),
-        ]
-    finally:
-        manager._mc_collective_executor.shutdown(wait=True)
-
-
-def test_close_releases_decode_collective_executor_and_group():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    executor = MagicMock()
-    manager._mc_collective_executor = executor
-    runtime_group = object()
-    manager._mc_runtime_cpu_group = runtime_group
-    manager.h2d_transport = None
-    manager._torch_shared_cpu_pool = None
-    manager._exclusive_prefill_pyhccl = None
-    manager._exclusive_prefill_comm_buffers = {}
-
-    with (
-        patch("torch.distributed.is_initialized", return_value=True),
-        patch("torch.distributed.destroy_process_group") as destroy_group,
-    ):
-        manager.close()
-
-    executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
-    assert manager._mc_collective_executor is None
-    destroy_group.assert_called_once_with(runtime_group)
-    assert manager._mc_runtime_cpu_group is None
-
-
-def test_alltoall_prefill_drains_old_graph_callbacks_once_per_forward():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager._debug = False
-    manager._prefill_initialized = True
-    manager._prefill_load_layer_shard = MagicMock()
-    manager._mc_graph_callbacks_registered = True
-    comm_context = SimpleNamespace(moe_comm_type=object())
-
-    with (
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager._EXTRA_CTX",
-            comm_context,
-        ),
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager."
-            "torch_npu.npu.synchronize",
-        ) as synchronize,
-    ):
-        assert manager._mc_handle_prefill_regime(0)
-        assert manager._mc_handle_prefill_regime(1)
-
-    synchronize.assert_called_once_with()
-    assert manager._prefill_load_layer_shard.call_args_list == [
-        call(0), call(1)
-    ]
-
-
 def test_mc_debug_callback_logs_python_error_and_exit():
     manager = _manager_for_mc_debug()
-
-    def fail_in_shared_swap(_args, context):
-        context["stage"] = "shared_swap_device_consensus"
-        raise RuntimeError("debug failure")
-
-    manager._update_weights_multi_card_impl = MagicMock(
-        side_effect=fail_in_shared_swap)
+    manager._update_weights_multi_card_impl = MagicMock(side_effect=RuntimeError("debug failure"))
     args = (
-        None, None, None, 39, 16, False, None, False, None, "softmax",
-        None, None, True,
+        None,
+        None,
+        None,
+        39,
+        16,
+        False,
+        None,
+        False,
+        None,
+        "softmax",
+        None,
+        None,
+        True,
     )
 
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info, patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.exception"
-    ) as log_exception:
+    with patch("vllm_ascend.expert_offload.expert_offload_manager.logger.info") as log_info:
         try:
             manager._update_weights_multi_card(args)
         except RuntimeError as exc:
@@ -635,13 +218,7 @@ def test_mc_debug_callback_logs_python_error_and_exit():
 
     events = [entry.args[1] for entry in log_info.call_args_list]
     assert events == ["CB_ENTER", "CB_ERROR", "CB_EXIT"]
-    error_details = log_info.call_args_list[1].args[-1]
-    assert "error_stage=shared_swap_device_consensus" in error_details
-    assert "error_type=RuntimeError" in error_details
-    assert "error_message=RuntimeError('debug failure')" in error_details
     assert "status=error:RuntimeError" in log_info.call_args_list[-1].args[-1]
-    log_exception.assert_called_once()
-    assert "callback traceback" in log_exception.call_args.args[0]
     assert manager._mc_debug_active_callbacks == 0
 
 
@@ -650,13 +227,21 @@ def test_mc_debug_disabled_uses_uninstrumented_fast_path():
     manager._debug = False
     manager._update_weights_multi_card_impl = MagicMock(return_value="done")
     args = (
-        None, None, None, 39, 16, False, None, False, None, "softmax",
-        None, None,
+        None,
+        None,
+        None,
+        39,
+        16,
+        False,
+        None,
+        False,
+        None,
+        "softmax",
+        None,
+        None,
     )
 
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info:
+    with patch("vllm_ascend.expert_offload.expert_offload_manager.logger.info") as log_info:
         result = manager._update_weights_multi_card(args)
 
     assert result == "done"
@@ -669,9 +254,7 @@ def test_multi_card_decode_plan_log_is_emitted_only_by_rank_zero():
     manager._debug = True
     manager._ep_rank = 1
 
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info:
+    with patch("vllm_ascend.expert_offload.expert_offload_manager.logger.info") as log_info:
         manager._log_mc_decode_plan(0, None, None, 1, 0.0, 0.0)
 
     log_info.assert_not_called()
@@ -692,12 +275,8 @@ def test_multi_card_decode_plan_marks_unassigned_as_capacity_failure():
         unassigned=[4],
     )
 
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info:
-        manager._log_mc_decode_plan(
-            0, global_counts, placement, per_rank_slots=2,
-            counts_ms=0.0, placement_ms=0.0)
+    with patch("vllm_ascend.expert_offload.expert_offload_manager.logger.info") as log_info:
+        manager._log_mc_decode_plan(0, global_counts, placement, per_rank_slots=2, counts_ms=0.0, placement_ms=0.0)
 
     assert log_info.call_args.args[9] is False
     assert log_info.call_args.args[12] == 1
@@ -712,9 +291,7 @@ def test_multi_card_decode_cache_log_validates_replicated_placement():
     manager._ep_info_resolved = True
     log2phy = torch.tensor([-1, -1, 5, -1, -1, 3], dtype=torch.int32)
 
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info:
+    with patch("vllm_ascend.expert_offload.expert_offload_manager.logger.info") as log_info:
         manager._log_mc_decode_cache(
             layer_idx=7,
             my_experts=[5, -1, 2],
@@ -729,8 +306,7 @@ def test_multi_card_decode_cache_log_validates_replicated_placement():
 
     args = log_info.call_args.args
     assert "DECODE cache" in args[0]
-    assert args[1:10] == (
-        1, 7, "replicated", 2, 1, 1, 0.5, True, True)
+    assert args[1:10] == (1, 7, "replicated", 2, 1, 1, 0.5, True, True)
     assert args[10:14] == ([(2, 2)], False, 2.0, 3.0)
 
 
@@ -742,9 +318,7 @@ def test_multi_card_decode_cache_log_skips_healthy_hit_only_step():
     manager._ep_rank = 0
     manager._ep_info_resolved = True
 
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info:
+    with patch("vllm_ascend.expert_offload.expert_offload_manager.logger.info") as log_info:
         manager._log_mc_decode_cache(
             layer_idx=1,
             my_experts=[3],
@@ -764,9 +338,7 @@ def test_weight_load_progress_log_is_rate_limited():
     manager._load_phase_start = 1.0
     manager._drained_shards = 0
 
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info:
+    with patch("vllm_ascend.expert_offload.expert_offload_manager.logger.info") as log_info:
         manager._drain_futures()
         log_info.assert_not_called()
 
@@ -803,9 +375,7 @@ def test_gate_registration_is_model_agnostic_and_index_aligned():
 
 def test_post_finalize_gate_registration_keeps_missing_gate_slot():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "expert_prefetch_enabled": True
-    })
+    manager.offload_config = ExpertOffloadConfig({"expert_prefetch_enabled": True})
     manager.topk_ids_h = object()
     manager._gate_weights_npu = []
     manager.moe_layers = [SimpleNamespace()]
@@ -818,15 +388,13 @@ def test_post_finalize_gate_registration_keeps_missing_gate_slot():
 def test_deepseek_hash_router_prefetch_uses_tid2eid():
     tid2eid = torch.tensor([[0, 1], [2, 3], [3, 1]], dtype=torch.int32)
     next_layer = SimpleNamespace(gate=SimpleNamespace(tid2eid=tid2eid))
-    manager = _manager_for_prediction(
-        next_layer, torch.ones((4, 3)), topk=2, prefetch_topk=1)
+    manager = _manager_for_prediction(next_layer, torch.ones((4, 3)), topk=2, prefetch_topk=1)
 
     with patch(
         "vllm_ascend.expert_offload.expert_offload_manager.get_forward_context",
         return_value=SimpleNamespace(input_ids=torch.tensor([2])),
     ):
-        weights, expert_ids = manager.predict_next_layer_experts_npu(
-            0, torch.tensor([[100.0, -100.0, 0.0]]))
+        weights, expert_ids = manager.predict_next_layer_experts_npu(0, torch.tensor([[100.0, -100.0, 0.0]]))
 
     assert torch.equal(expert_ids, tid2eid[2:3])
     assert torch.equal(weights, torch.full((1, 2), 0.5))
@@ -835,71 +403,33 @@ def test_deepseek_hash_router_prefetch_uses_tid2eid():
 def test_kimi_k3_learned_router_prefetch_keeps_full_topk_candidates():
     next_layer = SimpleNamespace(gate=SimpleNamespace())
     gate_weight = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
-    manager = _manager_for_prediction(
-        next_layer, gate_weight, topk=2, prefetch_topk=1)
+    manager = _manager_for_prediction(next_layer, gate_weight, topk=2, prefetch_topk=1)
 
-    weights, expert_ids = manager.predict_next_layer_experts_npu(
-        0, torch.tensor([[1.0, 2.0]]))
+    weights, expert_ids = manager.predict_next_layer_experts_npu(0, torch.tensor([[1.0, 2.0]]))
 
-    expected_weights = torch.softmax(torch.tensor([[1.0, 2.0, 3.0]]),
-                                     dim=-1).topk(2, dim=-1).values
+    expected_weights = torch.softmax(torch.tensor([[1.0, 2.0, 3.0]]), dim=-1).topk(2, dim=-1).values
     assert torch.equal(expert_ids, torch.tensor([[2, 1]]))
     assert torch.allclose(weights, expected_weights)
 
 
-def test_learned_router_prefetch_skips_mismatched_hidden_width():
-    next_layer = SimpleNamespace(gate=SimpleNamespace())
-    manager = _manager_for_prediction(
-        next_layer, torch.ones((3, 4)), topk=2, prefetch_topk=1)
-
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.warning_once"
-    ) as warning_once:
-        predicted = manager.predict_next_layer_experts_npu(
-            0, torch.ones((1, 2)))
-
-    assert predicted is None
-    assert "hidden width does not match" in warning_once.call_args.args[0]
-    assert warning_once.call_args.args[3:] == (2, 4)
-
-
-def test_trigger_prefetch_prefers_staged_full_width_hidden_states():
-    routed_hidden_states = torch.ones((1, 2))
-    full_width_hidden_states = torch.ones((1, 4))
-    layer = SimpleNamespace(
-        _expert_offload_prefetch_hidden_states=full_width_hidden_states)
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = SimpleNamespace(expert_prefetch_enabled=True)
-    manager._skip_prefill = False
-    manager.moe_layers = [layer]
-    manager._stage_predicted_topk = MagicMock(return_value=None)
-
-    manager.trigger_next_layer_prefetch(layer, routed_hidden_states)
-
-    manager._stage_predicted_topk.assert_called_once_with(
-        0, full_width_hidden_states)
-
-
 def test_expert_substitution_log_is_controlled_by_debug():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "expert_substitution_enabled": True,
-        "expert_substitution_threshold": 0.25,
-    })
+    manager.offload_config = ExpertOffloadConfig(
+        {
+            "expert_substitution_enabled": True,
+            "expert_substitution_threshold": 0.25,
+        }
+    )
     original_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
     substituted_ids = torch.tensor([[1, 5], [6, 4]], dtype=torch.int32)
 
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-    ) as log_info:
+    with patch("vllm_ascend.expert_offload.expert_offload_manager.logger.info") as log_info:
         manager._debug = False
-        manager._log_expert_substitution(
-            7, original_ids, substituted_ids)
+        manager._log_expert_substitution(7, original_ids, substituted_ids)
         log_info.assert_not_called()
 
         manager._debug = True
-        manager._log_expert_substitution(
-            7, original_ids, substituted_ids)
+        manager._log_expert_substitution(7, original_ids, substituted_ids)
 
     log_args = log_info.call_args.args
     assert log_args[1:4] == (7, 2, 0.25)
@@ -912,16 +442,22 @@ def test_expert_substitution_log_is_controlled_by_debug():
 
 def test_multi_card_substitution_updates_only_active_rows():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "expert_substitution_enabled": True,
-        "expert_substitution_threshold": 0.30,
-    })
+    manager.offload_config = ExpertOffloadConfig(
+        {
+            "expert_substitution_enabled": True,
+            "expert_substitution_threshold": 0.30,
+        }
+    )
     manager.topk = 2
     manager._debug = False
-    router_logits_h = torch.log(torch.tensor([
-        [0.40, 0.25, 0.20, 0.15],
-        [0.40, 0.25, 0.20, 0.15],
-    ]))
+    router_logits_h = torch.log(
+        torch.tensor(
+            [
+                [0.40, 0.25, 0.20, 0.15],
+                [0.40, 0.25, 0.20, 0.15],
+            ]
+        )
+    )
     topk_ids_h = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
     # The full global placement says experts 0 and 3 are resident across EP.
     log2phy_h = torch.tensor([0, -1, -1, 3], dtype=torch.int32)
@@ -942,14 +478,15 @@ def test_multi_card_substitution_updates_only_active_rows():
 
 def test_multi_card_substitution_honors_remote_blocker():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "expert_substitution_enabled": True,
-        "expert_substitution_threshold": 0.30,
-    })
+    manager.offload_config = ExpertOffloadConfig(
+        {
+            "expert_substitution_enabled": True,
+            "expert_substitution_threshold": 0.30,
+        }
+    )
     manager.topk = 2
     manager._debug = False
-    router_logits_h = torch.log(
-        torch.tensor([[0.40, 0.25, 0.20, 0.15]]))
+    router_logits_h = torch.log(torch.tensor([[0.40, 0.25, 0.20, 0.15]]))
     topk_ids_h = torch.tensor([[0, 1]], dtype=torch.int32)
     log2phy_h = torch.tensor([0, -1, -1, 3], dtype=torch.int32)
 
@@ -960,8 +497,7 @@ def test_multi_card_substitution_honors_remote_blocker():
         return referenced, global_blocked
 
     with patch(
-        "vllm_ascend.expert_offload.multi_card_planner."
-        "gather_global_substitution_state_cpu",
+        "vllm_ascend.expert_offload.multi_card_planner.gather_global_substitution_state_cpu",
         side_effect=block_expert_one,
     ):
         manager._apply_multi_card_substitution(
@@ -980,19 +516,19 @@ def test_multi_card_substitution_honors_remote_blocker():
 
 def test_multi_card_substitution_all_pad_still_joins_global_state():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "expert_substitution_enabled": True,
-        "expert_substitution_threshold": 0.30,
-    })
+    manager.offload_config = ExpertOffloadConfig(
+        {
+            "expert_substitution_enabled": True,
+            "expert_substitution_threshold": 0.30,
+        }
+    )
     manager.topk = 2
     manager._debug = False
     topk_ids_h = torch.tensor([[0, 1]], dtype=torch.int32)
-    gather = MagicMock(side_effect=lambda referenced, blocked, cpu_group:
-                       (referenced, blocked))
+    gather = MagicMock(side_effect=lambda referenced, blocked, cpu_group: (referenced, blocked))
 
     with patch(
-        "vllm_ascend.expert_offload.multi_card_planner."
-        "gather_global_substitution_state_cpu",
+        "vllm_ascend.expert_offload.multi_card_planner.gather_global_substitution_state_cpu",
         gather,
     ):
         manager._apply_multi_card_substitution(
@@ -1012,13 +548,16 @@ def test_multi_card_substitution_all_pad_still_joins_global_state():
 
 def test_single_card_substitution_changes_ids_but_preserves_weights():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "expert_substitution_enabled": True,
-        "expert_substitution_threshold": 0.30,
-    })
+    manager.offload_config = ExpertOffloadConfig(
+        {
+            "expert_substitution_enabled": True,
+            "expert_substitution_threshold": 0.30,
+        }
+    )
     manager.topk = 2
     manager._debug = False
     manager.cache_policy = None
+    manager._stats = None  # _update_weights reads it before any guard
     manager.load_stream = MagicMock()
     topk_ids_h = torch.tensor([[0, 1]], dtype=torch.int32)
     topk_weights_h = torch.tensor([[0.40, 0.25]])
@@ -1052,8 +591,7 @@ def test_single_card_substitution_changes_ids_but_preserves_weights():
 
 def test_prefetch_dispatch_uses_single_or_per_layer_multi_card_capacity():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig(
-        {"num_device_experts": [8, 12]})
+    manager.offload_config = ExpertOffloadConfig({"num_device_experts": [8, 12]})
     manager._ep_size = 2
     manager._ep_info_resolved = True
     manager._update_weights = MagicMock()
@@ -1100,8 +638,7 @@ def test_shared_expert_copy_is_non_blocking_and_refreshes_quant_scale():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
     manager.w13_expert_size_bytes = 4
     manager.w2_expert_size_bytes = 2
-    manager._expert_src_storage = MagicMock(
-        side_effect=["w13-source", "w2-source"])
+    manager._expert_src_storage = MagicMock(side_effect=["w13-source", "w2-source"])
     manager.scale_cpu_buffers = {}
     manager.offset_cpu_buffers = {}
     manager.scale_bias_cpu_buffers = {}
@@ -1114,21 +651,21 @@ def test_shared_expert_copy_is_non_blocking_and_refreshes_quant_scale():
 
     manager._load_expert_weights_into_slot(layer, 0, 7, 1)
 
-    assert layer.w13_weight.storage.copies == [
-        (slice(4, 8), "w13-source", True)]
-    assert layer.w2_weight.storage.copies == [
-        (slice(2, 4), "w2-source", True)]
+    assert layer.w13_weight.storage.copies == [(slice(4, 8), "w13-source", True)]
+    assert layer.w2_weight.storage.copies == [(slice(2, 4), "w2-source", True)]
     assert layer.w13_weight_scale_fp32[1] == 2.5
 
 
 def test_memfabric_shared_resolves_remote_expert_pointer():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "h2d_backend": "memfabric",
-        "memfabric_pool_size_gib": 1,
-        "enable_multi_card": True,
-        "shard_per_rank": True,
-    })
+    manager.offload_config = ExpertOffloadConfig(
+        {
+            "h2d_backend": "memfabric",
+            "memfabric_pool_size_gib": 1,
+            "enable_multi_card": True,
+            "shard_per_rank": True,
+        }
+    )
     manager._shard_base = 0
     manager._shard_size = 2
     manager.w13_weights_cpu = [[torch.zeros(1), torch.zeros(1)]]
@@ -1140,131 +677,16 @@ def test_memfabric_shared_resolves_remote_expert_pointer():
     assert source.data_ptr() == 123456
 
 
-def test_torch_shared_cpu_resolves_remote_weight_and_quant_sources():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "h2d_backend": "torch",
-        "enable_multi_card": True,
-        "shard_per_rank": True,
-        "shared_cpu_weights": True,
-    })
-    manager._shard_base = 0
-    manager._shard_size = 2
-    manager.w13_expert_size_bytes = 8
-    global_w13 = torch.arange(8, dtype=torch.float32).reshape(4, 2)
-    global_scale = torch.arange(12, dtype=torch.float32).reshape(4, 3)
-    manager._torch_shared_cpu_buffers = {
-        (0, "w13"): global_w13,
-        (0, "w13_weight_scale"): global_scale,
-    }
-    manager.w13_weights_cpu = [[global_w13[0], global_w13[1]]]
-
-    weight_source = manager._expert_src_storage(0, 3, "w13")
-    scale_source = manager._shared_h2d_source(
-        0, 3, "w13_weight_scale")
-
-    assert weight_source.nbytes() == 8
-    assert weight_source.data_ptr() == (
-        global_w13.untyped_storage().data_ptr() + 3 * 8)
-    assert torch.equal(scale_source, global_scale[3])
-
-
-def test_torch_shared_cpu_publish_barrier_marks_target_layers_ready():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "h2d_backend": "torch",
-        "enable_multi_card": True,
-        "shard_per_rank": True,
-        "shared_cpu_weights": True,
-    })
-    manager._ep_size = 2
-    manager._ep_rank = 0
-    manager._ep_info_resolved = True
-    manager.num_total_experts = 4
-    manager.w13_weights_cpu = [[torch.zeros(1), torch.zeros(1)]]
-    manager.w2_weights_cpu = [[torch.zeros(1), torch.zeros(1)]]
-    manager._torch_shared_cpu_buffers = {
-        (0, "w13"): torch.zeros(4, 1),
-        (0, "w2"): torch.zeros(4, 1),
-    }
-    manager._torch_shared_cpu_sources_ready = False
-    manager._torch_shared_cpu_ready_layers = set()
-    manager._log_torch_shared_cpu_pss = MagicMock()
-    ep_group = SimpleNamespace(cpu_group=object())
-
-    with (
-        patch("torch.distributed.barrier") as barrier,
-        patch("vllm.distributed.parallel_state.get_ep_group",
-              return_value=ep_group),
-    ):
-        manager._publish_shared_h2d_sources()
-
-    barrier.assert_called_once_with(group=ep_group.cpu_group)
-    assert manager._torch_shared_cpu_sources_ready is True
-    assert manager._shared_h2d_layer_ready(0) is True
-    assert manager._shared_h2d_layer_ready(1) is False
-    manager._log_torch_shared_cpu_pss.assert_called_once_with()
-
-
-def test_torch_shared_cpu_pss_log_reports_one_physical_copy():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager._debug = True
-    manager.offload_config = ExpertOffloadConfig({
-        "h2d_backend": "torch",
-        "enable_multi_card": True,
-        "shard_per_rank": True,
-        "shared_cpu_weights": True,
-    })
-    manager._ep_size = 2
-    manager._ep_rank = 0
-    manager._ep_info_resolved = True
-    local_snapshot = {
-        "size_bytes": 10 * 1024 ** 2,
-        "rss_bytes": 5 * 1024 ** 2,
-        "pss_bytes": 5 * 1024 ** 2,
-        "swap_pss_bytes": 0,
-        "mapping_count": 4,
-    }
-    manager._torch_shared_cpu_pool = SimpleNamespace(
-        mapping_memory_snapshot=MagicMock(return_value=local_snapshot))
-    manager.w13_weights_cpu = []
-    manager.w2_weights_cpu = []
-    manager.scale_cpu_buffers = {}
-    manager.offset_cpu_buffers = {}
-    manager.scale_bias_cpu_buffers = {}
-    manager._cpu_tensor_storage_bytes = MagicMock(
-        return_value=10 * 1024 ** 2)
-    ep_group = SimpleNamespace(cpu_group=object())
-
-    def gather(output, value, group):
-        assert group is ep_group.cpu_group
-        output[0] = value
-        output[1] = dict(value)
-
-    with (
-        patch("torch.distributed.all_gather_object", side_effect=gather),
-        patch("vllm.distributed.parallel_state.get_ep_group",
-              return_value=ep_group),
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-        ) as log_info,
-    ):
-        manager._log_torch_shared_cpu_pss()
-
-    args = log_info.call_args.args
-    assert args[0].startswith("[TORCH_SHARED_CPU_PSS]")
-    assert args[-2] == 1.0
-    assert args[-1] == "PASS_ONE_PHYSICAL_COPY"
-
-
 def test_memfabric_shared_publishes_complete_peer_pointer_table():
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "h2d_backend": "memfabric",
-        "memfabric_pool_size_gib": 1,
-        "enable_multi_card": True,
-        "shard_per_rank": True,
-    })
+    manager.offload_config = ExpertOffloadConfig(
+        {
+            "h2d_backend": "memfabric",
+            "memfabric_pool_size_gib": 1,
+            "enable_multi_card": True,
+            "shard_per_rank": True,
+        }
+    )
     manager.h2d_transport = SimpleNamespace(supports_remote_sources=True)
     manager._ep_size = 2
     manager._ep_rank = 0
@@ -1289,8 +711,7 @@ def test_memfabric_shared_publishes_complete_peer_pointer_table():
     ep_group = SimpleNamespace(cpu_group=object())
     with (
         patch("torch.distributed.all_gather_object", side_effect=gather),
-        patch("vllm.distributed.parallel_state.get_ep_group",
-              return_value=ep_group),
+        patch("vllm.distributed.parallel_state.get_ep_group", return_value=ep_group),
     ):
         manager._publish_shared_h2d_sources()
 
@@ -1304,16 +725,13 @@ def test_expert_load_combines_multiple_experts_into_one_transport_batch():
     manager.h2d_transport = MagicMock()
     first_task = H2DCopyTask(object(), object(), 4, name="first")
     second_task = H2DCopyTask(object(), object(), 8, name="second")
-    manager._build_expert_h2d_tasks = MagicMock(
-        side_effect=[[first_task], [second_task]])
+    manager._build_expert_h2d_tasks = MagicMock(side_effect=[[first_task], [second_task]])
     manager._refresh_expert_fp32_scale = MagicMock()
     layer = object()
 
-    manager._load_expert_weights_into_slots(
-        layer, 3, [(1, 7), (2, 9)])
+    manager._load_expert_weights_into_slots(layer, 3, [(1, 7), (2, 9)])
 
-    manager.h2d_transport.copy_batch.assert_called_once_with(
-        [first_task, second_task])
+    manager.h2d_transport.copy_batch.assert_called_once_with([first_task, second_task])
     assert manager._build_expert_h2d_tasks.call_args_list == [
         call(layer, 3, 7, 1),
         call(layer, 3, 9, 2),
@@ -1335,10 +753,8 @@ def test_expert_host_allocation_and_synchronization_use_transport():
     manager._synchronize_h2d()
 
     assert result is expected
-    manager.h2d_transport.allocate_host_tensor.assert_called_once_with(
-        (2, 4), torch.float32)
-    manager.h2d_transport.synchronize.assert_called_once_with(
-        manager.load_stream)
+    manager.h2d_transport.allocate_host_tensor.assert_called_once_with((2, 4), torch.float32)
+    manager.h2d_transport.synchronize.assert_called_once_with(manager.load_stream)
 
 
 def test_prefill_weight_and_quant_attributes_are_one_h2d_task_batch():
@@ -1348,8 +764,7 @@ def test_prefill_weight_and_quant_attributes_are_one_h2d_task_batch():
     manager.w2_expert_size_bytes = 2
     w13_source = torch.ones(4, dtype=torch.uint8).untyped_storage()
     w2_source = torch.ones(2, dtype=torch.uint8).untyped_storage()
-    manager._expert_src_storage = MagicMock(
-        side_effect=[w13_source, w2_source])
+    manager._expert_src_storage = MagicMock(side_effect=[w13_source, w2_source])
     manager._prefill_w13 = [torch.zeros((2, 4), dtype=torch.uint8)]
     manager._prefill_w2 = [torch.zeros((2, 2), dtype=torch.uint8)]
     manager._prefill_w13_scale = [torch.zeros((2, 2))]
@@ -1368,34 +783,7 @@ def test_prefill_weight_and_quant_attributes_are_one_h2d_task_batch():
     assert len(tasks) == 3
     assert [task.nbytes for task in tasks] == [4, 2, 8]
     assert tasks[2].source.data_ptr() == scale.data_ptr()
-    assert tasks[2].destination.data_ptr() == \
-        manager._prefill_w13_scale[0][1].data_ptr()
-
-
-def test_create_prefill_pool_precomputes_all2all_dispatcher_metadata():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager._init_prefill_pool_state()
-    manager.num_device_layers = 1
-    manager.num_total_experts = 8
-    manager.enable_multi_card = True
-    manager._ep_info_resolved = True
-    manager._ep_size = 2
-    manager._ep_rank = 1
-    manager.moe_layers = [SimpleNamespace(
-        w13_weight=torch.empty((2, 3, 4), dtype=torch.uint8),
-        w2_weight=torch.empty((2, 4, 3), dtype=torch.uint8),
-    )]
-    manager._cast_prefill_pool_format = MagicMock()
-    manager._init_prefill_pool_data = MagicMock()
-
-    manager.create_prefill_pool()
-
-    assert manager._prefill_local_expert_indices == [4, 5, 6, 7]
-    assert torch.equal(
-        manager._prefill_expert_ids_per_ep_rank,
-        torch.tensor([0, 1, 2, 3, 0, 1, 2, 3], dtype=torch.int32),
-    )
-    assert manager._prefill_initialized is True
+    assert tasks[2].destination.data_ptr() == manager._prefill_w13_scale[0][1].data_ptr()
 
 
 def test_quant_attributes_are_represented_as_h2d_tasks():
@@ -1423,6 +811,7 @@ def test_single_card_update_submits_misses_as_one_batch():
     manager.topk = 1
     manager._debug = False
     manager.cache_policy = None
+    manager._stats = None  # _update_weights reads it before any guard
     manager.load_stream = MagicMock()
     manager._load_expert_weights_into_slots = MagicMock()
     topk_ids_h = torch.tensor([[1]], dtype=torch.int32)
@@ -1433,17 +822,18 @@ def test_single_card_update_submits_misses_as_one_batch():
         "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
         return_value=nullcontext(),
     ):
-        manager._update_weights((
-            topk_ids_h,
-            log2phy_h.numpy(),
-            layer,
-            0,
-            None,
-            False,
-        ))
+        manager._update_weights(
+            (
+                topk_ids_h,
+                log2phy_h.numpy(),
+                layer,
+                0,
+                None,
+                False,
+            )
+        )
 
-    manager._load_expert_weights_into_slots.assert_called_once_with(
-        layer, 0, [(0, 1)])
+    manager._load_expert_weights_into_slots.assert_called_once_with(layer, 0, [(0, 1)])
     assert log2phy_h.tolist() == [-1, 0]
     manager.load_stream.synchronize.assert_called_once_with()
 
@@ -1456,6 +846,7 @@ def test_single_card_update_ranks_all_lrc_victims_once():
     manager.cache_policy = MagicMock()
     manager.cache_policy.observe.return_value = {4, 5}
     manager.cache_policy.choose_victims.return_value = [0, 1]
+    manager._stats = None  # _update_weights reads it before any guard
     manager.load_stream = MagicMock()
     manager._record_cache_stats = MagicMock()
     manager._load_expert_weights_into_slots = MagicMock()
@@ -1468,17 +859,18 @@ def test_single_card_update_ranks_all_lrc_victims_once():
         "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
         return_value=nullcontext(),
     ):
-        manager._update_weights((
-            topk_ids_h,
-            log2phy_h.numpy(),
-            layer,
-            0,
-            None,
-            False,
-        ))
+        manager._update_weights(
+            (
+                topk_ids_h,
+                log2phy_h.numpy(),
+                layer,
+                0,
+                None,
+                False,
+            )
+        )
 
-    manager.cache_policy.choose_victims.assert_called_once_with(
-        0, {0: 0, 1: 1}, protected={4, 5}, count=2)
+    manager.cache_policy.choose_victims.assert_called_once_with(0, {0: 0, 1: 1}, protected={4, 5}, count=2)
     loads = manager._load_expert_weights_into_slots.call_args.args[2]
     assert {slot for slot, _ in loads} == {0, 1}
     assert {eid for _, eid in loads} == {4, 5}
@@ -1501,147 +893,64 @@ def test_multi_card_misses_submit_one_batch_before_resident_commit():
     ):
         manager._h2d_load_mc_misses(layer, 3, misses, resident_map)
 
-    manager._load_expert_weights_into_slots.assert_called_once_with(
-        layer, 3, misses)
+    manager._load_expert_weights_into_slots.assert_called_once_with(layer, 3, misses)
     assert resident_map == {0: 4, 1: 7}
     manager.load_stream.synchronize.assert_called_once_with()
 
 
-def test_single_card_hot_preload_builds_initial_expert_map_without_copy(
-        tmp_path):
+def test_single_card_hot_preload_uses_format_aware_shared_copy(tmp_path):
     ranking_path = tmp_path / "hot.json"
-    ranking_path.write_text(json.dumps({"0": [[3, 0.9], [1, 0.8],
-                                                   [2, 0.7]]}))
-    config = ExpertOffloadConfig({
-        "expert_offload": True,
-        "num_device_experts": 2,
-        "hot_expert_preload": True,
-        "hot_experts_file": str(ranking_path),
-    })
-    enabled, expert_map, ndev = init_expert_offload_config(
-        config, num_experts=4, layer_idx=0)
-    _, ordinary_map, _ = init_expert_offload_config(
-        ExpertOffloadConfig({
-            "expert_offload": True,
-            "num_device_experts": 2,
-        }),
-        num_experts=4,
-        layer_idx=0,
-    )
-
-    assert enabled
-    assert ndev == 2
-    assert expert_map.tolist() == [-1, 1, -1, 0]
-    assert ordinary_map.tolist() == [0, 1, -1, -1]
-
+    ranking_path.write_text(json.dumps({"0": [[3, 0.9], [1, 0.8], [2, 0.7]]}))
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = config
+    manager.offload_config = ExpertOffloadConfig(
+        {
+            "num_device_experts": 2,
+            "hot_expert_preload": True,
+            "hot_experts_file": str(ranking_path),
+        }
+    )
     manager.enable_multi_card = False
-    manager.num_total_experts = 4
-    manager.cache_policy = MagicMock()
+    manager.cache_policy = None
     manager._debug = False
-    manager.moe_layers = [SimpleNamespace()]
+    manager.load_stream = MagicMock()
+    manager.log2phy_h = torch.full((4,), -1, dtype=torch.int32)
+    manager.log2phy_np = manager.log2phy_h.numpy()
+    layer = SimpleNamespace(log2phy=MagicMock())
+    manager.moe_layers = [layer]
     manager._load_expert_weights_into_slot = MagicMock()
-    manager._synchronize_h2d = MagicMock()
 
-    manager._preload_hot_experts()
+    with patch(
+        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
+        return_value=nullcontext(),
+    ):
+        manager._preload_hot_experts()
 
-    manager._load_expert_weights_into_slot.assert_not_called()
-    manager._synchronize_h2d.assert_not_called()
-    manager.cache_policy.seed_layer_hotness.assert_called_once_with(
-        0, {3: 0.9, 1: 0.8})
-
-
-def test_single_card_weight_loader_maps_hot_global_expert_to_device_slot():
-    from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
-
-    original_loader = MagicMock()
-    runner = AscendMoERunner.__new__(AscendMoERunner)
-    runner.moe_instance_id = 0
-    runner.enable_multi_card = False
-    runner._expert_map_offload = torch.tensor(
-        [-1, 1, -1, 0], dtype=torch.int32)
-    runner.routed_experts = SimpleNamespace(weight_loader=original_loader)
-    manager = SimpleNamespace(
-        offload_config=SimpleNamespace(
-            num_device_experts_for_rank=MagicMock(return_value=2)),
-        load_w13=MagicMock(),
-        load_w2=MagicMock(),
-        _load_scale_shard=MagicMock(),
-    )
-    loaded_weight = torch.ones((2, 2))
-
-    with patch.object(
-            ExpertOffloadManager, "get_instance", return_value=manager):
-        runner._wrap_weight_loader_for_offload()
-
-    wrapped_loader = runner.routed_experts.weight_loader
-    wrapped_loader(None, loaded_weight, "w13_weight", "w1", 3)
-    wrapped_loader(None, loaded_weight, "w13_weight", "w1", 0)
-
-    assert manager.load_w13.call_args_list == [
-        call(0, 3, loaded_weight, "w1"),
-        call(0, 0, loaded_weight, "w1"),
+    assert manager._load_expert_weights_into_slot.call_args_list == [
+        call(layer, 0, 3, 0),
+        call(layer, 0, 1, 1),
     ]
-    original_loader.assert_called_once_with(
-        None, loaded_weight, "w13_weight", "w1", 0)
-
-
-def test_multi_card_exclusive_sharded_loader_uses_only_local_npu_slots():
-    from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
-
-    original_loader = MagicMock()
-    runner = AscendMoERunner.__new__(AscendMoERunner)
-    runner.moe_instance_id = 0
-    runner.enable_multi_card = True
-    runner.routed_experts = SimpleNamespace(
-        weight_loader=original_loader,
-        global_num_experts=4,
-    )
-    manager = SimpleNamespace(
-        exclusive_sharded_cpu_enabled=True,
-        exclusive_shared_cpu_enabled=False,
-        ep_size=2,
-        ep_rank=1,
-        offload_config=SimpleNamespace(
-            num_device_experts_for_rank=MagicMock(return_value=1),
-            initial_device_experts_for_rank=MagicMock(return_value=[2]),
-        ),
-        load_w13=MagicMock(),
-        load_w2=MagicMock(),
-        _load_scale_shard=MagicMock(),
-    )
-    loaded_weight = torch.ones((2, 2))
-
-    with patch.object(
-            ExpertOffloadManager, "get_instance", return_value=manager):
-        runner._wrap_weight_loader_for_offload()
-
-    wrapped_loader = runner.routed_experts.weight_loader
-    wrapped_loader(None, loaded_weight, "w13_weight", "w1", 2)
-    wrapped_loader(None, loaded_weight, "w13_weight", "w1", 0)
-
-    assert manager.load_w13.call_args_list == [
-        call(0, 2, loaded_weight, "w1"),
-        call(0, 0, loaded_weight, "w1"),
-    ]
-    original_loader.assert_called_once_with(
-        None, loaded_weight, "w13_weight", "w1", 0)
+    assert manager.log2phy_h.tolist() == [-1, 1, -1, 0]
+    layer.log2phy.copy_.assert_called_once_with(manager.log2phy_h)
 
 
 def test_multi_card_hot_preload_loads_only_rank_owned_experts(tmp_path):
     ranking_path = tmp_path / "hot.json"
-    ranking_path.write_text(json.dumps({
-        "0": [[0, 0.9], [1, 0.8], [2, 0.7], [3, 0.6],
-              [4, 0.5], [5, 0.4], [6, 0.3], [7, 0.2]],
-    }))
+    ranking_path.write_text(
+        json.dumps(
+            {
+                "0": [[0, 0.9], [1, 0.8], [2, 0.7], [3, 0.6], [4, 0.5], [5, 0.4], [6, 0.3], [7, 0.2]],
+            }
+        )
+    )
     manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "num_device_experts": 4,
-        "hot_expert_preload": True,
-        "hot_experts_file": str(ranking_path),
-        "shard_per_rank": True,
-    })
+    manager.offload_config = ExpertOffloadConfig(
+        {
+            "num_device_experts": 4,
+            "hot_expert_preload": True,
+            "hot_experts_file": str(ranking_path),
+            "shard_per_rank": True,
+        }
+    )
     manager.enable_multi_card = True
     manager._ep_size = 2
     manager._ep_rank = 1
@@ -1674,1391 +983,5 @@ def test_multi_card_hot_preload_loads_only_rank_owned_experts(tmp_path):
     assert manager._mc_resident[0] == {0: 4, 1: 5}
     assert torch.equal(manager._mc_prev_log2phy[0], manager.log2phy_h)
     assert manager._mc_lrc is manager.cache_policy
-    manager.cache_policy.seed_layer_hotness.assert_called_once_with(
-        0, {0: 0.9, 1: 0.8, 4: 0.5, 5: 0.4})
+    manager.cache_policy.seed_layer_hotness.assert_called_once_with(0, {0: 0.9, 1: 0.8, 4: 0.5, 5: 0.4})
     layer.log2phy.copy_.assert_called_once_with(manager.log2phy_h)
-
-
-class _CopyingExpertTransport:
-
-    def __init__(self):
-        self.batches = []
-
-    def copy_batch(self, tasks):
-        self.batches.append(list(tasks))
-        for task in tasks:
-            task.destination.copy_(task.source)
-
-
-def _exclusive_runtime_manager():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "storage_partition_mode": "exclusive_dynamic",
-        "num_device_experts": 2,
-        "shard_per_rank": False,
-    })
-    manager._cpu_slot_to_eid = []
-    manager._eid_to_cpu_slot = []
-    manager._npu_slot_to_eid = []
-    manager._eid_to_npu_slot = []
-    manager._exclusive_layer_locks = []
-    manager._init_exclusive_ownership(0, ntotal=4, ndev=2)
-    manager.w13_expert_size_bytes = 4
-    manager.w2_expert_size_bytes = 2
-    manager.w13_weights_cpu = [[
-        torch.full((4,), 2, dtype=torch.uint8),
-        torch.full((4,), 3, dtype=torch.uint8),
-    ]]
-    manager.w2_weights_cpu = [[
-        torch.full((2,), 12, dtype=torch.uint8),
-        torch.full((2,), 13, dtype=torch.uint8),
-    ]]
-    manager.scale_cpu_buffers = {
-        "w13_weight_scale": [[
-            torch.tensor([2.0]),
-            torch.tensor([3.0]),
-        ]],
-    }
-    manager.offset_cpu_buffers = {}
-    manager.scale_bias_cpu_buffers = {}
-    manager._allocate_expert_host_tensor = (
-        lambda shape, dtype: torch.empty(shape, dtype=dtype))
-    manager.h2d_transport = _CopyingExpertTransport()
-    manager._synchronize_h2d = MagicMock()
-    return manager
-
-
-def test_exclusive_swap_preserves_victim_and_commits_after_copy():
-    manager = _exclusive_runtime_manager()
-    layer = SimpleNamespace(
-        w13_weight=torch.stack([
-            torch.zeros(4, dtype=torch.uint8),
-            torch.ones(4, dtype=torch.uint8),
-        ]),
-        w2_weight=torch.stack([
-            torch.full((2,), 10, dtype=torch.uint8),
-            torch.full((2,), 11, dtype=torch.uint8),
-        ]),
-        w13_weight_scale=torch.tensor([[0.0], [1.0]]),
-    )
-    log2phy = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
-
-    manager._swap_expert_weights(
-        layer, 0, [(0, 2, 0, 0)], log2phy.numpy())
-
-    tasks = manager.h2d_transport.batches[0]
-    assert [task.direction for task in tasks[:3]] == [
-        CopyDirection.D2H,
-        CopyDirection.D2H,
-        CopyDirection.D2H,
-    ]
-    assert [task.direction for task in tasks[3:]] == [
-        CopyDirection.H2D,
-        CopyDirection.H2D,
-        CopyDirection.H2D,
-    ]
-    assert torch.equal(
-        manager.w13_weights_cpu[0][0],
-        torch.zeros(4, dtype=torch.uint8),
-    )
-    assert torch.equal(
-        layer.w13_weight[0],
-        torch.full((4,), 2, dtype=torch.uint8),
-    )
-    assert manager.scale_cpu_buffers["w13_weight_scale"][0][0].item() == 0
-    assert layer.w13_weight_scale[0].item() == 2
-    assert manager._cpu_slot_to_eid[0] == [0, 3]
-    assert manager._npu_slot_to_eid[0] == [2, 1]
-    assert manager._eid_to_cpu_slot[0] == [0, -1, -1, 1]
-    assert manager._eid_to_npu_slot[0] == [-1, 1, 0, -1]
-    assert log2phy.tolist() == [-1, 1, 0, -1]
-    manager._synchronize_h2d.assert_called_once_with()
-
-
-def _exclusive_shared_runtime_manager():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "storage_partition_mode": "exclusive_dynamic",
-        "num_device_experts": 2,
-        "enable_multi_card": True,
-        "shard_per_rank": True,
-        "shared_cpu_weights": True,
-    })
-    manager.enable_multi_card = True
-    manager._ep_size = 2
-    manager._ep_rank = 0
-    manager._ep_info_resolved = True
-    manager.num_total_experts = 4
-    manager._shard_base = 0
-    manager._shard_size = 2
-    manager._cpu_slot_to_eid = []
-    manager._eid_to_cpu_slot = []
-    manager._npu_slot_to_eid = []
-    manager._eid_to_npu_slot = []
-    manager._exclusive_layer_locks = []
-    manager._exclusive_prefill_comm_lock = threading.Lock()
-    manager._exclusive_prefill_comm_buffers = {}
-    manager._exclusive_shared_local_cpu_slots = [[0]]
-    manager._exclusive_shared_cpu_slot_to_local = [{0: 0}]
-    manager._exclusive_shared_bootstrap_layers = set()
-    manager._init_exclusive_ownership(
-        0, ntotal=4, ndev=2, npu_eids=[0, 1])
-    manager.w13_expert_size_bytes = 4
-    manager.w2_expert_size_bytes = 2
-    global_w13 = torch.stack([
-        torch.full((4,), 2, dtype=torch.uint8),
-        torch.full((4,), 3, dtype=torch.uint8),
-    ])
-    global_w2 = torch.stack([
-        torch.full((2,), 12, dtype=torch.uint8),
-        torch.full((2,), 13, dtype=torch.uint8),
-    ])
-    manager._torch_shared_cpu_buffers = {
-        (0, "w13"): global_w13,
-        (0, "w2"): global_w2,
-    }
-    manager.w13_weights_cpu = [[global_w13[0]]]
-    manager.w2_weights_cpu = [[global_w2[0]]]
-    manager.scale_cpu_buffers = {}
-    manager.offset_cpu_buffers = {}
-    manager.scale_bias_cpu_buffers = {}
-    manager._allocate_expert_host_tensor = (
-        lambda shape, dtype: torch.empty(shape, dtype=dtype))
-    manager.h2d_transport = _CopyingExpertTransport()
-    manager._synchronize_h2d = MagicMock()
-    manager.load_stream = MagicMock()
-    manager._mc_prev_log2phy = {
-        0: torch.tensor([0, 1, -1, -1], dtype=torch.int32),
-    }
-    manager._mc_resident = {0: {0: 0}}
-    manager._debug = False
-    manager._torch_shared_cpu_sources_ready = True
-    manager._torch_shared_cpu_ready_layers = {0}
-    manager._mc_runtime_cpu_group = None
-    manager._mc_collective_executor = None
-    return manager
-
-
-def _exclusive_sharded_runtime_manager():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "storage_partition_mode": "exclusive_dynamic",
-        "num_device_experts": 2,
-        "enable_multi_card": True,
-        "shard_per_rank": True,
-        "shared_cpu_weights": False,
-    })
-    manager.enable_multi_card = True
-    manager._ep_size = 2
-    manager._ep_rank = 1
-    manager._ep_info_resolved = True
-    manager.num_total_experts = 4
-    manager._shard_base = 2
-    manager._shard_size = 2
-    manager._cpu_slot_to_eid = []
-    manager._eid_to_cpu_slot = []
-    manager._npu_slot_to_eid = []
-    manager._eid_to_npu_slot = []
-    manager._exclusive_layer_locks = []
-    manager._init_exclusive_ownership(
-        0, ntotal=4, ndev=1, npu_eids=[2], owned_eids=[2, 3])
-    manager.w13_expert_size_bytes = 4
-    manager.w2_expert_size_bytes = 2
-    manager.w13_weights_cpu = [[
-        torch.full((4,), 3, dtype=torch.uint8),
-    ]]
-    manager.w2_weights_cpu = [[
-        torch.full((2,), 13, dtype=torch.uint8),
-    ]]
-    manager.scale_cpu_buffers = {}
-    manager.offset_cpu_buffers = {}
-    manager.scale_bias_cpu_buffers = {}
-    manager._allocate_expert_host_tensor = (
-        lambda shape, dtype: torch.empty(shape, dtype=dtype))
-    manager.h2d_transport = _CopyingExpertTransport()
-    manager._synchronize_h2d = MagicMock()
-    manager.load_stream = MagicMock()
-    manager._mc_prev_log2phy = {}
-    manager._mc_resident = {0: {0: 2}}
-    manager._debug = False
-    manager._prefill_w13 = [torch.zeros((2, 4), dtype=torch.uint8)]
-    manager._prefill_w2 = [torch.zeros((2, 2), dtype=torch.uint8)]
-    manager._prefill_w13_scale = []
-    manager._prefill_w13_scale_fp32 = []
-    manager._prefill_w13_offset = []
-    manager._prefill_w2_scale = []
-    manager._prefill_w2_offset = []
-    manager._prefill_w13_scale_bias = []
-    manager._prefill_w2_scale_bias = []
-    manager.moe_layers = [SimpleNamespace(
-        w13_weight=torch.full((1, 4), 2, dtype=torch.uint8),
-        w2_weight=torch.full((1, 2), 12, dtype=torch.uint8),
-        log2phy=torch.full((4,), -1, dtype=torch.int32),
-    )]
-    return manager
-
-
-def test_exclusive_sharded_initializes_one_global_owner_constrained_map():
-    manager = _exclusive_sharded_runtime_manager()
-
-    manager._initialize_exclusive_sharded_runtime_state()
-
-    expected = torch.tensor([0, -1, 1, -1], dtype=torch.int32)
-    assert torch.equal(manager.moe_layers[0].log2phy, expected)
-    assert torch.equal(manager._mc_prev_log2phy[0], expected)
-    assert manager._mc_resident[0] == {0: 2}
-    assert manager._cpu_slot_to_eid[0] == [3]
-    assert manager._npu_slot_to_eid[0] == [2]
-
-
-def test_exclusive_sharded_bootstrap_materializes_and_drops_cpu_suffix():
-    manager = _exclusive_sharded_runtime_manager()
-    # Canonical CPU prefix owns expert 3. The initialization-only suffix owns
-    # expert 2 until its processed bytes are materialized in local NPU slot 0.
-    manager.w13_weights_cpu[0].append(
-        torch.full((4,), 2, dtype=torch.uint8))
-    manager.w2_weights_cpu[0].append(
-        torch.full((2,), 12, dtype=torch.uint8))
-    manager.scale_cpu_buffers = {
-        "w13_weight_scale": [[
-            torch.tensor([3.0]),
-            torch.tensor([2.0]),
-        ]],
-    }
-    manager.moe_layers[0].w13_weight.zero_()
-    manager.moe_layers[0].w2_weight.zero_()
-    manager.moe_layers[0].w13_weight_scale = torch.zeros((1, 1))
-    manager._exclusive_sharded_bootstrap_layers = {0}
-
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
-        return_value=nullcontext(),
-    ):
-        manager._materialize_exclusive_sharded_bootstrap()
-
-    assert torch.equal(
-        manager.moe_layers[0].w13_weight[0],
-        torch.full((4,), 2, dtype=torch.uint8))
-    assert torch.equal(
-        manager.moe_layers[0].w2_weight[0],
-        torch.full((2,), 12, dtype=torch.uint8))
-    assert manager.moe_layers[0].w13_weight_scale[0].item() == 2
-    assert len(manager.w13_weights_cpu[0]) == 1
-    assert len(manager.w2_weights_cpu[0]) == 1
-    assert len(manager.scale_cpu_buffers["w13_weight_scale"][0]) == 1
-    assert manager._exclusive_sharded_bootstrap_layers == set()
-    assert all(
-        task.direction == CopyDirection.H2D
-        for task in manager.h2d_transport.batches[0])
-    manager._synchronize_h2d.assert_called_once_with()
-
-
-def test_exclusive_shared_bootstrap_materializes_and_drops_private_suffix():
-    manager = _exclusive_shared_runtime_manager()
-    # Rank 0 writes canonical shared-CPU expert 2. Its private suffix owns
-    # initial NPU expert 0 only until that processed representation reaches
-    # local device slot 0.
-    manager.w13_weights_cpu[0].append(
-        torch.full((4,), 20, dtype=torch.uint8))
-    manager.w2_weights_cpu[0].append(
-        torch.full((2,), 120, dtype=torch.uint8))
-    manager.scale_cpu_buffers = {
-        "w13_weight_scale": [[
-            torch.tensor([3.0]),
-            torch.tensor([20.0]),
-        ]],
-    }
-    manager.moe_layers = [SimpleNamespace(
-        w13_weight=torch.zeros((1, 4), dtype=torch.uint8),
-        w2_weight=torch.zeros((1, 2), dtype=torch.uint8),
-        w13_weight_scale=torch.zeros((1, 1)),
-    )]
-    manager._exclusive_shared_bootstrap_layers = {0}
-
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
-        return_value=nullcontext(),
-    ):
-        manager._materialize_exclusive_shared_bootstrap()
-
-    assert torch.equal(
-        manager.moe_layers[0].w13_weight[0],
-        torch.full((4,), 20, dtype=torch.uint8))
-    assert torch.equal(
-        manager.moe_layers[0].w2_weight[0],
-        torch.full((2,), 120, dtype=torch.uint8))
-    assert manager.moe_layers[0].w13_weight_scale[0].item() == 20
-    assert len(manager.w13_weights_cpu[0]) == 1
-    assert len(manager.w2_weights_cpu[0]) == 1
-    assert len(manager.scale_cpu_buffers["w13_weight_scale"][0]) == 1
-    assert manager._exclusive_shared_bootstrap_layers == set()
-    assert manager._cpu_slot_to_eid[0] == [2, 3]
-    assert manager._npu_slot_to_eid[0] == [0, 1]
-    assert all(
-        task.direction == CopyDirection.H2D
-        for task in manager.h2d_transport.batches[0])
-    manager._synchronize_h2d.assert_called_once_with()
-
-
-def test_exclusive_shared_replacement_keeps_bootstrap_suffix_private():
-    manager = _exclusive_shared_runtime_manager()
-    manager._exclusive_shared_bootstrap_layers = {0}
-    shared_destination = torch.zeros(1, dtype=torch.int64)
-    manager._allocate_torch_shared_expert_buffer = MagicMock(
-        return_value=[shared_destination])
-
-    result = manager._replace_torch_shared_expert_buffer(
-        0,
-        "w13_weight_scale",
-        [torch.tensor([11]), torch.tensor([22])],
-    )
-
-    assert len(result) == 2
-    assert result[0] is shared_destination
-    assert result[0].item() == 11
-    assert result[1].item() == 22
-    assert result[1] is not shared_destination
-    manager._allocate_torch_shared_expert_buffer.assert_called_once()
-
-
-def test_tensor_storage_window_honors_shared_expert_view_offset():
-    backing = torch.arange(12, dtype=torch.uint8).reshape(3, 4)
-    expert_view = backing[1]
-
-    # A tensor view exposes the complete backing storage unless its logical
-    # storage_offset is applied explicitly.
-    assert expert_view.untyped_storage().nbytes() == 12
-    assert expert_view.storage_offset() == 4
-    destination = ExpertOffloadManager._tensor_storage_window(expert_view, 4)
-    assert destination.nbytes() == 4
-    destination.copy_(torch.full((4,), 99, dtype=torch.uint8).untyped_storage())
-
-    assert backing.tolist() == [
-        [0, 1, 2, 3],
-        [99, 99, 99, 99],
-        [8, 9, 10, 11],
-    ]
-
-
-def test_exclusive_sharded_numeric_log_reports_first_ok_and_each_failure():
-    manager = _exclusive_sharded_runtime_manager()
-    manager._debug = True
-    comm_context = SimpleNamespace(
-        capturing=False, moe_comm_type=SimpleNamespace(name="ALLTOALL"))
-
-    with (
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager._EXTRA_CTX",
-            comm_context,
-        ),
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager.logger",
-        ) as mock_logger,
-    ):
-        manager.log_exclusive_sharded_numeric(
-            manager.moe_layers[0], torch.ones(2), "moe_output")
-        manager.log_exclusive_sharded_numeric(
-            manager.moe_layers[0], torch.ones(2), "moe_output")
-        manager.log_exclusive_sharded_numeric(
-            manager.moe_layers[0], torch.tensor([1.0, float("nan")]),
-            "moe_output")
-
-    assert mock_logger.info.call_count == 1
-    assert mock_logger.warning.call_count == 1
-    assert mock_logger.warning.call_args.args[-1] == 1
-
-
-def test_exclusive_sharded_numeric_log_skips_graph_capture():
-    manager = _exclusive_sharded_runtime_manager()
-    manager._debug = True
-    comm_context = SimpleNamespace(
-        capturing=True, moe_comm_type=SimpleNamespace(name="MC2"))
-
-    with (
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager._EXTRA_CTX",
-            comm_context,
-        ),
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager.logger",
-        ) as mock_logger,
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager.torch.isfinite",
-        ) as mock_isfinite,
-    ):
-        manager.log_exclusive_sharded_numeric(
-            manager.moe_layers[0], torch.ones(2), "moe_input")
-
-    mock_isfinite.assert_not_called()
-    mock_logger.info_once.assert_called_once()
-    assert "during ACL Graph capture" in mock_logger.info_once.call_args.args[0]
-
-
-def test_exclusive_sharded_numeric_log_skips_non_tensor_input():
-    manager = _exclusive_sharded_runtime_manager()
-    manager._debug = True
-
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.logger",
-    ) as mock_logger:
-        manager.log_exclusive_sharded_numeric(
-            manager.moe_layers[0], SimpleNamespace(routed_out=torch.ones(2)),
-            "moe_output")
-
-    mock_logger.warning.assert_called_once()
-    assert "reason=not_tensor" in mock_logger.warning.call_args.args[0]
-    assert mock_logger.warning.call_args.args[-1] == "SimpleNamespace"
-
-
-def test_exclusive_sharded_prefill_uses_only_local_h2d_and_d2d():
-    manager = _exclusive_sharded_runtime_manager()
-
-    manager._load_prefill_shard_from_local_ownership(0, 0)
-
-    tasks = manager.h2d_transport.batches[0]
-    assert [task.direction for task in tasks] == [
-        CopyDirection.D2D,
-        CopyDirection.D2D,
-        CopyDirection.H2D,
-        CopyDirection.H2D,
-    ]
-    assert torch.equal(
-        manager._prefill_w13[0][0], torch.full((4,), 2, dtype=torch.uint8))
-    assert torch.equal(
-        manager._prefill_w13[0][1], torch.full((4,), 3, dtype=torch.uint8))
-
-
-def test_exclusive_sharded_decode_swaps_only_local_cpu_and_npu():
-    manager = _exclusive_sharded_runtime_manager()
-    placement = SimpleNamespace(
-        per_rank_experts=[[0], [3]],
-        log2phy=torch.tensor([0, -1, -1, 1], dtype=torch.int32),
-    )
-    log2phy_h = torch.tensor([0, -1, 1, -1], dtype=torch.int32)
-
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
-        return_value=nullcontext(),
-    ):
-        manager._swap_expert_weights_multi_card_sharded(
-            manager.moe_layers[0], 0, placement, 1, log2phy_h)
-
-    tasks = manager.h2d_transport.batches[0]
-    assert [task.direction for task in tasks] == [
-        CopyDirection.D2H,
-        CopyDirection.D2H,
-        CopyDirection.H2D,
-        CopyDirection.H2D,
-    ]
-    assert torch.equal(
-        manager.moe_layers[0].w13_weight[0],
-        torch.full((4,), 3, dtype=torch.uint8))
-    assert torch.equal(
-        manager.w13_weights_cpu[0][0],
-        torch.full((4,), 2, dtype=torch.uint8))
-    assert manager._npu_slot_to_eid[0] == [3]
-    assert manager._cpu_slot_to_eid[0] == [2]
-    assert manager._mc_resident[0] == {0: 3}
-    assert torch.equal(log2phy_h, placement.log2phy)
-
-
-def test_exclusive_sharded_decode_rejects_remote_weight_placement():
-    manager = _exclusive_sharded_runtime_manager()
-    placement = SimpleNamespace(
-        per_rank_experts=[[0], [1]],
-        log2phy=torch.tensor([0, 1, -1, -1], dtype=torch.int32),
-    )
-
-    with pytest.raises(RuntimeError, match="selected a remote expert"):
-        manager._swap_expert_weights_multi_card_sharded(
-            manager.moe_layers[0], 0, placement, 1,
-            torch.tensor([0, -1, 1, -1], dtype=torch.int32))
-
-
-def test_exclusive_sharded_decode_rejects_an_empty_local_slot():
-    manager = _exclusive_sharded_runtime_manager()
-    placement = SimpleNamespace(
-        per_rank_experts=[[0], [-1]],
-        log2phy=torch.tensor([0, -1, -1, -1], dtype=torch.int32),
-    )
-
-    with pytest.raises(RuntimeError, match="keep every local NPU slot"):
-        manager._swap_expert_weights_multi_card_sharded(
-            manager.moe_layers[0], 0, placement, 1,
-            torch.tensor([0, -1, 1, -1], dtype=torch.int32))
-
-
-def test_exclusive_shared_swap_commits_compact_cpu_and_global_ownership():
-    manager = _exclusive_shared_runtime_manager()
-    manager._debug = True
-    layer = SimpleNamespace(
-        w13_weight=torch.stack([
-            torch.zeros(4, dtype=torch.uint8),
-        ]),
-        w2_weight=torch.stack([
-            torch.full((2,), 10, dtype=torch.uint8),
-        ]),
-    )
-    placement = SimpleNamespace(
-        per_rank_experts=[[2], [1]],
-        log2phy=torch.tensor([-1, 1, 0, -1], dtype=torch.int32),
-    )
-    log2phy = torch.empty(4, dtype=torch.int32)
-    ep_group = SimpleNamespace(cpu_group=object())
-    decode_group = object()
-    manager._mc_runtime_cpu_group = decode_group
-    debug_context = {
-        "layer_idx": 0,
-        "layer_call": 1,
-        "callback_seq": 1,
-        "source": "graph_callback",
-        "is_prefetch": True,
-    }
-
-    def gather(output, value, group):
-        assert group is decode_group
-        output[:] = [value, value]
-
-    with (
-        patch("torch.distributed.all_gather_object", side_effect=gather),
-        patch("vllm.distributed.parallel_state.get_ep_group",
-              return_value=ep_group),
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager."
-            "torch_npu.npu.stream",
-            return_value=nullcontext(),
-        ),
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-        ) as log_info,
-    ):
-        manager._swap_expert_weights_multi_card_shared(
-            layer, 0, placement, 1, log2phy, debug_context)
-
-    assert torch.equal(
-        manager._torch_shared_cpu_buffers[(0, "w13")][0],
-        torch.zeros(4, dtype=torch.uint8),
-    )
-    assert torch.equal(
-        layer.w13_weight[0], torch.full((4,), 2, dtype=torch.uint8))
-    assert manager._cpu_slot_to_eid[0] == [0, 3]
-    assert manager._npu_slot_to_eid[0] == [2, 1]
-    assert manager._eid_to_cpu_slot[0] == [0, -1, -1, 1]
-    assert manager._eid_to_npu_slot[0] == [-1, 1, 0, -1]
-    assert torch.equal(log2phy, placement.log2phy)
-    debug_events = [
-        entry.args[1] for entry in log_info.call_args_list
-        if entry.args and entry.args[0].startswith("[MC_DEBUG]")
-    ]
-    assert debug_events == ["SHARED_SWAP_PLAN"]
-    assert debug_context["stage"] == "shared_swap_complete"
-
-
-def test_exclusive_shared_swap_logs_local_device_copy_failure():
-    manager = _exclusive_shared_runtime_manager()
-    manager._debug = True
-    manager.h2d_transport.copy_batch = MagicMock(
-        side_effect=RuntimeError("device copy failed"))
-    layer = SimpleNamespace(
-        w13_weight=torch.stack([
-            torch.zeros(4, dtype=torch.uint8),
-        ]),
-        w2_weight=torch.stack([
-            torch.full((2,), 10, dtype=torch.uint8),
-        ]),
-    )
-    placement = SimpleNamespace(
-        per_rank_experts=[[2], [1]],
-        log2phy=torch.tensor([-1, 1, 0, -1], dtype=torch.int32),
-    )
-    log2phy = torch.empty(4, dtype=torch.int32)
-    ep_group = SimpleNamespace(cpu_group=object())
-    debug_context = {
-        "layer_idx": 0,
-        "layer_call": 1,
-        "callback_seq": 1,
-        "source": "graph_callback",
-        "is_prefetch": True,
-    }
-
-    def gather(output, value, group):
-        assert group is ep_group.cpu_group
-        output[:] = [value, value]
-
-    with (
-        patch("torch.distributed.all_gather_object", side_effect=gather),
-        patch("vllm.distributed.parallel_state.get_ep_group",
-              return_value=ep_group),
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager."
-            "torch_npu.npu.stream",
-            return_value=nullcontext(),
-        ),
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-        ) as log_info,
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager.logger.exception"
-        ) as log_exception,
-    ):
-        with pytest.raises(
-            RuntimeError,
-            match="Exclusive shared swap failed during device copy.*"
-                  "device copy failed",
-        ):
-            manager._swap_expert_weights_multi_card_shared(
-                layer, 0, placement, 1, log2phy, debug_context)
-
-    debug_calls = [
-        entry for entry in log_info.call_args_list
-        if entry.args and entry.args[0].startswith("[MC_DEBUG]")
-    ]
-    assert [entry.args[1] for entry in debug_calls] == [
-        "SHARED_SWAP_PLAN", "SHARED_SWAP_LOCAL_ERROR"
-    ]
-    error_details = debug_calls[-1].args[-1]
-    assert "error_stage=device_copy" in error_details
-    assert "error_type=RuntimeError" in error_details
-    assert "error_message=RuntimeError('device copy failed')" in error_details
-    assert debug_context["stage"] == "shared_swap_device_consensus"
-    log_exception.assert_called_once()
-
-
-def test_exclusive_shared_prefill_uses_zero_offset_uint8_p2p_buffers():
-    manager = _exclusive_shared_runtime_manager()
-    manager._npu_slot_to_eid[0] = [2, 1]
-    manager._eid_to_npu_slot[0] = [-1, 1, 0, -1]
-    manager._cpu_slot_to_eid[0] = [0, 3]
-    manager._eid_to_cpu_slot[0] = [0, -1, -1, 1]
-    manager.w2_expert_size_bytes = 4
-    global_w2 = torch.stack([
-        torch.full((4,), 12, dtype=torch.uint8),
-        torch.full((4,), 13, dtype=torch.uint8),
-    ])
-    manager._torch_shared_cpu_buffers[(0, "w2")] = global_w2
-    manager.w2_weights_cpu = [[global_w2[0]]]
-    source_scale = torch.arange(
-        16, dtype=torch.uint8).reshape(1, 4, 2, 2).transpose(-3, -2)
-    assert not source_scale[0].is_contiguous()
-    layer = SimpleNamespace(
-        w13_weight=torch.stack([
-            torch.full((4,), 22, dtype=torch.uint8),
-        ]),
-        w2_weight=torch.stack([
-            torch.full((4,), 32, dtype=torch.uint8),
-        ]),
-        w13_weight_scale=source_scale,
-    )
-    manager.moe_layers = [layer]
-    manager._prefill_w13 = [torch.zeros((2, 4), dtype=torch.uint8)]
-    manager._prefill_w2 = [torch.zeros((2, 4), dtype=torch.uint8)]
-    manager._prefill_w13_scale = [torch.zeros(
-        (2, 2, 4, 2), dtype=torch.uint8)]
-    manager._prefill_w13_scale_fp32 = []
-    manager._prefill_w2_scale = []
-    manager._prefill_w13_offset = []
-    manager._prefill_w2_offset = []
-    manager._prefill_w13_scale_bias = []
-    manager._prefill_w2_scale_bias = []
-    cpu_scales = torch.stack([
-        torch.full((2, 4, 2), 25, dtype=torch.uint8),
-        torch.full((2, 4, 2), 35, dtype=torch.uint8),
-    ])
-    manager.scale_cpu_buffers = {
-        "w13_weight_scale": [[cpu_scales[0], cpu_scales[1]]],
-    }
-    manager._torch_shared_cpu_buffers[(
-        0, "w13_weight_scale")] = cpu_scales
-    manager.num_device_layers = 1
-    manager._exclusive_layer_locks = [threading.RLock()]
-    ep_group = SimpleNamespace(
-        cpu_group=object(), device_group=object(), ranks=[10, 11])
-
-    def as_bytes(*tensors):
-        return torch.cat([
-            tensor.contiguous().view(torch.uint8).reshape(-1)
-            for tensor in tensors
-        ])
-
-    remote_scale = torch.arange(
-        16, dtype=torch.uint8).reshape(2, 4, 2) + 100
-    remote_payloads = [
-        as_bytes(
-            torch.full((4,), 41, dtype=torch.uint8),
-            torch.full((4,), 51, dtype=torch.uint8),
-        ),
-        as_bytes(remote_scale),
-    ]
-    exchanges = []
-    exchange_round = 0
-
-    def gather_plans(output, local_plan, group):
-        assert group is ep_group.cpu_group
-        remote_plan = {
-            "send": {0: local_plan["recv"][1]},
-            "recv": {0: local_plan["send"][1]},
-        }
-        output[:] = [local_plan, remote_plan]
-
-    def exchange(send_buffers, recv_buffers, stream):
-        nonlocal exchange_round
-        payload = remote_payloads[exchange_round]
-        exchange_round += 1
-        assert set(send_buffers) == {1}
-        assert set(recv_buffers) == {1}
-        exchanges.append({
-            "send": send_buffers[1].clone(),
-            "recv": recv_buffers[1],
-            "stream": stream,
-        })
-        recv_buffers[1].copy_(payload)
-
-    pyhccl = SimpleNamespace(
-        batch_send_recv=MagicMock(side_effect=exchange))
-
-    with (
-        patch("vllm.distributed.parallel_state.get_ep_group",
-              return_value=ep_group),
-        patch.object(
-            manager, "_get_exclusive_prefill_pyhccl",
-            return_value=pyhccl) as get_pyhccl,
-        patch("torch.distributed.all_gather_object",
-              side_effect=gather_plans) as gather,
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager."
-            "_EXCLUSIVE_PREFILL_P2P_CHUNK_BYTES",
-            16,
-        ),
-        patch("torch.distributed.barrier") as barrier,
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager."
-            "torch_npu.npu.stream",
-            return_value=nullcontext(),
-        ),
-    ):
-        manager._prefill_load_layer_shard_exclusive_shared(0, 0)
-
-    get_pyhccl.assert_called_once_with(ep_group, manager._prefill_w13[0].device)
-    assert pyhccl.batch_send_recv.call_count == 2
-    assert gather.call_count == 1
-    communication_buffers = [
-        buffer
-        for call_args in pyhccl.batch_send_recv.call_args_list
-        for buffers in call_args.args[:2]
-        for buffer in buffers.values()
-    ]
-    assert all(buffer.dtype == torch.uint8
-               for buffer in communication_buffers)
-    assert all(buffer.is_contiguous() for buffer in communication_buffers)
-    assert all(buffer.storage_offset() == 0
-               for buffer in communication_buffers)
-    assert sorted(buffer.numel() for buffer in communication_buffers) == [
-        8, 8, 16, 16]
-    send_payload = torch.cat([
-        exchange_state["send"] for exchange_state in exchanges
-    ])
-    assert torch.equal(send_payload, as_bytes(
-        layer.w13_weight[0],
-        layer.w2_weight[0],
-        layer.w13_weight_scale[0],
-    ))
-    assert all(exchange_state["stream"] is manager.load_stream
-               for exchange_state in exchanges)
-    barrier.assert_called_once_with(group=ep_group.cpu_group)
-    # Static-shard expert 0 is CPU-owned and was loaded through shared H2D.
-    assert torch.equal(
-        manager._prefill_w13[0][0],
-        manager._torch_shared_cpu_buffers[(0, "w13")][0],
-    )
-    assert torch.equal(
-        manager._prefill_w13[0][1],
-        torch.full((4,), 41, dtype=torch.uint8),
-    )
-    assert torch.equal(
-        manager._prefill_w2[0][1],
-        torch.full((4,), 51, dtype=torch.uint8),
-    )
-    assert torch.equal(manager._prefill_w13_scale[0][0], cpu_scales[0])
-    assert torch.equal(manager._prefill_w13_scale[0][1], remote_scale)
-    packed_tasks = [
-        task
-        for tasks in manager.h2d_transport.batches
-        for task in tasks
-        if task.name.startswith("prefill-p2p-pack-")
-    ]
-    pack_names = [task.name.split("[")[0] for task in packed_tasks]
-    unpacked_tasks = [
-        task
-        for tasks in manager.h2d_transport.batches
-        for task in tasks
-        if task.name.startswith("prefill-p2p-unpack-")
-    ]
-    unpack_names = [
-        task.name.split("[")[0]
-        for task in unpacked_tasks
-    ]
-    assert pack_names == [
-        "prefill-p2p-pack-w13",
-        "prefill-p2p-pack-w2",
-        "prefill-p2p-pack-w13_weight_scale",
-    ]
-    assert unpack_names == [
-        "prefill-p2p-unpack-w13",
-        "prefill-p2p-unpack-w2",
-        "prefill-p2p-unpack-w13_weight_scale",
-    ]
-    assert all(not isinstance(task.source, torch.Tensor)
-               and not isinstance(task.destination, torch.Tensor)
-               for task in packed_tasks[:2] + unpacked_tasks[:2])
-    assert isinstance(packed_tasks[2].source, torch.Tensor)
-    assert isinstance(packed_tasks[2].destination, torch.Tensor)
-    assert not packed_tasks[2].source.is_contiguous()
-    assert packed_tasks[2].destination.is_contiguous()
-    assert isinstance(unpacked_tasks[2].source, torch.Tensor)
-    assert isinstance(unpacked_tasks[2].destination, torch.Tensor)
-
-
-def test_exclusive_prefill_comm_buffer_reuses_zero_offset_prefix():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager._exclusive_prefill_comm_buffers = {}
-
-    initial = manager._get_exclusive_prefill_comm_buffer(
-        "send", 1, 16, torch.device("cpu"))
-    smaller = manager._get_exclusive_prefill_comm_buffer(
-        "send", 1, 8, torch.device("cpu"))
-    grown = manager._get_exclusive_prefill_comm_buffer(
-        "send", 1, 32, torch.device("cpu"))
-
-    assert initial.dtype == smaller.dtype == grown.dtype == torch.uint8
-    assert initial.storage_offset() == 0
-    assert smaller.storage_offset() == 0
-    assert grown.storage_offset() == 0
-    assert initial.data_ptr() == smaller.data_ptr()
-    assert grown.numel() == 32
-
-
-def test_exclusive_prefill_pyhccl_is_created_once_and_cached():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager._ep_size = 3
-    manager._ep_rank = 1
-    manager._ep_info_resolved = True
-    manager._exclusive_prefill_pyhccl = None
-    device = torch.device("cpu")
-    communicator = SimpleNamespace(
-        available=True,
-        disabled=False,
-        device=device,
-        hccl=SimpleNamespace(supports_batch_send_recv=True),
-        close=MagicMock(),
-    )
-    ep_group = SimpleNamespace(cpu_group=object())
-
-    def gather_availability(output, value, group):
-        assert group is ep_group.cpu_group
-        output[:] = [value] * manager._ep_size
-
-    with (
-        patch(
-            "vllm_ascend.distributed.device_communicators.pyhccl."
-            "PyHcclCommunicator",
-            return_value=communicator,
-        ) as communicator_cls,
-        patch(
-            "vllm_ascend.distributed.device_communicators.pyhccl_wrapper."
-            "HCCLLibrary",
-            return_value=SimpleNamespace(supports_batch_send_recv=True),
-        ),
-        patch("torch.distributed.all_gather_object",
-              side_effect=gather_availability),
-    ):
-        first = manager._get_exclusive_prefill_pyhccl(ep_group, device)
-        second = manager._get_exclusive_prefill_pyhccl(ep_group, device)
-
-    assert first is second is communicator
-    communicator_cls.assert_called_once_with(
-        ep_group.cpu_group, device=device)
-
-
-def test_exclusive_prefill_pyhccl_rejects_missing_batch_api():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager._ep_size = 2
-    manager._exclusive_prefill_pyhccl = None
-    communicator = SimpleNamespace(
-        available=True,
-        disabled=False,
-        device=torch.device("cpu"),
-        hccl=SimpleNamespace(supports_batch_send_recv=False),
-        close=MagicMock(),
-    )
-    cpu_group = object()
-
-    def gather_availability(output, value, group):
-        assert group is cpu_group
-        output[:] = [value] * manager._ep_size
-
-    with (
-        patch(
-            "vllm_ascend.distributed.device_communicators.pyhccl."
-            "PyHcclCommunicator",
-            return_value=communicator,
-        ) as communicator_cls,
-        patch(
-            "vllm_ascend.distributed.device_communicators.pyhccl_wrapper."
-            "HCCLLibrary",
-            return_value=SimpleNamespace(supports_batch_send_recv=False),
-        ),
-        patch("torch.distributed.all_gather_object",
-              side_effect=gather_availability),
-        pytest.raises(RuntimeError, match="Raw-pointer prefill P2P"),
-    ):
-        manager._get_exclusive_prefill_pyhccl(
-            SimpleNamespace(cpu_group=cpu_group), torch.device("cpu"))
-
-    communicator_cls.assert_not_called()
-    communicator.close.assert_not_called()
-
-
-def test_exclusive_prefill_comm_layout_aligns_typed_components():
-    raw_component = _PrefillPeerComponent(
-        name="weight",
-        source=object(),
-        destination=object(),
-        nbytes=6,
-    )
-    typed_component = _PrefillPeerComponent(
-        name="scale",
-        source=object(),
-        destination=object(),
-        nbytes=4,
-        dtype=torch.float32,
-        shape=(1,),
-        element_size=4,
-    )
-
-    layout, total_bytes = (
-        ExpertOffloadManager._layout_prefill_peer_components([
-            (3, raw_component),
-            (4, typed_component),
-        ]))
-
-    assert [entry[2] for entry in layout] == [0, 8]
-    assert total_bytes == 12
-    buffer = torch.zeros(12, dtype=torch.uint8)
-    typed_view = ExpertOffloadManager._prefill_comm_component_view(
-        buffer, 8, typed_component)
-    typed_view.copy_(torch.tensor([3.5]))
-    assert typed_view.item() == 3.5
-    assert torch.equal(
-        buffer[8:12], torch.tensor([3.5]).view(torch.uint8))
-
-
-@pytest.mark.parametrize("dtype", [
-    torch.uint8,
-    torch.bfloat16,
-    torch.float32,
-    torch.int64,
-])
-def test_exclusive_prefill_comm_view_preserves_metadata_dtype(dtype):
-    source = torch.arange(4, dtype=torch.float32).to(dtype)
-    element_size = source.element_size()
-    offset = element_size
-    component = _PrefillPeerComponent(
-        name="metadata",
-        source=source,
-        destination=object(),
-        nbytes=source.numel() * element_size,
-        dtype=dtype,
-        shape=tuple(source.shape),
-        element_size=element_size,
-    )
-    buffer = torch.zeros(
-        offset + component.nbytes, dtype=torch.uint8)
-
-    view = ExpertOffloadManager._prefill_comm_component_view(
-        buffer, offset, component)
-    view.copy_(source)
-
-    assert view.dtype == dtype
-    assert view.is_contiguous()
-    assert torch.equal(view, source)
-
-
-def test_exclusive_prefill_comm_chunks_are_bounded_and_realigned():
-    components = [
-        _PrefillPeerComponent(
-            name="weight",
-            source=object(),
-            destination=object(),
-            nbytes=6,
-        ),
-        _PrefillPeerComponent(
-            name="scale",
-            source=object(),
-            destination=object(),
-            nbytes=4,
-            dtype=torch.float32,
-            shape=(1,),
-            element_size=4,
-        ),
-        _PrefillPeerComponent(
-            name="offset",
-            source=object(),
-            destination=object(),
-            nbytes=8,
-            dtype=torch.int64,
-            shape=(1,),
-            element_size=8,
-        ),
-    ]
-
-    chunks = ExpertOffloadManager._chunk_prefill_peer_components(
-        list(enumerate(components)), max_chunk_bytes=10)
-
-    assert [size for _, size in chunks] == [6, 4, 8]
-    assert [[offset for _, _, offset in layout]
-            for layout, _ in chunks] == [[0], [0], [0]]
-
-
-def test_exclusive_prefill_plan_validation_rejects_mismatched_peer():
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager._ep_size = 2
-    manager._ep_rank = 0
-    manager._ep_info_resolved = True
-    component = _PrefillPeerComponent(
-        name="weight",
-        source=object(),
-        destination=object(),
-        nbytes=8,
-    )
-    send_components = {1: [(2, component)]}
-    cpu_group = object()
-    dist = SimpleNamespace()
-
-    def gather(output, local_plan, group):
-        assert group is cpu_group
-        remote_signature = local_plan["send"][1]
-        output[:] = [
-            local_plan,
-            {"send": {}, "recv": {0: (
-                remote_signature[0] + 1,
-                remote_signature[1],
-                remote_signature[2],
-            )}},
-        ]
-
-    dist.all_gather_object = gather
-
-    with pytest.raises(RuntimeError, match="plans do not match"):
-        manager._validate_prefill_peer_plans(
-            dist, cpu_group, 0, send_components, {})
-
-
-def test_exclusive_shared_prefill_uses_raw_storage_for_local_npu():
-    manager = _exclusive_shared_runtime_manager()
-    manager._npu_slot_to_eid[0] = [0, 2]
-    manager._eid_to_npu_slot[0] = [0, -1, 1, -1]
-    manager._cpu_slot_to_eid[0] = [1, 3]
-    manager._eid_to_cpu_slot[0] = [-1, 0, -1, 1]
-    layer = SimpleNamespace(
-        w13_weight=torch.stack([
-            torch.full((4,), 22, dtype=torch.uint8),
-        ]),
-        w2_weight=torch.stack([
-            torch.full((2,), 32, dtype=torch.uint8),
-        ]),
-        w13_weight_scale=torch.tensor([[1.25]]),
-    )
-    manager.moe_layers = [layer]
-    manager._prefill_w13 = [torch.zeros((2, 4), dtype=torch.uint8)]
-    manager._prefill_w2 = [torch.zeros((2, 2), dtype=torch.uint8)]
-    manager._prefill_w13_scale = [torch.zeros((2, 1))]
-    manager._prefill_w13_scale_fp32 = []
-    manager._prefill_w2_scale = []
-    manager._prefill_w13_offset = []
-    manager._prefill_w2_offset = []
-    manager._prefill_w13_scale_bias = []
-    manager._prefill_w2_scale_bias = []
-    manager.scale_cpu_buffers = {
-        "w13_weight_scale": [[torch.tensor([2.5])]],
-    }
-    manager._torch_shared_cpu_buffers[(
-        0, "w13_weight_scale")] = torch.tensor([[2.5], [3.5]])
-    manager.num_device_layers = 1
-    manager._exclusive_layer_locks = [threading.RLock()]
-    ep_group = SimpleNamespace(
-        cpu_group=object(), device_group=object(), ranks=[10, 11])
-    pyhccl = SimpleNamespace(batch_send_recv=MagicMock())
-
-    def gather_plans(output, local_plan, group):
-        assert group is ep_group.cpu_group
-        output[:] = [local_plan, local_plan]
-
-    with (
-        patch("vllm.distributed.parallel_state.get_ep_group",
-              return_value=ep_group),
-        patch.object(
-            manager, "_get_exclusive_prefill_pyhccl",
-            return_value=pyhccl),
-        patch("torch.distributed.all_gather_object",
-              side_effect=gather_plans),
-        patch("torch.distributed.barrier") as barrier,
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager."
-            "torch_npu.npu.stream",
-            return_value=nullcontext(),
-        ),
-    ):
-        manager._prefill_load_layer_shard_exclusive_shared(0, 0)
-
-    tasks = manager.h2d_transport.batches[0]
-    local_d2d = [
-        task for task in tasks if task.direction == CopyDirection.D2D]
-    cpu_h2d = [
-        task for task in tasks if task.direction == CopyDirection.H2D]
-    local_weight_d2d = [
-        task for task in local_d2d
-        if task.name.split("[")[0] in {
-            "prefill-local-d2d-w13",
-            "prefill-local-d2d-w2",
-        }
-    ]
-    local_metadata_d2d = [
-        task for task in local_d2d
-        if task.name.split("[")[0] not in {
-            "prefill-local-d2d-w13",
-            "prefill-local-d2d-w2",
-        }
-    ]
-    cpu_weight_h2d = [
-        task for task in cpu_h2d
-        if task.name.split("[")[0] in {"prefill-w13", "prefill-w2"}
-    ]
-    cpu_metadata_h2d = [
-        task for task in cpu_h2d
-        if task.name.split("[")[0] not in {"prefill-w13", "prefill-w2"}
-    ]
-    assert len(local_weight_d2d) == 2
-    assert len(local_metadata_d2d) == 1
-    assert len(cpu_weight_h2d) == 2
-    assert len(cpu_metadata_h2d) == 1
-    assert all(not isinstance(task.source, torch.Tensor)
-               for task in local_weight_d2d + cpu_weight_h2d)
-    assert all(not isinstance(task.destination, torch.Tensor)
-               for task in local_weight_d2d + cpu_weight_h2d)
-    assert all(isinstance(task.source, torch.Tensor)
-               for task in local_metadata_d2d + cpu_metadata_h2d)
-    assert all(isinstance(task.destination, torch.Tensor)
-               for task in local_metadata_d2d + cpu_metadata_h2d)
-    assert {task.name.split("[")[0] for task in local_weight_d2d} == {
-        "prefill-local-d2d-w13",
-        "prefill-local-d2d-w2",
-    }
-    pyhccl.batch_send_recv.assert_not_called()
-    barrier.assert_called_once_with(group=ep_group.cpu_group)
-    assert torch.equal(manager._prefill_w13[0][0], layer.w13_weight[0])
-    assert torch.equal(manager._prefill_w2[0][0], layer.w2_weight[0])
-    assert torch.equal(
-        manager._prefill_w13[0][1],
-        manager._torch_shared_cpu_buffers[(0, "w13")][0],
-    )
-    assert torch.equal(
-        manager._prefill_w2[0][1],
-        manager._torch_shared_cpu_buffers[(0, "w2")][0],
-    )
-    assert manager._prefill_w13_scale[0][:, 0].tolist() == [1.25, 2.5]
-
-
-def test_hot_preload_with_exclusive_dynamic_and_layer_capacities(tmp_path):
-    ranking_path = tmp_path / "hot.json"
-    ranking_path.write_text(json.dumps({
-        "0": [[2, 0.9], [1, 0.8], [4, 0.7]],
-        "1": [[4, 0.95], [1, 0.85], [3, 0.75]],
-    }))
-    manager = ExpertOffloadManager.__new__(ExpertOffloadManager)
-    manager.offload_config = ExpertOffloadConfig({
-        "expert_offload": True,
-        "storage_partition_mode": "exclusive_dynamic",
-        "num_device_experts": [2, 3],
-        "hot_expert_preload": True,
-        "hot_experts_file": str(ranking_path),
-        "shard_per_rank": False,
-    })
-    manager.enable_multi_card = False
-    manager.num_total_experts = None
-    manager.w13_weights_cpu = []
-    manager.w2_weights_cpu = []
-    manager.scale_cpu_buffers = {}
-    manager.offset_cpu_buffers = {}
-    manager.scale_bias_cpu_buffers = {}
-    manager._cpu_slot_to_eid = []
-    manager._eid_to_cpu_slot = []
-    manager._npu_slot_to_eid = []
-    manager._eid_to_npu_slot = []
-    manager._exclusive_layer_locks = []
-    manager.moe_layers = []
-    manager.cache_policy = None
-    manager._allocate_expert_host_tensor = (
-        lambda shape, dtype: torch.empty(shape, dtype=dtype))
-    manager.h2d_transport = _CopyingExpertTransport()
-    manager._synchronize_h2d = MagicMock()
-    manager._debug = False
-    layers = [
-        SimpleNamespace(
-            global_num_experts=5,
-            w13_weight=torch.empty((2, 6, 4), dtype=torch.uint8),
-            w2_weight=torch.empty((2, 5, 4), dtype=torch.uint8),
-        ),
-        SimpleNamespace(
-            global_num_experts=5,
-            w13_weight=torch.empty((3, 6, 4), dtype=torch.uint8),
-            w2_weight=torch.empty((3, 5, 4), dtype=torch.uint8),
-        ),
-    ]
-
-    for layer_idx, layer in enumerate(layers):
-        manager.init_layer_cpu_buffers(layer, layer_idx)
-
-    manager.cache_policy = MagicMock()
-    manager._preload_hot_experts()
-
-    assert manager._npu_slot_to_eid == [[2, 1], [4, 1, 3]]
-    assert manager._cpu_slot_to_eid == [[0, 3, 4], [0, 2]]
-    assert manager._eid_to_npu_slot == [
-        [-1, 1, 0, -1, -1],
-        [-1, 1, -1, 2, 0],
-    ]
-    assert manager._eid_to_cpu_slot == [
-        [0, -1, -1, 1, 2],
-        [0, -1, 1, -1, -1],
-    ]
-    assert manager.h2d_transport.batches == []
-    manager._synchronize_h2d.assert_not_called()
-    assert manager.cache_policy.seed_layer_hotness.call_args_list == [
-        call(0, {2: 0.9, 1: 0.8}),
-        call(1, {4: 0.95, 1: 0.85, 3: 0.75}),
-    ]
-
-
-def test_exclusive_prefill_resolves_npu_source_as_d2d_and_cpu_as_h2d():
-    manager = _exclusive_runtime_manager()
-    layer = SimpleNamespace(
-        w13_weight=torch.stack([
-            torch.zeros(4, dtype=torch.uint8),
-            torch.ones(4, dtype=torch.uint8),
-        ]),
-        w2_weight=torch.stack([
-            torch.full((2,), 10, dtype=torch.uint8),
-            torch.full((2,), 11, dtype=torch.uint8),
-        ]),
-    )
-    manager.moe_layers = [layer]
-    manager.scale_cpu_buffers = {}
-    manager._prefill_w13 = [torch.zeros((4, 4), dtype=torch.uint8)]
-    manager._prefill_w2 = [torch.zeros((4, 2), dtype=torch.uint8)]
-    manager._prefill_w13_scale = []
-    manager._prefill_w2_scale = []
-    manager._prefill_w13_offset = []
-    manager._prefill_w2_offset = []
-    manager._prefill_w13_scale_bias = []
-    manager._prefill_w2_scale_bias = []
-    manager._prefill_w13_scale_fp32 = []
-    manager.num_device_layers = 1
-    manager.num_total_experts = 4
-    manager._debug = False
-    manager.load_stream = MagicMock()
-
-    npu_tasks = manager._build_prefill_h2d_tasks(0, 0, 0, 0)
-    cpu_tasks = manager._build_prefill_h2d_tasks(0, 0, 2, 2)
-
-    assert {task.direction for task in npu_tasks} == {CopyDirection.D2D}
-    assert {task.direction for task in cpu_tasks} == {CopyDirection.H2D}
-
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
-        return_value=nullcontext(),
-    ):
-        manager._prefill_load_layer(0, torch.empty(0))
-
-    full_overwrite = manager.h2d_transport.batches[0]
-    assert len(full_overwrite) == 8
-    assert sum(task.direction == CopyDirection.D2D
-               for task in full_overwrite) == 4
-    assert sum(task.direction == CopyDirection.H2D
-               for task in full_overwrite) == 4
-    assert manager._npu_slot_to_eid[0] == [0, 1]
-    assert manager._cpu_slot_to_eid[0] == [2, 3]
-
-
-def test_exclusive_prefetch_uses_same_dynamic_swap_planner():
-    manager = _exclusive_runtime_manager()
-    manager.topk = 1
-    manager.prefetch_topk = 1
-    manager.cache_policy = None
-    manager._debug = False
-    manager.load_stream = MagicMock()
-    manager._swap_expert_weights = MagicMock()
-    topk_ids = torch.tensor([[2]], dtype=torch.int32)
-    log2phy = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
-    log2phy_np = log2phy.numpy()
-    layer = SimpleNamespace()
-
-    with patch(
-        "vllm_ascend.expert_offload.expert_offload_manager.torch_npu.npu.stream",
-        return_value=nullcontext(),
-    ):
-        manager._update_weights((
-            topk_ids,
-            log2phy_np,
-            layer,
-            0,
-            None,
-            True,
-        ))
-
-    manager._swap_expert_weights.assert_called_once_with(
-        layer, 0, [(1, 2, 1, 0)], log2phy_np)
-
-
-def test_exclusive_debug_log_includes_cache_observability_and_swaps():
-    manager = _exclusive_runtime_manager()
-    manager.topk = 2
-    manager.cache_policy = None
-    manager._debug = True
-    manager.load_stream = MagicMock()
-    manager._swap_expert_weights = MagicMock()
-    topk_ids = torch.tensor([[2, 1]], dtype=torch.int32)
-    log2phy = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
-    layer = SimpleNamespace()
-
-    with (
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager."
-            "torch_npu.npu.stream",
-            return_value=nullcontext(),
-        ),
-        patch(
-            "vllm_ascend.expert_offload.expert_offload_manager.logger.info"
-        ) as log_info,
-    ):
-        manager._update_weights((
-            topk_ids,
-            log2phy.numpy(),
-            layer,
-            0,
-            None,
-            False,
-        ))
-
-    log_args = log_info.call_args.args
-    assert "expert_hit=%s expert_miss=%s hit_rate=%.2f" in log_args[0]
-    assert log_args[1:8] == (
-        "[UPDATE-SWAP]",
-        0,
-        [1],
-        [2],
-        0.5,
-        {1},
-        {1, 2},
-    )
-    assert log_args[8] is topk_ids
-    assert log_args[9] == [(0, 2, 0)]

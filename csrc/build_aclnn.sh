@@ -84,7 +84,7 @@ if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
     CUSTOM_OPS_ARRAY=(
         "causal_conv1d_v310"
         "recurrent_gated_delta_rule_v310"
-        "chunk_fwd_o"
+        "chunk_fwd_o_vllm"
         "chunk_gated_delta_rule_fwd_h"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -96,8 +96,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
     setup_catlass_dependency
 
     CUSTOM_OPS_ARRAY=(
-        "scatter_nd_update_v2"
-        "moe_grouped_matmul"
+        "scatter_nd_update_sk"
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
         "lightning_indexer"
         "sparse_flash_attention"
@@ -105,18 +104,19 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "moe_gating_top_k"
         "moe_gating_top_k_hash"
         "add_rms_norm_bias"
+        "rms_norm_cast"
         "transpose_kv_cache_by_block"
         "copy_and_expand_eagle_inputs"
         "causal_conv1d"
         "lightning_indexer_quant"
         "compressor"
         "compressor_metadata"
-        "vllm_quant_lightning_indexer"
-        "vllm_quant_lightning_indexer_metadata"
+        "quant_lightning_indexer_v2"
+        "quant_lightning_indexer_v2_metadata"
+        "sparse_flash_mla"
+        "sparse_flash_mla_metadata"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"
-        "hc_pre_sinkhorn"
-        "hc_pre_inv_rms"
         "hc_pre"
         "hc_post"
         "inplace_partial_rotary_mul"
@@ -127,7 +127,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "grouped_matmul_swiglu_quant_v2"
         "recurrent_gated_delta_rule"
         "recurrent_kda"
-        "chunk_fwd_o"
+        "chunk_fwd_o_vllm"
         "chunk_gated_delta_rule_fwd_h"
         "chunk_kda_fwd"
         "kda_gate_cumsum"
@@ -135,6 +135,11 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "store_kv_block"
         "store_kv_block_metadata"
         "sparse_attention_score"
+        "k2q_csr"
+        "msa_index_score"
+        "fused_sparse_attention_overlap"
+        "fused_lightning_indexer_manage"
+        "fused_scatter_copy_sparse_flash_attention"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -146,7 +151,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
     setup_catlass_dependency
 
     CUSTOM_OPS_ARRAY=(
-        "scatter_nd_update_v2"
+        "scatter_nd_update_sk"
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
         "lightning_indexer"
         "sparse_flash_attention"
@@ -157,19 +162,19 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "moe_gating_top_k"
         "moe_gating_top_k_hash"
         "add_rms_norm_bias"
+        "rms_norm_cast"
         "transpose_kv_cache_by_block"
         "copy_and_expand_eagle_inputs"
         "causal_conv1d"
-        "moe_grouped_matmul"
         "lightning_indexer_quant"
         "compressor"
         "compressor_metadata"
-        "vllm_quant_lightning_indexer"
-        "vllm_quant_lightning_indexer_metadata"
+        "quant_lightning_indexer_v2"
+        "quant_lightning_indexer_v2_metadata"
+        "sparse_flash_mla"
+        "sparse_flash_mla_metadata"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"
-        "hc_pre_sinkhorn"
-        "hc_pre_inv_rms"
         "hc_pre"
         "hc_post"
         "inplace_partial_rotary_mul"
@@ -180,7 +185,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "grouped_matmul_swiglu_quant_v2"
         "recurrent_gated_delta_rule"
         "recurrent_kda"
-        "chunk_fwd_o"
+        "chunk_fwd_o_vllm"
         "chunk_gated_delta_rule_fwd_h"
         "chunk_kda_fwd"
         "kda_gate_cumsum"
@@ -188,6 +193,11 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "store_kv_block"
         "store_kv_block_metadata"
         "sparse_attention_score"
+        "k2q_csr"
+        "msa_index_score"
+        "fused_sparse_attention_overlap"
+        "fused_lightning_indexer_manage"
+        "fused_scatter_copy_sparse_flash_attention"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend910_93"
@@ -198,36 +208,36 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
     setup_catlass_dependency
 
     CUSTOM_OPS_ARRAY=(
+        "scatter_nd_update_sk"
+        "add_rms_norm_bias"
         "moe_gating_top_k_hash"
-        "indexer_compress_epilog"
         "inplace_partial_rotary_mul"
         "kv_compress_epilog"
         "compressor"
         "compressor_metadata"
-        "vllm_quant_lightning_indexer"
-        "vllm_quant_lightning_indexer_metadata"
+        "quant_lightning_indexer_v2"
+        "quant_lightning_indexer_v2_metadata"
         "kv_quant_sparse_attn_sharedkv"
         "kv_quant_sparse_attn_sharedkv_metadata"
-        "hc_pre_sinkhorn"
-        "hc_pre_inv_rms"
         "hc_post"
         "hc_pre"
         "swiglu_group_quant"
         "situ_mx_quant"
-        "load_index_kv_cache"
         "indexer_compress_epilog_v2"
         "causal_conv1d"
         "recurrent_gated_delta_rule"
         "recurrent_kda"
-        "chunk_fwd_o"
+        "chunk_fwd_o_vllm"
         "chunk_gated_delta_rule_fwd_h"
         "chunk_kda_fwd"
         "kda_gate_cumsum"
         "kda_layout_swap12"
         "store_kv_block"
         "store_kv_block_metadata"
+        "k2q_csr"
         "sparse_attention_score"
-        "mla_prolog_v3"
+        "mla_prolog_v3_k3"
+        "msa_index_score"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -260,13 +270,8 @@ log_selected_ops
   log "subshell cwd before cd=$(pwd)"
   cd "${ROOT_DIR}/csrc"
   log "subshell cwd after cd=$(pwd)"
-  # The CANN op generator does not model every op definition and kernel source
-  # as a dependency of the generated ACLNN/proto/kernel artifacts. Reusing the
-  # build tree can therefore package stale signatures or binaries after a
-  # source update. Editable builds must regenerate the custom-op package from
-  # one consistent source snapshot.
-  log "cleaning custom-op build dirs to regenerate ACLNN/proto/kernel artifacts"
-  rm -rf -- build output build_out
+  log "preserving csrc/build and cleaning output dirs"
+  rm -rf -- output build_out
 
   : "${CUSTOM_OPS:?CUSTOM_OPS is not set}"
   : "${SOC_VERSION:?SOC_VERSION is not set}"

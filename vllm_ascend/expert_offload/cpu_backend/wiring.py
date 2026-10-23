@@ -41,7 +41,8 @@ def model_layer_index(layer_name: str) -> int:
         raise ValueError(
             "cpu_moe.layers is expressed in MODEL layer indices, which are "
             "parsed from the layer name, but none could be parsed from "
-            f"{layer_name!r}") from exc
+            f"{layer_name!r}"
+        ) from exc
 
 
 def maybe_attach_cpu_expert_backend(
@@ -52,6 +53,7 @@ def maybe_attach_cpu_expert_backend(
     cpu_moe_config: Any,
     enable_multi_card: bool,
     tp_size: int,
+    native_weights=None,
 ) -> CPUExpertBackend | None:
     """Attach a kt-kernel backend when CPU/NPU hybrid owns this layer.
 
@@ -73,14 +75,15 @@ def maybe_attach_cpu_expert_backend(
     if not cpu_moe_config.includes(model_layer_idx):
         return None
 
-    # Hybrid v1 is single-card decode.  Refuse the rest loudly rather than
+    # Hybrid supports single-card decode and DSpark verification.  Refuse the rest loudly rather than
     # attaching a backend whose routes would never reach it.
     if enable_multi_card or tp_size != 1 or moe_config.ep_size > 1:
         raise ValueError(
             "expert_offload_config.cpu_moe supports single-card decode only, "
             f"but layer {model_layer_idx} runs with enable_multi_card="
             f"{enable_multi_card}, tp_size={tp_size}, "
-            f"ep_size={moe_config.ep_size}")
+            f"ep_size={moe_config.ep_size}"
+        )
 
     config = KtKernelBackendConfig(
         # The MODEL layer index, matching both cpu_moe.layers and the GGUF
@@ -94,12 +97,18 @@ def maybe_attach_cpu_expert_backend(
         hidden_size=moe_config.hidden_dim,
         intermediate_size=moe_config.intermediate_size_per_partition,
         weight_path=cpu_moe_config.weight_path,
+        weight_format=cpu_moe_config.weight_format,
         cpuinfer_threads=cpu_moe_config.cpuinfer_threads,
         threadpool_count=cpu_moe_config.threadpool_count,
         max_num_tokens=cpu_moe_config.max_num_tokens,
         numa_nodes=cpu_moe_config.numa_nodes,
     )
-    backend = KtKernelCPUExpertBackend(config)
+    if config.weight_format == "native_mxfp4":
+        if native_weights is None:
+            raise RuntimeError("Native CPU backend must borrow the offload manager's loaded weight owner")
+        backend = KtKernelCPUExpertBackend(config, native_weights=native_weights)
+    else:
+        backend = KtKernelCPUExpertBackend(config)
     # Both sides take the model layer index: submit() cross-checks the index it
     # is handed against config.layer_idx and raises on a mismatch.
     attach_hybrid_expert_executor(routed_experts, backend, model_layer_idx)

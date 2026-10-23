@@ -83,7 +83,7 @@ public:
         } else {
             isVariedLen = 1;
             shapeBatch = 1;
-            tokenBatch = ctx_.cuSeqlensDim0 - 1;
+            tokenBatch = ctx_.cuSeqlensDim0 - 1;  // gitleaks:allow
             batch = tokenBatch;
         }
 

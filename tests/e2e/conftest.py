@@ -510,7 +510,9 @@ def _get_pd_server_required_devices(vllm_serve_args: list[str]) -> int:
         "--data-parallel-size-local" if "--data-parallel-size-local" in vllm_serve_args else "--data-parallel-size"
     )
     data_parallel_size = get_size(data_parallel_arg)
-    return tensor_parallel_size * data_parallel_size
+    pipeline_parallel_size = get_size("--pipeline-parallel-size")
+    prefill_context_parallel_size = get_size("--prefill-context-parallel-size")
+    return tensor_parallel_size * pipeline_parallel_size * prefill_context_parallel_size * data_parallel_size
 
 
 class RemotePDServer(RemoteOpenAIServer):
@@ -547,6 +549,11 @@ class RemotePDServer(RemoteOpenAIServer):
             raise RuntimeError("vllm_serves_args must be a list")
         serve_arg_cmd = ["vllm", "serve"]
         start_device_id = 0
+        visible_devices = self.env_dict.get(
+            "ASCEND_RT_VISIBLE_DEVICES",
+            os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+        )
+        available_device_ids = visible_devices.split(",") if visible_devices else None
 
         for i, vllm_serve_arg in enumerate(self.vllm_serve_args_list):
             if "--port" not in vllm_serve_arg:
@@ -556,9 +563,17 @@ class RemotePDServer(RemoteOpenAIServer):
 
             required_devices = _get_pd_server_required_devices(vllm_serve_arg)
             server_env = copy.deepcopy(self.env_dict)
-            server_env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(
-                str(device_id) for device_id in range(start_device_id, start_device_id + required_devices)
-            )
+            end_device_id = start_device_id + required_devices
+            if available_device_ids is None:
+                assigned_device_ids = [str(device_id) for device_id in range(start_device_id, end_device_id)]
+            else:
+                assigned_device_ids = available_device_ids[start_device_id:end_device_id]
+                if len(assigned_device_ids) != required_devices:
+                    raise ValueError(
+                        f"PD servers require at least {end_device_id} visible devices, "
+                        f"but ASCEND_RT_VISIBLE_DEVICES={visible_devices!r}."
+                    )
+            server_env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(assigned_device_ids)
             start_device_id += required_devices
 
             vllm_serve_arg = [*serve_arg_cmd, *vllm_serve_arg]
@@ -1177,9 +1192,12 @@ class VllmRunner:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        del self.model
-        clear_ascend_config()
-        cleanup_dist_env_and_memory()
+        try:
+            self.model.llm_engine.engine_core.shutdown()
+        finally:
+            del self.model
+            clear_ascend_config()
+            cleanup_dist_env_and_memory()
 
 
 class ModelCache:
@@ -1921,6 +1939,41 @@ def olmoe_lora_files():
     return snapshot_download(repo_id="vllm-ascend/olmoe-instruct-text2sql-spider")
 
 
+@pytest.fixture(scope="session")
+def qwen2vl_lora_files():
+    return snapshot_download(repo_id="vllm-ascend/qwen2-vl-lora-pokemon")
+
+
+@pytest.fixture(scope="session")
+def qwen25vl_lora_files():
+    return snapshot_download(repo_id="vllm-ascend/qwen25-vl-lora-pokemon")
+
+
+@pytest.fixture(scope="session")
+def qwen25vl_vision_lora_files():
+    return snapshot_download(repo_id="vllm-ascend/qwen2.5-3b-vl-lora-vision-connector")
+
+
+@pytest.fixture(scope="session")
+def qwen3vl_vision_lora_files():
+    return snapshot_download(repo_id="vllm-ascend/qwen3-4b-vl-lora-vision-connector")
+
+
+@pytest.fixture(scope="session")
+def qwen2vl_language_lora_files():
+    return snapshot_download(repo_id="vllm-ascend/qwen2vl-flickr-lora-language")
+
+
+@pytest.fixture(scope="session")
+def qwen2vl_vision_tower_connector_lora_files():
+    return snapshot_download(repo_id="vllm-ascend/qwen2vl-flickr-lora-tower-connector")
+
+
+@pytest.fixture(scope="session")
+def qwen2vl_vision_tower_lora_files():
+    return snapshot_download(repo_id="vllm-ascend/qwen2vl-flickr-lora-tower")
+
+
 def qwen_prompt(questions: list[str]) -> list[str]:
     placeholder = "<|image_pad|>"
     return [
@@ -1934,9 +1987,9 @@ def qwen_prompt(questions: list[str]) -> list[str]:
 
 
 def hunyuan_prompt(questions: list[str]) -> list[str]:
-    # vLLM's Hunyuan prompt update adds the image start/end tokens around
-    # this placeholder. Supplying the wrapper here would duplicate it.
-    placeholder = "<｜hy_place▁holder▁no▁102｜>"  # noqa: E501
+    image_token = "<｜hy_place▁holder▁no▁102｜>"
+    # vLLM PR #49691 matches the complete image placeholder.
+    placeholder = f"<｜hy_place▁holder▁no▁100｜>{image_token}<｜hy_place▁holder▁no▁101｜>"
     return [f"<｜hy_begin▁of▁sentence｜>{placeholder}{question}<｜hy_User｜>" for question in questions]
 
 
@@ -1951,9 +2004,11 @@ PROMPT_CONFIGS = {
         },
     },
     "hunyuan-vl": {
-        "model": "Tencent-Hunyuan/HunyuanOCR",
+        "model": "vllm-ascend/HunyuanOCR",
         "prompt_fn": hunyuan_prompt,
         "mm_processor_kwargs": {},
+        "skip": "HunyuanVL is not supported by the pinned vLLM versions "
+        "(upstream vllm-project/vllm#53272 removed native Hunyuan V1/VL).",
     },
 }
 

@@ -7,7 +7,6 @@ _envs: &envs
   OMP_PROC_BIND: "false"
   HCCL_BUFFSIZE: "1024"
   PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
-  VLLM_ASCEND_ENABLE_FLASHCOMM1: "1"
   SERVER_PORT: "DEFAULT_PORT"
 
 _server_cmd: &server_cmd
@@ -74,6 +73,7 @@ test_cases:
     envs:
       <<: *envs
       DYNAMIC_EPLB: "true"
+      VLLM_USE_V2_MODEL_RUNNER: "0"
     server_cmd: *server_cmd
     server_cmd_extra:
       - "--additional-config"
