@@ -70,6 +70,7 @@ class HybridExpertPlan:
     cpu_topk_ids: torch.Tensor
     cpu_topk_weights: torch.Tensor
     cpu_task: CPUExpertTask
+    stats: dict | None = None
 
 
 class HybridExpertExecutor:
@@ -92,6 +93,7 @@ class HybridExpertExecutor:
         topk_weights: torch.Tensor,
         log2phy: torch.Tensor,
         weight_transfer=None,
+        transfer_manager=None,
     ) -> HybridExpertPlan:
         """Submit CPU misses and produce a safe zero-weight NPU route.
 
@@ -125,7 +127,7 @@ class HybridExpertExecutor:
             from vllm_ascend.expert_offload.cpu_backend.kt_kernel_backend import _graph_capture_active
 
             if getattr(weight_transfer, "device_owned", False):
-                transfer_task = weight_transfer.prepare(topk_ids, log2phy)
+                transfer_task = weight_transfer.prepare(topk_ids, log2phy, topk_weights)
             elif _graph_capture_active():
                 # CPU selects placement and submits the reduced CPU routes.
                 # This returns after recording one map+weights dependency;
@@ -145,6 +147,7 @@ class HybridExpertExecutor:
         physical_ids = log2phy[safe_ids]
         npu_route_mask = valid_routes & (physical_ids >= 0)
         cpu_route_mask = valid_routes & (physical_ids < 0)
+        raw_hit_mask = valid_routes & (physical_ids >= 0)
         zero = torch.zeros((), dtype=topk_weights.dtype, device=topk_weights.device)
         npu_topk_weights = torch.where(npu_route_mask, topk_weights, zero)
         cpu_topk_weights = torch.where(cpu_route_mask, topk_weights, zero)
@@ -154,11 +157,16 @@ class HybridExpertExecutor:
             torch.full((), -1, dtype=topk_ids.dtype, device=topk_ids.device),
         )
 
+        # Carry the admission count in already-skipped CPU route sentinels.
+        # A newly admitted expert has at least one NPU-owned route, so T1
+        # always has a negative CPU route available. No additional D2H.
+        import os
+        if (os.environ.get("KT_MOE_CPU_TRACE") and weight_transfer is not None
+                and getattr(weight_transfer, "device_owned", False)):
+            sentinel = -1 - weight_transfer.trace_transfer_count
+            cpu_topk_ids = torch.where(cpu_topk_ids < 0, sentinel.to(cpu_topk_ids.dtype), cpu_topk_ids)
+
         submission_options = {}
-        # Only host-driven weight transfers need the callback dispatcher free
-        # until their weight callback has run. Device-owned copies have no host
-        # weight callback: drain CPU work and return its output concurrently with
-        # NPU work instead of scheduling a second callback after npu_done.
         if (transfer_task is not None and transfer_task.graph
                 and not getattr(weight_transfer, "device_owned", False)):
             submission_options["defer_graph_join"] = True
@@ -172,12 +180,24 @@ class HybridExpertExecutor:
             )
         if transfer_task is not None:
             transfer_task.wait_for_weights(cpu_task)
+        collector = getattr(transfer_manager, "_stats", None)
+        stats = None
+        if collector is not None and getattr(collector, "collecting", False):
+            routed_experts = torch.unique(topk_ids[valid_routes])
+            stats = {
+                "cpu_experts": float(torch.unique(topk_ids[cpu_route_mask]).numel()),
+                "npu_experts": float(torch.unique(topk_ids[npu_route_mask]).numel()),
+                "cpu_routes": float(cpu_route_mask.sum()),
+                "npu_routes": float(npu_route_mask.sum()),
+                "raw_hit": float(torch.unique(topk_ids[raw_hit_mask]).numel()) / max(float(routed_experts.numel()), 1.0),
+            }
         return HybridExpertPlan(
             npu_topk_ids=topk_ids,
             npu_topk_weights=npu_topk_weights,
             cpu_topk_ids=cpu_topk_ids,
             cpu_topk_weights=cpu_topk_weights,
             cpu_task=cpu_task,
+            stats=stats,
         )
 
     @staticmethod
@@ -195,6 +215,9 @@ class HybridExpertExecutor:
                 f"cpu={tuple(cpu_routed_out.shape)}, "
                 f"npu={tuple(npu_routed_out.shape)}"
             )
+        if getattr(cpu_task, "host_mapped_result", False):
+            from .cpu_backend.mapped_combine import mapped_combine
+            return mapped_combine(npu_routed_out, cpu_routed_out)
         cpu_routed_out = cpu_routed_out.to(
             device=npu_routed_out.device,
             dtype=npu_routed_out.dtype,
@@ -203,7 +226,42 @@ class HybridExpertExecutor:
         return npu_routed_out + cpu_routed_out
 
 
-def maybe_prepare_hybrid_routes(
+class PreparedHybridRoutes:
+    """Phase-A result of hybrid route preparation.
+
+    Phase A (``begin_hybrid_routes``) finishes the pending prefetch join and
+    preprocesses routes (substitution / pruning / transfer handle), but does
+    NOT submit the current layer's CPU MoE task yet. The caller can therefore
+    fire the next-layer prefetch signal (prediction + selector + notify)
+    between the two phases, so the prefetch chain starts before the current
+    layer's CPU D2H copies and ready-flag publish.
+
+    Phase B (``finish``) performs the CPU input copies and the backend submit
+    exactly as the previous single-shot path did.
+    """
+
+    def __init__(self, executor, *, hidden_states, topk_ids, topk_weights,
+                 log2phy, weight_transfer, transfer_manager):
+        self._executor = executor
+        self._hidden_states = hidden_states
+        self._topk_ids = topk_ids
+        self._topk_weights = topk_weights
+        self._log2phy = log2phy
+        self._weight_transfer = weight_transfer
+        self._transfer_manager = transfer_manager
+
+    def finish(self) -> HybridExpertPlan:
+        return self._executor.prepare(
+            hidden_states=self._hidden_states,
+            topk_ids=self._topk_ids,
+            topk_weights=self._topk_weights,
+            log2phy=self._log2phy,
+            weight_transfer=self._weight_transfer,
+            transfer_manager=self._transfer_manager,
+        )
+
+
+def begin_hybrid_routes(
     layer: torch.nn.Module,
     *,
     hidden_states: torch.Tensor,
@@ -211,14 +269,20 @@ def maybe_prepare_hybrid_routes(
     topk_weights: torch.Tensor,
     log2phy: torch.Tensor,
     transfer_manager=None,
-) -> HybridExpertPlan | None:
-    """Split this layer's routes onto CPU and NPU, if a backend owns it.
+    router_logits=None,
+    scoring_func="softmax",
+    e_score_correction_bias=None,
+    is_hash_routed=False,
+) -> PreparedHybridRoutes | None:
+    """Phase A: prefetch join + route preprocessing, CPU submit deferred.
+
+    Returns None exactly where the previous single-shot path returned None
+    (no executor, profile run, over token capacity). Otherwise returns a
+    ``PreparedHybridRoutes`` whose ``finish()`` submits the CPU MoE task.
 
     Attached executors handle normal forwards within their token capacity.
     Startup memory profiling alone retains the existing NPU path.
     Larger batches retain the existing NPU paging/layerwise path.
-    A returned plan replaces paging, which must not rewrite the residency map
-    after CPU/NPU ownership has been determined.
     """
     executor = get_hybrid_expert_executor(layer)
     if executor is None:
@@ -232,6 +296,34 @@ def maybe_prepare_hybrid_routes(
         raise ValueError(f"CPU expert backend max_num_tokens must be positive; got {backend_max_tokens}")
     if hidden_states.shape[0] > backend_max_tokens or topk_ids.shape[0] > backend_max_tokens:
         return None
+    # The hybrid path replaces update_weights, so it must perform the same
+    # prefetch join before reading or modifying the device residency map.
+    if transfer_manager is not None:
+        import torch_npu
+        transfer_manager._finish_pending_predict(executor.layer_idx)
+        with transfer_manager._prefetch_state_lock:
+            pending_event = transfer_manager._prefetch_layer_npu_event.pop(executor.layer_idx, None)
+        if pending_event is not None:
+            torch_npu.npu.current_stream().wait_event(pending_event)
+
+    # Reuse the paging route substitution before deciding CPU/NPU ownership.
+    # Hash-routed layers are intentionally excluded, just as in update_weights.
+    if (transfer_manager is not None
+            and transfer_manager.offload_config.expert_substitution_enabled
+            and not is_hash_routed and router_logits is not None
+            and router_logits.shape[-1] == transfer_manager.num_total_experts):
+        from vllm.logger import logger
+        logger.info_once("[HYBRID-STACK] NPU substitution enabled threshold=%s",
+                         transfer_manager.offload_config.expert_substitution_threshold)
+        from vllm_ascend.ops.fused_moe.experts_selector import substitute_experts_device
+        substituted_ids = substitute_experts_device(
+            router_logits, topk_ids, log2phy,
+            expert_substitution_threshold=transfer_manager.offload_config.expert_substitution_threshold,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+        )
+        topk_ids.copy_(substituted_ids)
+
     # Threshold pruning belongs to routing, not to the paging operation that
     # hybrid execution replaces. Use the final pruned routes for both devices.
     if transfer_manager is not None and getattr(transfer_manager.offload_config, "experts_pruning_enabled", False):
@@ -250,18 +342,50 @@ def maybe_prepare_hybrid_routes(
 
             if getattr(transfer_manager.offload_config.cpu_moe, "transfer_scheduler", "cpu") == "npu":
                 from vllm_ascend.expert_offload.device_transfer import DeviceExpertTransfer
-
                 executor._weight_transfer = DeviceExpertTransfer(transfer_manager, layer)
             else:
                 executor._weight_transfer = HybridExpertTransfer(transfer_manager, layer)
         weight_transfer = executor._weight_transfer
-    return executor.prepare(
+    return PreparedHybridRoutes(
+        executor,
         hidden_states=hidden_states,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
         log2phy=log2phy,
         weight_transfer=weight_transfer,
+        transfer_manager=transfer_manager,
     )
+
+
+def maybe_prepare_hybrid_routes(
+    layer: torch.nn.Module,
+    *,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    log2phy: torch.Tensor,
+    transfer_manager=None,
+    router_logits=None,
+    scoring_func="softmax",
+    e_score_correction_bias=None,
+    is_hash_routed=False,
+) -> HybridExpertPlan | None:
+    """Backward-compatible single-shot path: begin + immediate finish."""
+    prepared = begin_hybrid_routes(
+        layer,
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        log2phy=log2phy,
+        transfer_manager=transfer_manager,
+        router_logits=router_logits,
+        scoring_func=scoring_func,
+        e_score_correction_bias=e_score_correction_bias,
+        is_hash_routed=is_hash_routed,
+    )
+    if prepared is None:
+        return None
+    return prepared.finish()
 
 
 def attach_hybrid_expert_executor(
@@ -295,7 +419,9 @@ __all__ = [
     "CPUExpertTask",
     "HybridExpertExecutor",
     "HybridExpertPlan",
+    "PreparedHybridRoutes",
     "attach_hybrid_expert_executor",
+    "begin_hybrid_routes",
     "get_hybrid_expert_executor",
     "maybe_prepare_hybrid_routes",
 ]

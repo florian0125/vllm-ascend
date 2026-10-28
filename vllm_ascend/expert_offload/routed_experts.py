@@ -124,17 +124,42 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
         counter_sample = counters.begin(counter_layer, topk_ids, topk_weights,
                                         layer.log2phy, is_hash=layer.tid2eid is not None)
     hybrid_plan = None
+    prefetch_staged = False
     if not layer.enable_multi_card:
-        from vllm_ascend.expert_offload.hybrid_executor import maybe_prepare_hybrid_routes
+        from vllm_ascend.expert_offload.hybrid_executor import begin_hybrid_routes
 
-        hybrid_plan = maybe_prepare_hybrid_routes(
+        # Phase A only: finishes the pending prefetch join and preprocesses
+        # routes. The current layer's CPU D2H copies and ready-flag publish
+        # are deferred to prepared.finish() so the next-layer prefetch signal
+        # can be fired first.
+        prepared = begin_hybrid_routes(
             layer,
             hidden_states=hidden_states,
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             log2phy=layer.log2phy,
             transfer_manager=mgr,
+            router_logits=router_logits,
+            scoring_func=routing["scoring_func"],
+            e_score_correction_bias=routing["e_score_correction_bias"],
+            is_hash_routed=routing["is_hash_routed"],
         )
+        # The actual current-layer top-k is the authoritative observation for
+        # the target layer's NPU-owned LRC table. This does not alter routing;
+        # it only updates the device-side eviction state before next-layer
+        # prediction is launched.
+        if getattr(getattr(mgr.offload_config, "cpu_moe", None), "enabled", False):
+            mgr.observe_device_prefetch_route(
+                mgr.moe_layers.index(layer), topk_ids, topk_weights
+            )
+        if prepared is not None:
+            # Stage next-layer prediction + selector + prefetch notify BEFORE
+            # the current layer's CPU input copies and submit. hidden_states
+            # is already available here; the prefetch chain no longer waits
+            # behind the current layer's CPU-ready publish (~200us measured).
+            mgr.trigger_next_layer_prefetch(layer, hidden_states)
+            prefetch_staged = True
+            hybrid_plan = prepared.finish()
     if hybrid_plan is not None:
         topk_ids = hybrid_plan.npu_topk_ids
         topk_weights = hybrid_plan.npu_topk_weights
@@ -204,7 +229,12 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
             )
         if hidden_states.dtype != torch.float8_e4m3fn:
             topk_weights = topk_weights.to(hidden_states.dtype)
-        if hybrid_plan is None and not use_prefill and num_tokens <= mgr.offload_threshold:
+        # Fallback trigger site for paths without a hybrid plan (multi-card /
+        # paging / prefill regimes): stage next-layer prediction before the
+        # current-layer GMM is submitted. The hybrid path already staged the
+        # prefetch before its CPU submit above (prefetch_staged).
+        if (not prefetch_staged and not use_prefill
+                and (hybrid_plan is not None or num_tokens <= mgr.offload_threshold)):
             mgr.trigger_next_layer_prefetch(layer, hidden_states)
         _split_ctx = None
         if use_prefill and mgr.offload_config.prefill_split_gmm is True:
@@ -233,4 +263,7 @@ def apply_offloaded_experts(layer, hidden_states, topk_weights, topk_ids, router
             setattr(dispatcher, name, value)
     if hybrid_plan is not None:
         result.cpu_expert_task = hybrid_plan.cpu_task
+        stats = getattr(mgr, "_stats", None)
+        if stats is not None and hybrid_plan.stats is not None:
+            stats.record_layer(layer_idx=mgr.moe_layers.index(layer), gsize=hybrid_plan.stats["cpu_experts"] + hybrid_plan.stats["npu_experts"], **hybrid_plan.stats)
     return result

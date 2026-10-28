@@ -11,10 +11,6 @@ import torch
 from vllm_ascend.expert_offload.cpu_backend.kt_kernel_backend import _eager_trace
 from vllm_ascend.expert_offload.frequency_transfer_policy import FrequencyTransferPolicy
 
-from vllm_ascend.expert_offload.cpu_backend.transfer_diagnostics import (
-    TransferDiagnostics, inspect_route_buffers,
-)
-
 CPU_EXPERT_TRANSFER_MIN_MISSES = 1
 
 
@@ -81,9 +77,6 @@ class HybridExpertTransfer:
         self.transfer_policy = getattr(manager.offload_config.cpu_moe, "transfer_policy", "first_miss")
         self._frequency_policy = FrequencyTransferPolicy() if self.transfer_policy == "frequency" else None
         self._states = []  # Retain pinned addresses/events baked into graphs.
-        if not hasattr(manager, "_cpu_transfer_diagnostics"):
-            manager._cpu_transfer_diagnostics = TransferDiagnostics.configured()
-        self.diagnostics = manager._cpu_transfer_diagnostics
 
     def _scheduling_stream(self, device):
         # One stream per manager/device; capture buffers/events remain private.
@@ -100,21 +93,14 @@ class HybridExpertTransfer:
 
     def _enqueue(self, state):
         selector = self._frequency_policy.select if self._frequency_policy is not None else select_transfer_expert
-        record = getattr(state, "_diagnostic_record", None)
-        if record:
-            record.mark("selector_begin")
         state.selection = selector(
             state.ids_h, state.map_h,
             self.manager.num_device_experts_for_layer(self.layer_idx))
-        if record:
-            record.mark("selector_end", selection=state.selection)
         if state.selection is None:
             return
         eid, slot = state.selection
         state.map_h[state.map_h == slot] = -1
         state.map_h[eid] = slot
-        if record:
-            record.mark("map_update_end")
 
     def capture_cpu_and_weights(self, backend, hidden_states, log2phy,
                                 cpu_stream, weights_ready):
@@ -131,13 +117,6 @@ class HybridExpertTransfer:
         state = _TransferState(ids_h, map_h, None, weights_ready,
                                cpu_stream, True, self._load_and_sync)
         self._states.append(state)
-        if self.diagnostics:
-            state._diagnostic_capture = dict(
-                state_id=id(state), stream_handle=int(cpu_stream.npu_stream),
-                load_stream_handle=int(self.manager.load_stream.npu_stream),
-                staged_ids_ptr=ids_h.data_ptr(), staged_weights_ptr=weights_h.data_ptr(),
-                map_ptr=map_h.data_ptr(), buffers=inspect_route_buffers(backend, hidden_states))
-            state._diagnostic_replay = 0
         map_h.copy_(log2phy, non_blocking=True)
         torch.npu._launch_host_func(
             cpu_stream, self._prepare_and_launch_cpu,
@@ -145,60 +124,26 @@ class HybridExpertTransfer:
         log2phy.copy_(map_h, non_blocking=True)
         cpu_stream.record_event(weights_ready)
 
+    # InferenceMode is thread-local. ACL callbacks do not inherit the
+    # capture thread context, but mutate its inference routing buffers.
     @torch.inference_mode()
     def _prepare_and_launch_cpu(self, args):
         state, backend, hidden_states, weights_h = args
-        record = None
-        error = None
-        if self.diagnostics:
-            state._diagnostic_replay += 1
-            record = self.diagnostics.begin(
-                self.layer_idx, state._diagnostic_capture, state._diagnostic_replay)
-            state._diagnostic_record = record
-        try:
-            if record:
-                record.mark("route_snapshot_before_begin")
-                record.data["routes_before"] = dict(
-                    ids=state.ids_h.tolist(), weights=weights_h.tolist(),
-                    logical_to_physical=state.map_h.tolist(),
-                    current_buffers=inspect_route_buffers(backend, hidden_states))
-                record.mark("route_snapshot_before_end")
-                record.mark("enqueue_begin")
-            self._enqueue(state)
-            if record:
-                record.mark("enqueue_end", selection=state.selection)
-                record.mark("cpu_route_mask_begin")
-            ids = state.ids_h
-            valid = (ids >= 0) & (ids < state.map_h.numel()) & (weights_h != 0)
-            safe_ids = ids.clamp(min=0, max=state.map_h.numel() - 1).long()
-            cpu_owned = valid & (state.map_h[safe_ids] < 0)
-            ids.masked_fill_(~cpu_owned, -1)
-            weights_h.masked_fill_(~cpu_owned, 0)
-            if record:
-                record.mark("cpu_route_mask_end")
-                record.mark("route_snapshot_after_begin")
-                record.data["routes_after"] = dict(
-                    ids=ids.tolist(), weights=weights_h.tolist(),
-                    logical_to_physical=state.map_h.tolist())
-                record.mark("route_snapshot_after_end")
-                backend._launch_pinned_forward(
-                    (hidden_states, int(state.stream.npu_stream)), diagnostics=record)
-            else:
-                backend._launch_pinned_forward(
-                    (hidden_states, int(state.stream.npu_stream)))
-            self._load_and_sync(state)
-        except Exception as exc:
-            error = exc
-            raise
-        finally:
-            if record:
-                record.finish(error)
-                state._diagnostic_record = None
+        # Host-only operations: all input copies precede this callback.
+        self._enqueue(state)
+        ids = state.ids_h
+        valid = (ids >= 0) & (ids < state.map_h.numel()) & (weights_h != 0)
+        safe_ids = ids.clamp(min=0, max=state.map_h.numel() - 1).long()
+        cpu_owned = valid & (state.map_h[safe_ids] < 0)
+        ids.masked_fill_(~cpu_owned, -1)
+        weights_h.masked_fill_(~cpu_owned, 0)
+        backend._launch_pinned_forward(
+            (hidden_states, int(state.stream.npu_stream)))
+        # CPU work is now asynchronous; overlap it with weight H2D.
+        self._load_and_sync(state)
 
+    @torch.inference_mode()
     def _load_and_sync(self, state):
-        record = getattr(state, "_diagnostic_record", None)
-        if record:
-            record.mark("weight_phase_begin")
         tracing = bool(os.environ.get("VLLM_ASCEND_CPU_MOE_TRACE"))
         if tracing:
             callback_begin_ns = time.perf_counter_ns()
@@ -207,32 +152,12 @@ class HybridExpertTransfer:
             eid, slot = state.selection
             if tracing:
                 load_begin_ns = time.perf_counter_ns()
-            transport = self.manager._get_h2d_transport() if record else None
-            if record:
-                transport.diagnostic_record = record
-                if hasattr(transport, "base"):
-                    transport.base.diagnostic_record = record
-                record.mark("load_stream_context_begin")
-            try:
-                with torch.npu.stream(self.manager.load_stream):
-                    if record:
-                        record.mark("weight_task_build_dispatch_begin", expert=eid, slot=slot)
-                    self.manager._load_expert_weights_into_slot(
-                        self.layer, self.layer_idx, eid, slot)
-                    if record:
-                        record.mark("weight_task_build_dispatch_end")
-            finally:
-                if record:
-                    transport.diagnostic_record = None
-                    if hasattr(transport, "base"):
-                        transport.base.diagnostic_record = None
+            with torch.npu.stream(self.manager.load_stream):
+                self.manager._load_expert_weights_into_slot(
+                    self.layer, self.layer_idx, eid, slot)
             if tracing:
                 load_end_ns = time.perf_counter_ns()
-            if record:
-                record.mark("h2d_synchronize_begin")
             self.manager._synchronize_h2d()
-            if record:
-                record.mark("h2d_synchronize_end")
             if tracing:
                 sync_end_ns = time.perf_counter_ns()
                 # One record after all measured phases; no file writes are
@@ -252,9 +177,6 @@ class HybridExpertTransfer:
             _eager_trace("cpu_moe.transfer_skipped", layer=self.layer_idx,
                          callback_begin_ns=callback_begin_ns,
                          callback_begin_wall_ns=callback_begin_wall_ns)
-
-        if record:
-            record.mark("weight_phase_end", selection=state.selection)
 
     def prepare(self, topk_ids, log2phy):
         from vllm_ascend.expert_offload.cpu_backend.kt_kernel_backend import (

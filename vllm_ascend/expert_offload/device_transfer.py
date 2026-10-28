@@ -1,7 +1,7 @@
 """Device-owned hybrid admission and mapped-DRAM expert uploads.
 
 CPU receives only the final compute routes. Placement stays on device; one
-parallel copy kernel converts native bytes directly into the selected HBM slot.
+parallel copy kernel moves preconverted NZ bytes into the selected HBM slot.
 """
 
 import ctypes
@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 
 from vllm_ascend.expert_offload.frequency_transfer_policy import (
-    FREQUENCY_DECAY, FREQUENCY_MIN_SCORE, FREQUENCY_REPLACEMENT_MARGIN,
+    FREQUENCY_DECAY, FREQUENCY_MIN_SCORE,
     FREQUENCY_REPLACEMENT_RATIO,
 )
 
@@ -46,10 +46,10 @@ class DeviceExpertPolicy:
             candidate = torch.where(missing & (self.scores == best), first, flat.numel()).argmin()
             slot_scores = torch.where(owners, self.scores[:, None], 0).amax(dim=0)
             slot = torch.where(available, slot_scores, float("inf")).argmin()
-            demand, victim = self.scores[candidate], slot_scores[slot]
+            demand = self.scores.gather(0, candidate.reshape(1)).squeeze(0)
+            victim = slot_scores.gather(0, slot.reshape(1)).squeeze(0)
             admit = ((demand >= FREQUENCY_MIN_SCORE)
-                     & (demand > victim * FREQUENCY_REPLACEMENT_RATIO)
-                     & ((demand - victim) > FREQUENCY_REPLACEMENT_MARGIN))
+                     & (demand > victim * FREQUENCY_REPLACEMENT_RATIO))
         else:
             candidate = torch.where(missing, first, flat.numel()).argmin()
             slot = torch.where(available, self.slots, self.slots.numel()).argmin()
@@ -99,7 +99,7 @@ class DeviceSparseCopy:
         ranges = []
         for index, tensor in enumerate(tensors):
             pointer = tensor.data_ptr()
-            end = pointer + tensor.numel() * tensor.element_size()
+            end = pointer + (tensor.nbytes() if isinstance(tensor, torch.UntypedStorage) else tensor.numel() * tensor.element_size())
             ranges.append((pointer // page_size * page_size,
                            (end + page_size - 1) // page_size * page_size, index))
         groups = []
@@ -125,6 +125,33 @@ class DeviceSparseCopy:
             raise
         return mapped
 
+    def map_storages(self, tensors):
+        """Register exact allocator bounds; never extend a pinned allocation.
+
+        Small torch pinned blocks may occupy part of a page. Registering the
+        rounded page crosses the allocator range and CANN rejects it.
+        Tensor views share their owner's storage registration and add offsets.
+        """
+        registered = {}
+        mapped = []
+        try:
+            for tensor in tensors:
+                storage = tensor.untyped_storage() if isinstance(tensor, torch.Tensor) else tensor
+                key = (storage.data_ptr(), storage.nbytes())
+                if key not in registered:
+                    pointer = ctypes.c_void_p()
+                    ret = self.acl.aclrtHostRegister(key[0], key[1], 0, ctypes.byref(pointer))
+                    if ret:
+                        raise RuntimeError(f"NPU expert host storage registration failed: ACL {ret}")
+                    registered[key] = pointer.value
+                    self.registered.append(key[0])
+                    self.owners.append(storage)
+                mapped.append(registered[key] + tensor.data_ptr() - key[0])
+        except Exception:
+            self.close()
+            raise
+        return mapped
+
     def copy(self, sources, destinations, lengths, count):
         self.launch(sources.data_ptr(), destinations.data_ptr(), lengths.data_ptr(),
                     count.data_ptr(), sources.device.index)
@@ -139,117 +166,160 @@ class DeviceSparseCopy:
 
 
 class DeviceExpertTransfer:
-    """One parallel kernel: mapped DRAM -> final NZ weights and scale slots."""
+    """Device-owned admission and byte-preserving copies of preconverted NZ.
 
+    CPU GGUF stays independent. The device receives a table of mapped expert
+    addresses once, then selects and copies without a host weight callback.
+    """
     device_owned = True
 
-    def __init__(self, manager, layer):
+    def __init__(self, manager, layer, *, initialize_policy=True):
         from vllm_ascend.expert_offload.expert_offload_manager import _expert_weight
-
-        if not manager.native_mxfp4_enabled or manager.ep_size != 1:
-            raise ValueError("NPU transfer scheduler requires native MXFP4 and EP size one")
-        if getattr(manager, "exclusive_dynamic_enabled", False):
-            raise ValueError("NPU transfer scheduler requires replicated CPU experts")
+        if manager.native_mxfp4_enabled or manager.ep_size != 1:
+            raise ValueError("Preconverted NZ transfer requires GGUF and EP size one")
         self.manager, self.layer = manager, layer
         self.layer_idx = manager.moe_layers.index(layer)
-        owner = manager._native_owners[self.layer_idx]
+        if any(len(buffers[self.layer_idx]) != manager.num_total_experts
+               for buffers in (manager.w13_weights_cpu, manager.w2_weights_cpu)):
+            raise ValueError("Preconverted NZ transfer requires all host experts")
         self.device = layer.w13_weight_scale.device
         slots = manager.num_device_experts_for_layer(self.layer_idx)
-        if slots < 1:
-            raise ValueError("NPU transfer scheduler requires at least one device slot")
         config = manager.offload_config.cpu_moe
-        self.policy = DeviceExpertPolicy(owner.gate.shape[0], slots, self.device, config.transfer_policy)
+        self.load_balanced = config.transfer_policy == "load_balance"
+        self.policy = None
+        if initialize_policy:
+            if self.load_balanced:
+                from vllm_ascend.expert_offload.load_balance_transfer_policy import LoadBalanceTransferPolicy
+                self.policy = LoadBalanceTransferPolicy(manager.num_total_experts, slots, self.device, config)
+                if manager.offload_config.cache_policy_enabled:
+                    seed_state = manager.cache_policy.layer_states[self.layer_idx]
+                    if getattr(manager.offload_config, "cache_policy_type", "lrc") == "lru":
+                        from vllm_ascend.expert_offload.device_lru_policy import DeviceLRUHotness
+                        self.policy.lrc = DeviceLRUHotness(manager.num_total_experts, self.device,
+                                                           manager.offload_config, seed_state)
+                        from vllm.logger import logger
+                        logger.info_once("[HYBRID-STACK] NPU transfer eviction=LRU; admission=load_balance")
+                    else:
+                        from vllm_ascend.expert_offload.device_lrc_policy import DeviceLRCHotness
+                        self.policy.lrc = DeviceLRCHotness(manager.num_total_experts, self.device,
+                                                          manager.offload_config, seed_state)
+                        from vllm.logger import logger
+                        logger.info_once("[HYBRID-STACK] NPU transfer eviction=LRC; admission=load_balance")
+                    if not hasattr(manager, "_hybrid_lrc_hotness_h"):
+                        manager._hybrid_lrc_hotness_h = {}
+                    manager._hybrid_lrc_hotness_h[self.layer_idx] = torch.empty(
+                        (2, manager.num_total_experts), dtype=torch.float32, pin_memory=True)
+
+            else:
+                self.policy = DeviceExpertPolicy(manager.num_total_experts, slots, self.device, config.transfer_policy)
         self.copier = DeviceSparseCopy(config.transfer_copy_library)
-        if self.copier.native_launch is None:
-            raise ValueError("Rebuild the expert copy library: AccOffloadNativeCopy is required")
         w13, w2 = _expert_weight(layer, "w13_weight"), _expert_weight(layer, "w2_weight")
-        intermediate = owner.gate.shape[1]
-        hidden = owner.down.shape[1]
-        destinations = (w13, w13, w2, layer.w13_weight_scale,
-                        layer.w13_weight_scale, layer.w2_weight_scale)
-        target_rows = (2 * intermediate, 2 * intermediate, hidden,
-                       2 * intermediate, 2 * intermediate, hidden)
-        row_offsets = (0, intermediate, 0, 0, intermediate, 0)
-        slot_bytes = (manager.w13_expert_size_bytes, manager.w13_expert_size_bytes,
-                      manager.w2_expert_size_bytes,
-                      layer.w13_weight_scale[0].numel(), layer.w13_weight_scale[0].numel(),
-                      layer.w2_weight_scale[0].numel())
-        recipes = []
-        mapped_sources = self.copier.map_hosts(owner.tensors)
-        for field, (source, destination, rows, offset, stride) in enumerate(zip(
-                owner.tensors, destinations, target_rows, row_offsets, slot_bytes)):
-            source_rows, row_bytes = source.shape[1:]
-            if source.element_size() != 1 or destination.element_size() != 1:
-                raise ValueError("Fused native transfer requires byte-sized weights/scales")
-            if rows * row_bytes != stride:
-                raise ValueError("Unsupported padded expert slot layout")
-            width = 16 if field < 3 else self._scale_width(destination, rows, row_bytes)
-            if row_bytes % width or ((width + 31) // 32) * 32 * 256 > 128 * 1024:
-                raise ValueError("Unsupported native expert row width")
-            recipes.append([mapped_sources[field], destination.data_ptr(),
-                            source_rows * row_bytes, stride, source_rows, row_bytes,
-                            rows, offset, width])
-        self._gather_offsets = []
-        if self.copier.native_plan_version == 2:
-            for recipe in recipes:
-                row_bytes, width = recipe[5], recipe[8]
-                if recipe[4] % 16 or row_bytes > 2048:
-                    raise ValueError("Tiled native copy requires 16-row tiles and row bytes <= 2048")
-                if width == row_bytes:
-                    recipe.append(0)
+        self._packed_scales = []
+        self._sources = []
+        rows = []
+        destinations = [w13.data_ptr(), w2.data_ptr()]
+        self._field_names = ["w13_weight_NZ", "w2_weight_NZ"]
+        sizes = [manager.w13_expert_size_bytes, manager.w2_expert_size_bytes]
+        source_fields = [manager.w13_weights_cpu[self.layer_idx], manager.w2_weights_cpu[self.layer_idx]]
+        # Tensor.copy_ writes logical scale values into destination strides.
+        # Pack that same physical layout once on CPU, never during replay.
+        for buffer_dict in (manager.scale_cpu_buffers, manager.offset_cpu_buffers, manager.scale_bias_cpu_buffers):
+            for name, buffers in buffer_dict.items():
+                target = getattr(layer, name, None)
+                if target is None or self.layer_idx >= len(buffers):
                     continue
-                item_bytes = 2 if width == 2 else 4
-                chunk_items = width // item_bytes
-                index = torch.arange(16 * row_bytes // item_bytes, dtype=torch.int64)
-                offset = ((index // (16 * chunk_items)) * chunk_items
-                          + (index // chunk_items % 16) * (row_bytes // item_bytes)
-                          + index % chunk_items) * item_bytes
-                offsets = offset.to(device=self.device, dtype=torch.int32)
-                self._gather_offsets.append(offsets)
-                recipe.append(offsets.data_ptr())
-        self.recipes = torch.tensor(recipes, device=self.device, dtype=torch.int64)
+                dst = target[0]
+                span = (1 + sum((n - 1) * stride for n, stride in zip(dst.shape, dst.stride()))) * dst.element_size()
+                slot_stride = target.stride(0) * target.element_size()
+                if span != dst.numel() * dst.element_size() or slot_stride != span:
+                    raise ValueError(f"Unsupported padded scale slot: {name}")
+                packed = torch.empty((manager.num_total_experts, span), dtype=torch.uint8, pin_memory=True)
+                views = []
+                for eid, src in enumerate(buffers[self.layer_idx]):
+                    raw = packed[eid]
+                    logical = raw.view(dst.dtype).as_strided(dst.shape, dst.stride())
+                    logical.copy_(src.reshape(dst.shape))
+                    views.append(raw)
+                self._packed_scales.append(packed)
+                source_fields.append(views)
+                destinations.append(target.data_ptr())
+                sizes.append(span)
+                self._field_names.append(name)
+        # Flatten registration across all experts/fields so shared allocator
+        # pages are registered only once for this layer.
+        flat = [source_fields[field][eid].untyped_storage() if field < 2 else source_fields[field][eid]
+                for eid in range(manager.num_total_experts) for field in range(len(source_fields))]
+        mapped = self.copier.map_storages(flat)
+        for eid in range(manager.num_total_experts):
+            rows.append(mapped[eid * len(source_fields):(eid + 1) * len(source_fields)])
+        if len(destinations) % 2:
+            destinations.append(destinations[-1]); sizes.append(0)
+            self._field_names.append("padding_zero_length")
+            for row in rows: row.append(row[-1])
+        self.sources = torch.tensor(rows, dtype=torch.int64, device=self.device)
+        self.destinations = torch.tensor(destinations, dtype=torch.int64, device=self.device)
+        self.strides = torch.tensor(sizes, dtype=torch.int64, device=self.device)
+        self.lengths = torch.tensor(sizes, dtype=torch.int32, device=self.device)
+        self.count = torch.tensor(len(sizes), dtype=torch.int32, device=self.device)
+        self.trace = None
+        if getattr(config, "transfer_trace_capacity", 0):
+            from vllm_ascend.expert_offload.transfer_trace import TransferTrace
+            self.trace = TransferTrace(self, config.transfer_trace_capacity, config.transfer_trace_mode)
         self._plans = []
+        self._sources = source_fields
         if not hasattr(manager, "_device_expert_transfers"):
             manager._device_expert_transfers = []
         manager._device_expert_transfers.append(self)
 
-    @staticmethod
-    def _scale_width(destination, rows, columns):
-        shape = tuple(destination[0].shape)
-        stride = tuple(destination[0].stride())
-        if shape != (columns // 2, rows, 2):
-            raise ValueError(f"Unsupported native scale shape: {shape}")
-        if stride == (2, columns, 1):
-            return columns
-        if stride == (rows * 2, 2, 1):
-            return 2
-        raise ValueError(f"Unsupported native scale strides: {stride}")
-
-    def prepare(self, ids, mapping):
-        candidate, slot, active = self.policy.select(ids, mapping)
-        task = _DeviceUpload(self, candidate, slot, active)
-        if task.graph:
-            self._plans.append(task)
+    def prepare(self, ids, mapping, weights=None):
+        if self.policy is None:
+            raise RuntimeError("Source-only expert transfer has no demand-admission policy")
+        if self.trace is not None:
+            self.trace.mark(0)
+        if self.load_balanced:
+            candidate, slot, active = self.policy.select(ids, mapping, weights)
         else:
-            self._last_eager_plan = task
+            candidate, slot, active = self.policy.select(ids, mapping)
+        self.trace_transfer_count = active.to(torch.int64).sum()
+        if self.trace is not None:
+            self.trace.mark(1, candidate, slot, active)
+        if self.load_balanced:
+            sources = self.sources.index_select(0, candidate).reshape(-1)
+            destinations = (self.destinations[None, :] + slot[:, None] * self.strides[None, :]).reshape(-1)
+            lengths = (self.lengths[None, :] * active[:, None].to(torch.int32)).reshape(-1)
+            copy_count = active.to(torch.int32).sum().to(torch.int32) * self.lengths.numel()
+        else:
+            sources = self.sources.index_select(0, candidate.reshape(1)).reshape(-1)
+            destinations = self.destinations + slot * self.strides
+            lengths = self.lengths * active.to(torch.int32)
+            copy_count = self.count
+        if self.trace is not None:
+            self.trace.mark(2)
+        task = _DeviceUpload(self, sources, destinations, lengths, candidate, slot)
+        task.copy_count = copy_count
+        self._plans.append(task)
         return task
 
     def upload(self, task):
-        self.copier.native_launch(
-            self.recipes.data_ptr(), task.candidate.data_ptr(), task.slot.data_ptr(),
-            task.active.data_ptr(), self.device.index)
+        if self.trace is None:
+            self.copier.copy(task.sources, task.destinations, task.lengths, task.copy_count)
+        else:
+            self.trace.mark(3)
+            self.trace.copy(task, self.count)
+            self.trace.mark(4)
         if hasattr(self.layer, "w13_weight_scale_fp32"):
             self.layer.w13_weight_scale_fp32.copy_(self.layer.w13_weight_scale.to(torch.float32))
 
 
 class _DeviceUpload:
-    def __init__(self, transfer, candidate, slot, active):
+    def __init__(self, transfer, sources, destinations, lengths, candidate=None, slot=None):
         from vllm_ascend.expert_offload.cpu_backend.kt_kernel_backend import _graph_capture_active
-
         self.transfer = transfer
-        self.candidate, self.slot, self.active = candidate, slot, active
+        self.candidate, self.slot = candidate, slot
+        self.sources, self.destinations, self.lengths = sources, destinations, lengths
         self.graph = _graph_capture_active()
 
     def wait_for_weights(self, cpu_task):
-        # No CPU submission event or host callback gates this upload.
+        # Device descriptors depend on device admission. No host submission
+        # event or host callback is on the weight-transfer critical path.
         self.transfer.upload(self)

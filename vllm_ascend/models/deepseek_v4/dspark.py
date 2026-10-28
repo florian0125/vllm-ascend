@@ -106,12 +106,18 @@ class DeepseekV4DSparkModel(nn.Module):
         first_layer = self.layers[str(self.mtp_start_layer_idx)]
         self.use_sequence_parallel_moe = first_layer.use_sequence_parallel_moe
 
+        _model_quant_cfg = getattr(config, "quantization_config", None)
+        _main_proj_qconfig = (
+            vllm_config.quant_config
+            if _model_quant_cfg is not None and _model_quant_cfg.get("quant_method") == "fp8"
+            else None
+        )
         self.main_proj = ColumnParallelLinear(
             config.hidden_size * len(self.target_layer_ids),
             config.hidden_size,
             bias=False,
             return_bias=False,
-            quant_config=vllm_config.quant_config,
+            quant_config=_main_proj_qconfig,
             prefix=maybe_prefix(prefix, f"layers.{self.mtp_start_layer_idx}.main_proj"),
             gather_output=True,
         )

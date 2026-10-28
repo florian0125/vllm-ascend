@@ -580,38 +580,67 @@ def test_executor_graph_splits_only_after_combined_transfer(monkeypatch):
     assert plan.cpu_topk_ids.tolist() == [[-1, -1, 3]]
 
 
-@pytest.mark.parametrize("inference_buffers", [False, True])
-def test_transfer_callback_masks_inference_routes_from_another_thread(inference_buffers):
+def test_transfer_callback_updates_capture_inference_buffers(monkeypatch):
+    monkeypatch.setattr(torch, 'npu', SimpleNamespace(stream=lambda _: nullcontext()), raising=False)
+    layer = object()
+    modes = []
+    manager = make_manager(layer, lambda *args: modes.append(torch.is_inference_mode_enabled()),
+                           lambda: modes.append(torch.is_inference_mode_enabled()))
+    transfer = HybridExpertTransfer(manager, layer)
+    with torch.inference_mode():
+        ids = torch.tensor([[0, 2, 3]])
+        weights = torch.ones(1, 3)
+        hidden = torch.ones(1, 4)
+    state = SimpleNamespace(ids_h=ids, map_h=torch.tensor([0, 1, -1, -1]),
+                            stream=SimpleNamespace(npu_stream=123))
+    submitted = []
+    backend = SimpleNamespace(_launch_pinned_forward=lambda args: submitted.append(torch.is_inference_mode_enabled()))
+    assert not torch.is_inference_mode_enabled()
+    transfer._prepare_and_launch_cpu((state, backend, hidden, weights))
+    assert ids.tolist() == [[-1, -1, 3]]
+    assert weights.tolist() == [[0, 0, 1]]
+    assert submitted == [True]
+    assert modes == [True, True]
+    assert not torch.is_inference_mode_enabled()
+
+
+def test_weight_callback_can_refresh_inference_tensor(monkeypatch):
+    monkeypatch.setattr(torch, 'npu', SimpleNamespace(stream=lambda _: nullcontext()), raising=False)
+    with torch.inference_mode():
+        destination = torch.zeros(1)
+    layer = object()
+    manager = make_manager(layer, lambda *args: destination.fill_(3))
+    transfer = HybridExpertTransfer(manager, layer)
+    transfer._load_and_sync(SimpleNamespace(selection=(2, 1)))
+    assert destination.item() == 3
+    assert not torch.is_inference_mode_enabled()
+
+
+def test_unwrapped_transfer_callback_reproduces_inference_violation(monkeypatch):
+    monkeypatch.setattr(torch, 'npu', SimpleNamespace(stream=lambda _: nullcontext()), raising=False)
     layer = object()
     transfer = HybridExpertTransfer(make_manager(layer), layer)
-    with torch.inference_mode(inference_buffers):
-        ids = torch.tensor([[0, 2, 3]])
-        weights = torch.tensor([[0.2, 0.3, 0.5]])
-    state = SimpleNamespace(
-        ids_h=ids, map_h=torch.tensor([0, 1, -1, -1]),
-        stream=SimpleNamespace(npu_stream=123),
-    )
-    calls = []
-    errors = []
-    backend = SimpleNamespace(_launch_pinned_forward=lambda _: calls.append("submit"))
-    transfer._load_and_sync = lambda _: calls.append("weights")
-
-    def callback():
-        try:
-            # ACL callback threads do not inherit the model thread's mode.
-            assert not torch.is_inference_mode_enabled()
-            transfer._prepare_and_launch_cpu((state, backend, torch.ones(1, 4), weights))
-            assert not torch.is_inference_mode_enabled()
-        except BaseException as exc:
-            errors.append(exc)
-
     with torch.inference_mode():
-        worker = threading.Thread(target=callback)
-        worker.start()
-        worker.join(timeout=5)
-    assert not worker.is_alive()
-    assert not errors, errors
-    assert ids.tolist() == [[-1, -1, 3]]
-    torch.testing.assert_close(weights, torch.tensor([[0.0, 0.0, 0.5]]))
-    assert state.map_h.tolist() == [0, -1, 1, -1]
-    assert calls == ["submit", "weights"]
+        ids = torch.tensor([[0, 2, 3]])
+        weights = torch.ones(1, 3)
+        hidden = torch.ones(1, 4)
+    state = SimpleNamespace(ids_h=ids, map_h=torch.tensor([0, 1, -1, -1]),
+                            stream=SimpleNamespace(npu_stream=123))
+    backend = SimpleNamespace(_launch_pinned_forward=lambda _: None)
+    with pytest.raises(RuntimeError, match="Inplace update to inference tensor"):
+        transfer._prepare_and_launch_cpu.__wrapped__(transfer, (state, backend, hidden, weights))
+
+
+def test_device_owned_transfer_does_not_defer_cpu_result():
+    calls = []
+    task = SimpleNamespace(wait=lambda: torch.zeros(1, 4))
+    backend = SimpleNamespace(submit=lambda **kw: calls.append(kw) or task, max_num_tokens=100)
+    executor = HybridExpertExecutor(backend, 0)
+    transfer = SimpleNamespace(device_owned=True, prepare=lambda ids, mapping: SimpleNamespace(
+        graph=True, wait_for_weights=lambda cpu_task: calls.append("device_copy")))
+    plan = executor.prepare(hidden_states=torch.ones(1, 4), topk_ids=torch.tensor([[0, 2]]),
+                            topk_weights=torch.ones(1, 2), log2phy=torch.tensor([0, 1, -1]),
+                            weight_transfer=transfer)
+    assert "defer_graph_join" not in calls[0]
+    assert calls[1] == "device_copy"
+    assert plan.cpu_task is task

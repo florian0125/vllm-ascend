@@ -1785,8 +1785,17 @@ class CpuMoeConfig:
         "transfer_one_expert": False,
         # first_miss preserves the original policy; frequency admits recent hotspots.
         "transfer_policy": "first_miss",
-        "transfer_scheduler": "cpu",  # npu: device-owned native MXFP4 scheduling
-        "transfer_copy_library": "",  # standalone MemFabric sparse-copy kernel
+        "transfer_scheduler": "cpu",
+        "transfer_copy_library": "",
+        "transfer_trace_capacity": 0,
+        "transfer_trace_mode": 1,
+        # Initial minimax model in microseconds; tune from per-layer measurements.
+        "balance_max_transfers": 32,
+        "balance_cpu_expert_us": 70.0,
+        "balance_cpu_extra_route_us": 10.0,
+        "balance_copy_us": 450.0,
+        "balance_npu_route_us": 2.0,
+        "balance_min_gain_us": 20.0,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -1876,17 +1885,36 @@ class CpuMoeConfig:
             raise TypeError("cpu_moe.enabled must be a boolean")
         if not isinstance(self.config["transfer_one_expert"], bool):
             raise TypeError("cpu_moe.transfer_one_expert must be a boolean")
+        capacity = self.config["transfer_trace_capacity"]
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or not 0 <= capacity <= 4096:
+            raise ValueError("cpu_moe.transfer_trace_capacity must be an integer in [0,4096]")
+        mode = self.config["transfer_trace_mode"]
+        if isinstance(mode, bool) or not isinstance(mode, int) or mode not in (1, 2):
+            raise ValueError("cpu_moe.transfer_trace_mode must be 1 (field) or 2 (per-tile)")
+        if capacity and self.config["transfer_scheduler"] != "npu":
+            raise ValueError("Transfer trace requires the NPU scheduler")
         if self.config["transfer_scheduler"] not in ("cpu", "npu"):
             raise ValueError("cpu_moe.transfer_scheduler must be cpu or npu")
-        if not isinstance(self.config["transfer_copy_library"], str):
-            raise TypeError("cpu_moe.transfer_copy_library must be a string")
-        if self.config["transfer_scheduler"] == "npu":
-            if self.config["weight_format"] != "native_mxfp4":
-                raise ValueError("NPU transfer scheduler requires native_mxfp4 weights")
-            if not self.config["transfer_copy_library"]:
-                raise ValueError("NPU transfer scheduler requires transfer_copy_library")
-        if self.config["transfer_policy"] not in ("first_miss", "frequency"):
-            raise ValueError("cpu_moe.transfer_policy must be first_miss or frequency")
+        if self.config["transfer_scheduler"] == "npu" and not self.config["transfer_copy_library"]:
+            from vllm_ascend.expert_offload.copy_library import get_default_copy_library
+
+            self.config["transfer_copy_library"] = get_default_copy_library()
+        if self.config["transfer_policy"] not in ("first_miss", "frequency", "load_balance"):
+            raise ValueError("cpu_moe.transfer_policy must be first_miss, frequency or load_balance")
+        if self.config["transfer_policy"] == "load_balance":
+            if self.config["transfer_scheduler"] != "npu":
+                raise ValueError("Load balancing requires the NPU scheduler")
+            if self.config["transfer_trace_capacity"]:
+                raise ValueError("Per-core transfer tracing supports single-expert policies only")
+        limit = self.config["balance_max_transfers"]
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 32:
+            raise ValueError("cpu_moe.balance_max_transfers must be an integer in [1,32]")
+        for key in ("balance_cpu_expert_us", "balance_cpu_extra_route_us", "balance_copy_us", "balance_npu_route_us", "balance_min_gain_us"):
+            value = self.config[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < float("inf"):
+                raise ValueError(f"cpu_moe.{key} must be finite and nonnegative")
+        if self.config["balance_cpu_expert_us"] == 0 or self.config["balance_copy_us"] == 0:
+            raise ValueError("CPU expert and copy costs must be positive")
         if self.config["backend"] not in ("kt_kernel", ):
             raise ValueError("cpu_moe.backend must be 'kt_kernel'; got "
                              f"{self.config['backend']!r}")
@@ -1941,6 +1969,11 @@ class ExpertOffloadConfig:
         "num_device_layers": 2,
         "expert_map_path": None,
         "cache_policy_enabled": False,
+        # Eviction flavor when cache_policy_enabled: "lrc" (hotness = recent
+        # freq + EMA + router - age) or "lru" (classic recency-only, heat =
+        # last-used step). Only affects which device policy the hybrid stack
+        # attaches; both run inside the same fused Triton kernel.
+        "cache_policy_type": "lrc",
         "cache_recent_window": 32,
         "cache_ema_beta": 0.9,
         "cache_recent_weight": 1.0,
@@ -2119,6 +2152,10 @@ class ExpertOffloadConfig:
             raise TypeError("expert_offload must be a boolean")
         if not isinstance(self.config["cache_policy_enabled"], bool):
             raise TypeError("cache_policy_enabled must be a boolean")
+        if not isinstance(self.config["cache_policy_type"], str):
+            raise TypeError("cache_policy_type must be a string")
+        if self.config["cache_policy_type"] not in ("lrc", "lru"):
+            raise ValueError("cache_policy_type must be 'lrc' or 'lru'")
         if not isinstance(self.config["cache_recent_window"], int):
             raise TypeError("cache_recent_window must be an integer")
         if self.config["cache_recent_window"] < 1:

@@ -1,8 +1,11 @@
-"""Fused NPU proportional admission and unchanged token-wise LRC eviction.
+"""Fused NPU proportional admission and unchanged token-wise LRC/LRU eviction.
 
 Candidate order: current route count descending, historical frequency descending,
-expert ID ascending. Victims: unprotected slots, LRC score ascending, slot ID
-ascending; empty slots come first. Counts use exact rational integer rounding.
+expert ID ascending. Victims: unprotected slots, LRC score ascending (or, on the
+LRU branch, last-used step ascending — classic recency-only), slot ID ascending;
+empty slots come first. Counts use exact rational integer rounding. The LRU
+branch compiles out the LRC history/EMA/router state entirely: only ``Last`` and
+``Step`` stay live, so it is strictly cheaper than LRC per step.
 """
 import math
 
@@ -28,7 +31,8 @@ def _counts_hotness(Ids, Weights, Mapping, Counts, Scores,
                     SlotHeat, Protected, Heat,
                     N: tl.constexpr, K: tl.constexpr, E: tl.constexpr,
                     W: tl.constexpr, S: tl.constexpr, HAS_WEIGHTS: tl.constexpr,
-                    LRC: tl.constexpr, BETA: tl.constexpr, LOG_BETA: tl.constexpr,
+                    LRC: tl.constexpr, LRU: tl.constexpr,
+                    BETA: tl.constexpr, LOG_BETA: tl.constexpr,
                     RW: tl.constexpr, EW: tl.constexpr, SW: tl.constexpr, AW: tl.constexpr,
                     BN: tl.constexpr, BW: tl.constexpr, BE: tl.constexpr, DECAY: tl.constexpr):
     e = tl.program_id(0) * BE + tl.arange(0, BE)
@@ -65,11 +69,15 @@ def _counts_hotness(Ids, Weights, Mapping, Counts, Scores,
         addition = tl.sum(tl.where(r[:, None] < N, (counts > 0).to(tl.float32) * decay[:, None], 0.), axis=0)
         ema = tl.load(Ema + e, e < E, other=0) * (BETA ** N) + addition * (1. - BETA)
         tl.store(Ema + e, ema, e < E)
+    if LRC or LRU:
+        # Recency state shared by both policies: LRU consumes it directly as
+        # the heat, LRC folds it into the age penalty.
         step = tl.load(Step)
         last_row = tl.max(tl.where(counts > 0, r[:, None] + 1, 0), axis=0)
         last = tl.load(Last + e, e < E, other=-1)
         last = tl.where(last_row > 0, step + last_row, last)
         tl.store(Last + e, last, e < E)
+    if LRC:
         router = tl.load(Router + e, e < E, other=0)
         if HAS_WEIGHTS:
             latest_weight = tl.load(Weights + tl.maximum(latest, 0), (e < E) & (latest >= 0), other=0).to(tl.float32)
@@ -79,6 +87,10 @@ def _counts_hotness(Ids, Weights, Mapping, Counts, Scores,
         recent = tl.sum(tl.where(h[:, None] < W, history, 0.), axis=0)
         age = tl.where(last < 0, 0., step + N - last)
         heat = RW * (seed + recent) + EW * ema + SW * router - AW * age
+    elif LRU:
+        # Classic LRU: heat IS the last-used step, so the ascending victim
+        # order evicts least-recently-used first; never-used (-1) is coldest.
+        heat = last
     else:
         heat = score
     tl.store(Heat + e, heat, e < E)
@@ -128,7 +140,8 @@ def _rank_and_balance(Counts, Scores, Mapping, SlotHeat, Protected,
 @triton.jit
 def _update_mapping(Mapping, Candidates, Victims, Active, Step,
                     E: tl.constexpr, L: tl.constexpr, N: tl.constexpr,
-                    LRC: tl.constexpr, B_E: tl.constexpr, B_L: tl.constexpr):
+                    LRC: tl.constexpr, LRU: tl.constexpr,
+                    B_E: tl.constexpr, B_L: tl.constexpr):
     e = tl.arange(0, B_E)
     k = tl.arange(0, B_L)
     mapping = tl.load(Mapping + e, e < E, other=-1)
@@ -140,7 +153,7 @@ def _update_mapping(Mapping, Candidates, Victims, Active, Step,
     slot = tl.max(tl.where(admitted, victims[None, :], -1), axis=1)
     updated = tl.where(slot >= 0, slot, tl.where(evicted, -1, mapping))
     tl.store(Mapping + e, updated, e < E)
-    if LRC:
+    if LRC or LRU:
         tl.store(Step, tl.load(Step) + N)
 
 
@@ -167,6 +180,11 @@ class ModelNew:
             raise ValueError('Proportional policy requires matching contiguous weights')
         p = self.policy
         lrc = getattr(p, 'lrc', None)
+        lru = lrc is not None and bool(getattr(lrc, 'is_lru', False))
+        # The attribute is named `lrc` for both flavors; only a non-LRU
+        # policy object may drive the LRC kernel branches, which read/write
+        # the LRC state tensors (history/ema/router) the LRU object lacks.
+        lrc_flag = lrc is not None and not lru
         w = lrc.window if lrc is not None else 1
         beta = lrc.beta if lrc is not None else .9
         rw, ew, sw, aw = lrc.weights if lrc is not None else (0., 0., 0., 0.)
@@ -175,12 +193,12 @@ class ModelNew:
                            self.s, self.l, triton.next_power_of_2(max(self.s, self.l)))
         _counts_hotness[(triton.cdiv(self.e, 16),)](
             ids, weights if weights is not None else dummy, mapping, p.counts, p.scores,
-            lrc.history if lrc is not None else dummy, lrc.seed if lrc is not None else dummy,
-            lrc.ema if lrc is not None else dummy, lrc.router_score if lrc is not None else dummy,
-            lrc.last_used if lrc is not None else dummy, lrc.step if lrc is not None else dummy,
+            getattr(lrc, 'history', dummy), getattr(lrc, 'seed', dummy),
+            getattr(lrc, 'ema', dummy), getattr(lrc, 'router_score', dummy),
+            getattr(lrc, 'last_used', dummy), getattr(lrc, 'step', dummy),
             self.slot_heat, self.protected, self.heat,
             ids.shape[0], ids.shape[1], self.e, w, self.s, weights is not None,
-            lrc is not None, beta, math.log(beta) if beta else 0., rw, ew, sw, aw,
+            lrc_flag, lru, beta, math.log(beta) if beta else 0., rw, ew, sw, aw,
             triton.next_power_of_2(max(1, ids.shape[0])), triton.next_power_of_2(w), 16, FREQUENCY_DECAY)
         _rank_and_balance[(triton.cdiv(max(self.e, self.s), 16),)](
             p.counts, p.scores, mapping, self.slot_heat, self.protected,
@@ -188,8 +206,8 @@ class ModelNew:
             self.e, self.s, self.l, p.ratio_num, p.ratio_den,
             triton.next_power_of_2(self.e), triton.next_power_of_2(self.s), 16)
         _update_mapping[(1,)](mapping, self.candidates, self.victims, self.active,
-                               lrc.step if lrc is not None else dummy,
-                               self.e, self.l, ids.shape[0], lrc is not None,
+                               getattr(lrc, 'step', dummy),
+                               self.e, self.l, ids.shape[0], lrc_flag, lru,
                                triton.next_power_of_2(self.e), triton.next_power_of_2(self.l))
         return self.candidates, self.victims, self.active
 

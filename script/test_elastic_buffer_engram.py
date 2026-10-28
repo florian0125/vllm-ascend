@@ -35,13 +35,12 @@ import gc
 import os
 import sys
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import torch
 import torch.distributed as dist
-
 
 ENGRAM_HIDDEN_ALIGNMENT = 128
 PACKED_CARRIER_DTYPE = torch.float16
@@ -58,13 +57,9 @@ class TestCase:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Validate distributed CPU expert fetch with ElasticBuffer/Engram."
-    )
+    parser = argparse.ArgumentParser(description="Validate distributed CPU expert fetch with ElasticBuffer/Engram.")
     parser.add_argument("--num-entries", type=int, default=8, help="CPU entries per rank")
-    parser.add_argument(
-        "--num-indices", type=int, default=8, help="entries fetched by every rank"
-    )
+    parser.add_argument("--num-indices", type=int, default=8, help="entries fetched by every rank")
     parser.add_argument(
         "--hidden",
         type=int,
@@ -166,9 +161,7 @@ def make_packed_storage(rank: int, num_entries: int, hidden: int) -> torch.Tenso
     return packed.view(PACKED_CARRIER_DTYPE)
 
 
-def make_packed_expected(
-    global_indices: torch.Tensor, num_entries: int, hidden: int
-) -> torch.Tensor:
+def make_packed_expected(global_indices: torch.Tensor, num_entries: int, hidden: int) -> torch.Tensor:
     indices = global_indices.to(dtype=torch.int64, device="cpu")
     row_bytes = hidden * PACKED_CARRIER_DTYPE.itemsize
     owner = torch.div(indices, num_entries, rounding_mode="floor").unsqueeze(1)
@@ -222,8 +215,7 @@ def validate_preallocated_slot(
     validate_exact(rank, "preallocated_slot_copy", slot, expected_cpu, compare_as_bytes)
     log(
         rank,
-        "[SLOT] direct_out_supported=false extra_npu_copy=true "
-        f"fetched_ptr={fetched.data_ptr()} slot_ptr={slot_ptr}",
+        f"[SLOT] direct_out_supported=false extra_npu_copy=true fetched_ptr={fetched.data_ptr()} slot_ptr={slot_ptr}",
     )
 
 
@@ -239,9 +231,7 @@ def run_graph_test(
     static_indices = initial_indices_cpu.npu()
     replay_indices_cpu = torch.roll(initial_indices_cpu, shifts=1)
     total_entries = dist.get_world_size(group) * num_entries
-    replay_indices_cpu = torch.remainder(
-        replay_indices_cpu + num_entries, total_entries
-    ).to(torch.int32)
+    replay_indices_cpu = torch.remainder(replay_indices_cpu + num_entries, total_entries).to(torch.int32)
     replay_indices_npu = replay_indices_cpu.npu()
 
     # Warm up lazy Engram resources before capture.
@@ -296,9 +286,7 @@ def run_case(
     storage = test_case.make_storage(rank, num_entries, test_case.hidden)
     log_process_memory(rank, f"{test_case.name}:after_storage")
 
-    num_cpu_bytes = elastic_buffer_class.get_engram_storage_size_hint(
-        num_entries, test_case.hidden, test_case.dtype
-    )
+    num_cpu_bytes = elastic_buffer_class.get_engram_storage_size_hint(num_entries, test_case.hidden, test_case.dtype)
     payload_bytes = storage.numel() * storage.element_size()
     log(
         rank,
@@ -323,9 +311,7 @@ def run_case(
             f"[FETCH] global_indices={indices_cpu.tolist()} owner_ranks={owner_ranks} "
             f"contains_remote={any(owner != rank for owner in owner_ranks)}",
         )
-        expected_builder = lambda indices: test_case.make_expected(
-            indices, num_entries, test_case.hidden
-        )
+        expected_builder = lambda indices: test_case.make_expected(indices, num_entries, test_case.hidden)
         expected_cpu = expected_builder(indices_cpu)
         fetched = buffer.engram_fetch(indices_cpu.npu())()
         validate_exact(rank, "eager_local_and_remote_fetch", fetched, expected_cpu, test_case.compare_as_bytes)
@@ -418,12 +404,8 @@ def main() -> int:
                 name="numeric",
                 hidden=args.hidden,
                 dtype=dtype,
-                make_storage=lambda rank_id, entries, hidden: make_numeric_storage(
-                    rank_id, entries, hidden, dtype
-                ),
-                make_expected=lambda indices, entries, hidden: make_numeric_expected(
-                    indices, entries, hidden, dtype
-                ),
+                make_storage=lambda rank_id, entries, hidden: make_numeric_storage(rank_id, entries, hidden, dtype),
+                make_expected=lambda indices, entries, hidden: make_numeric_expected(indices, entries, hidden, dtype),
             )
         )
     if args.cases in ("all", "packed-w4"):
@@ -453,9 +435,7 @@ def main() -> int:
         )
         all_eager_passed = all_eager_passed and eager_passed
         if graph_passed is not None:
-            all_graph_passed = (
-                graph_passed if all_graph_passed is None else all_graph_passed and graph_passed
-            )
+            all_graph_passed = graph_passed if all_graph_passed is None else all_graph_passed and graph_passed
 
     global_eager_passed = reduce_pass(group, all_eager_passed)
     global_graph_passed = None

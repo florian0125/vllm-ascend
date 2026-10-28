@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+project(cpu_moe_mapped_combine LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../expert_transfer_copy/config_ascendc.cmake)
+ascendc_library(cpu_moe_mapped_combine SHARED mapped_combine.cpp)

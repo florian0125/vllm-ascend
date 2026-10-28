@@ -243,7 +243,4 @@ csrc/third_party/
 
 # local build cache
 .vllm_ascend/
-
-# local working artifacts on 9334
-memfabric_hybrid/
-outputs/
+extra-info/

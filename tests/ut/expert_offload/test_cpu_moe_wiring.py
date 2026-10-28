@@ -80,3 +80,30 @@ def test_wiring_retains_single_card_constraint(cpu_config_class, monkeypatch, tp
             enable_multi_card=multi_card,
             tp_size=tp,
         )
+
+
+def test_npu_transfer_resolves_checkout_copy_library(cpu_config_class, monkeypatch):
+    import vllm_ascend.expert_offload.copy_library as library
+
+    monkeypatch.setattr(library, "get_default_copy_library", lambda: "/checkout/default-copy.so")
+    cfg = cpu_config_class({"transfer_scheduler": "npu"})
+    assert cfg.transfer_copy_library == "/checkout/default-copy.so"
+
+
+def test_npu_transfer_preserves_explicit_library(cpu_config_class, monkeypatch):
+    import vllm_ascend.expert_offload.copy_library as library
+
+    def unexpected_default():
+        raise AssertionError("Explicit copy library must bypass default resolution")
+
+    monkeypatch.setattr(library, "get_default_copy_library", unexpected_default)
+    cfg = cpu_config_class({"transfer_scheduler": "npu", "transfer_copy_library": "/custom/copy.so"})
+    assert cfg.transfer_copy_library == "/custom/copy.so"
+
+
+def test_missing_checkout_copy_library_has_build_instruction(monkeypatch, tmp_path):
+    import vllm_ascend.expert_offload.copy_library as library
+
+    monkeypatch.setattr(library, "__file__", str(tmp_path / "copy_library.py"))
+    with pytest.raises(FileNotFoundError, match="csrc/expert_transfer_copy/build.sh"):
+        library.get_default_copy_library()

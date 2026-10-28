@@ -19,7 +19,6 @@ import sys
 import torch
 import torch.distributed as dist
 
-
 ONE_GIB = 1 << 30
 
 
@@ -35,8 +34,8 @@ def parse_args() -> argparse.Namespace:
 
 def _import_npu_dependencies():
     try:
-        import torch_npu  # noqa: F401
         import memfabric_hybrid as mf
+        import torch_npu  # noqa: F401
         from memfabric_hybrid import offload
     except ImportError as exc:
         raise RuntimeError(
@@ -47,13 +46,10 @@ def _import_npu_dependencies():
 
 
 def _rank_env() -> tuple[int, int, int]:
-    missing = [name for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE")
-               if name not in os.environ]
+    missing = [name for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE") if name not in os.environ]
     if missing:
-        raise RuntimeError(
-            "launch this script with torchrun; missing " + ", ".join(missing))
-    return (int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"]),
-            int(os.environ["WORLD_SIZE"]))
+        raise RuntimeError("launch this script with torchrun; missing " + ", ".join(missing))
+    return (int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"]), int(os.environ["WORLD_SIZE"]))
 
 
 def _pattern(expert_id: int, weight_id: int) -> float:
@@ -62,8 +58,7 @@ def _pattern(expert_id: int, weight_id: int) -> float:
 
 def main() -> int:
     args = parse_args()
-    if min(args.num_experts, args.hidden_size, args.intermediate_size,
-           args.reserve_gib) <= 0:
+    if min(args.num_experts, args.hidden_size, args.intermediate_size, args.reserve_gib) <= 0:
         raise ValueError("shape, expert count, and reserve size must be positive")
 
     rank, local_rank, world_size = _rank_env()
@@ -102,58 +97,43 @@ def main() -> int:
         experts_per_rank = args.num_experts // world_size
         shard_start = rank * experts_per_rank
         local_ptrs = []
-        for expert_id in range(shard_start,
-                               shard_start + experts_per_rank):
+        for expert_id in range(shard_start, shard_start + experts_per_rank):
             for weight_id, shape in enumerate(shapes):
                 value = _pattern(expert_id, weight_id)
-                host = offload.empty(
-                    shape, dtype=torch.bfloat16).fill_(value)
+                host = offload.empty(shape, dtype=torch.bfloat16).fill_(value)
                 host_weights.append(host)
                 local_ptrs.append(host.data_ptr())
 
         gathered_ptrs = [None] * world_size
-        dist.all_gather_object(
-            gathered_ptrs, local_ptrs, group=cpu_group)
+        dist.all_gather_object(gathered_ptrs, local_ptrs, group=cpu_group)
         source_rank = (rank + 1) % world_size
         source_start = source_rank * experts_per_rank
         expected: list[float] = []
         lengths_cpu: list[int] = []
-        for expert_id in range(source_start,
-                               source_start + experts_per_rank):
+        for expert_id in range(source_start, source_start + experts_per_rank):
             for weight_id, shape in enumerate(shapes):
-                slot = torch.empty(shape,
-                                   dtype=torch.bfloat16,
-                                   device=f"npu:{local_rank}")
+                slot = torch.empty(shape, dtype=torch.bfloat16, device=f"npu:{local_rank}")
                 device_slots.append(slot)
                 expected.append(_pattern(expert_id, weight_id))
                 lengths_cpu.append(slot.numel() * slot.element_size())
 
         buffer_count = len(device_slots)
-        src_ptrs = torch.tensor(gathered_ptrs[source_rank],
-                                dtype=torch.int64,
-                                device=f"npu:{local_rank}")
+        src_ptrs = torch.tensor(gathered_ptrs[source_rank], dtype=torch.int64, device=f"npu:{local_rank}")
 
-        dst_ptrs = torch.tensor([item.data_ptr() for item in device_slots],
-                                 dtype=torch.int64,
-                                 device=f"npu:{local_rank}")
-        lengths = torch.tensor(lengths_cpu,
-                               dtype=torch.int32,
-                               device=f"npu:{local_rank}")
-        count = torch.tensor(buffer_count,
-                             dtype=torch.int32,
-                             device=f"npu:{local_rank}")
-        ret = offload.sparse_copy(src_ptrs, dst_ptrs, lengths, count,
-                                  device_slots[0].device)
+        dst_ptrs = torch.tensor(
+            [item.data_ptr() for item in device_slots], dtype=torch.int64, device=f"npu:{local_rank}"
+        )
+        lengths = torch.tensor(lengths_cpu, dtype=torch.int32, device=f"npu:{local_rank}")
+        count = torch.tensor(buffer_count, dtype=torch.int32, device=f"npu:{local_rank}")
+        ret = offload.sparse_copy(src_ptrs, dst_ptrs, lengths, count, device_slots[0].device)
         if ret != 0:
-            raise RuntimeError(
-                f"rank {rank}: offload.sparse_copy failed: ret={ret}")
+            raise RuntimeError(f"rank {rank}: offload.sparse_copy failed: ret={ret}")
         torch.npu.synchronize()
 
         for index, (slot, value) in enumerate(zip(device_slots, expected)):
             reference = torch.full_like(slot, value)
             if not torch.equal(slot, reference):
-                raise AssertionError(
-                    f"rank {rank}: H2D verification failed for buffer {index}")
+                raise AssertionError(f"rank {rank}: H2D verification failed for buffer {index}")
         dist.barrier()
     finally:
         if process_group_initialized:

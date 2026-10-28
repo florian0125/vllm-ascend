@@ -36,10 +36,6 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
-    # Optional local /tmp directory for detailed CPU expert-transfer diagnostics.
-    # Default empty disables all instrumentation. Not a secret; valid values
-    # are empty or an absolute directory below /tmp. Diagnostics add overhead.
-    "VLLM_ASCEND_CPU_MOE_DIAGNOSTICS": lambda: os.getenv("VLLM_ASCEND_CPU_MOE_DIAGNOSTICS", ""),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

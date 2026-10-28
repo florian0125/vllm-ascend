@@ -6679,6 +6679,8 @@ class NPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
+        from vllm_ascend.expert_offload.transfer_trace import initialize_transfer_traces
+        initialize_transfer_traces()
         parent_module_name = _get_gpu_model_runner_module_name(self)
         self._engram_capture_active = True
         try:

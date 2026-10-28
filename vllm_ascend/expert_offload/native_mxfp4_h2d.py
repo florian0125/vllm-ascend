@@ -74,21 +74,13 @@ class NativeMXFP4H2DTransport:
         import torch_npu
         from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import apply_mxfp4_weight_scale_layout
 
-        record = getattr(self, "diagnostic_record", None)
-        if record:
-            record.mark("native_upload_enter", expert=task.expert, task_name=task.name)
         owner = task.owner
         if not 0 <= task.expert < owner.gate.shape[0]:
             raise IndexError(f"Invalid native expert id {task.expert}")
         stream = torch.npu.current_stream(task.scale13_destination.device)
         key = (task.scale13_destination.device.index, int(stream.npu_stream))
-        if record:
-            record.mark("native_source_views_begin")
         sources = tuple(tensor[task.expert] for tensor in owner.tensors)
         shapes = tuple(tuple(tensor.shape) for tensor in sources)
-        if record:
-            record.mark("native_source_views_end", shapes=shapes)
-            record.mark("native_staging_begin")
         cached = self._staging.get(key)
         if cached is None or cached[0] != shapes:
             staging = tuple(
@@ -97,26 +89,13 @@ class NativeMXFP4H2DTransport:
             self._staging[key] = (shapes, staging)
         else:
             staging = cached[1]
-        if record:
-            record.mark("native_staging_end", cache_hit=cached is not None and cached[0] == shapes)
-            record.mark("native_h2d_tasks_build_begin")
-        tasks = [
+        self.base.copy_batch([
             H2DCopyTask(source=source, destination=destination, nbytes=source.numel(), name=task.name)
             for source, destination in zip(sources, staging)
-        ]
-        if record:
-            record.mark("native_h2d_tasks_build_end")
-        self.base.copy_batch(tasks)
-        if record:
-            record.mark("native_weight_h2d_enqueued")
+        ])
         gate, up, down, gate_scale, up_scale, down_scale = staging
-        if record:
-            record.mark("native_cat_begin")
         w13 = torch.cat((gate, up), dim=0)
         scale13 = torch.cat((gate_scale, up_scale), dim=0)
-        if record:
-            record.mark("native_cat_end")
-            record.mark("native_format_cast_begin")
         nz13 = torch_npu.npu_format_cast(
             w13, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
         )
@@ -125,19 +104,10 @@ class NativeMXFP4H2DTransport:
         )
         # The slots carry transpose(NZ(original)); a transpose changes metadata,
         # not the physical storage consumed by the following byte copies.
-        if record:
-            record.mark("native_format_cast_end")
-            record.mark("native_slot_byte_copies_begin")
         self._copy_device_bytes(task.w13_destination, nz13, stream)
         self._copy_device_bytes(task.w2_destination, nz2, stream)
-        if record:
-            record.mark("native_slot_byte_copies_end")
-            record.mark("native_scale_layout_begin")
         scale13 = apply_mxfp4_weight_scale_layout(scale13).contiguous()
         scale2 = apply_mxfp4_weight_scale_layout(down_scale).contiguous()
-        if record:
-            record.mark("native_scale_layout_end")
-            record.mark("native_scale_copies_begin")
         for source, destination in (
             (scale13, task.scale13_destination), (scale2, task.scale2_destination)
         ):
@@ -148,24 +118,14 @@ class NativeMXFP4H2DTransport:
                 # MemFabric's existing attribute copies are byte-preserving,
                 # unlike TorchCopy's logical tensor copies.
                 self._copy_device_bytes(destination, source, stream)
-        if record:
-            record.mark("native_scale_copies_end")
-            record.mark("native_record_stream_begin")
         for output in (w13, nz13, nz2, scale13, scale2):
             output.record_stream(stream)
         # Allocator reuse is ordered on this same stream. Only the final
         # outputs are retained; prefill must not retain a full converted layer.
         self._last_outputs[key] = (w13, nz13, nz2, scale13, scale2)
-        if record:
-            record.mark("native_upload_exit")
 
     def copy_batch(self, tasks):
-        record = getattr(self, "diagnostic_record", None)
-        if record:
-            record.mark("native_transport_lock_wait_begin")
         with self._lock:
-            if record:
-                record.mark("native_transport_lock_acquired")
             plain = []
             for task in tasks:
                 if isinstance(task, NativeExpertUploadTask):

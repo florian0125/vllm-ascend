@@ -2,6 +2,9 @@
 import ast
 from pathlib import Path
 import pytest
+import sys
+import types
+import torch
 from vllm_ascend.expert_offload.cpu_backend.kt_kernel_backend import KtKernelBackendConfig, KtKernelCPUExpertBackend
 
 
@@ -60,3 +63,29 @@ def test_native_service_config_accepts_checkpoint_directory():
     })
     assert config.weight_format == "native_mxfp4"
     assert config.weight_path == "/model"
+
+
+def test_graph_registration_retains_warmup_buffers_across_sizes(monkeypatch):
+    from vllm_ascend.expert_offload.cpu_backend import kt_kernel_backend as module
+
+    warmup4 = (object(),)
+    warmup1 = (object(),)
+    buffers = types.SimpleNamespace(temp_bs=4, temp_buffer=warmup4,
+                                    capture_buffers={})
+    fake = types.ModuleType("kt_kernel.experts_base")
+    fake.KExpertsCPUBuffer = buffers
+    monkeypatch.setitem(sys.modules, "kt_kernel.experts_base", fake)
+    monkeypatch.setattr(module, "_GRAPH_PINNED_BATCH_SIZES", set())
+    monkeypatch.setattr(module, "_GRAPH_BATCH_SIGNATURES", {})
+    backend = object.__new__(KtKernelCPUExpertBackend)
+    backend.config = types.SimpleNamespace(top_k=3)
+    backend._wrapper = types.SimpleNamespace(set_capture_batch_sizes=lambda sizes: None)
+    backend._pin_graph_batch_size(torch.empty(4, 256))
+    buffers.temp_bs, buffers.temp_buffer = 1, warmup1
+    backend._pin_graph_batch_size(torch.empty(1, 256))
+    assert buffers.capture_buffers[4] is warmup4
+    assert buffers.capture_buffers[1] is warmup1
+    # An already captured allocation must survive later temporary warmups.
+    buffers.temp_bs, buffers.temp_buffer = 4, (object(),)
+    backend._pin_graph_batch_size(torch.empty(4, 256))
+    assert buffers.capture_buffers[4] is warmup4

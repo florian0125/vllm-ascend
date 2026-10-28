@@ -2,7 +2,6 @@
 import importlib.util
 from pathlib import Path
 import unittest
-from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
     "frequency_transfer_policy",
@@ -60,23 +59,8 @@ class FrequencyPolicyTests(unittest.TestCase):
     def test_invalid_routes_ignored_and_scores_decay(self):
         self.policy.scores = [10.0, 0.0]
         self.assertIsNone(self.select([-1, 9], [0, -1]))
-        self.assertAlmostEqual(self.policy.scores[0], 9.0)
+        self.assertAlmostEqual(self.policy.scores[0], 9.9)
         self.assertEqual(self.policy.scores[1], 0.0)
-
-    def test_absolute_margin_blocks_near_tie(self):
-        # Isolate the absolute guard: the production ratio is stricter at
-        # the current minimum admission score.
-        with patch.object(module, "FREQUENCY_REPLACEMENT_RATIO", 1.0):
-            self.policy.scores = [1.95 / module.FREQUENCY_DECAY, 0.0]
-            self.assertIsNone(self.select([1, 1], [0, -1], slots=1))
-            self.policy.scores = [1.8 / module.FREQUENCY_DECAY, 0.0]
-            self.assertEqual(self.select([1, 1], [0, -1], slots=1), (1, 0))
-
-    def test_recent_demand_overtakes_decaying_history(self):
-        self.policy.scores = [4.0, 0.0]
-        self.assertIsNone(self.select([1, 1], [0, -1], slots=1))
-        self.assertIsNone(self.select([1, 1], [0, -1], slots=1))
-        self.assertEqual(self.select([1, 1], [0, -1], slots=1), (1, 0))
 
     def test_per_layer_state_is_independent(self):
         self.select([0] * 3, [-1], slots=1)

@@ -217,9 +217,8 @@ class LRCExpertCachePolicy:
     ) -> list[int]:
         """Return up to ``count`` resident experts ordered coldest first.
 
-        Unlike repeated :meth:`choose_victim` calls, this ranks the resident
-        candidates once.  The stable sort preserves ``slot_owner`` iteration
-        order when experts have equal hotness, matching ``min`` tie-breaking.
+        Compute candidate scores in bulk, then select by the same hotness,
+        last-used step, and expert-id ordering as :meth:`choose_victim`.
         """
         if count < 0:
             raise ValueError("victim count must be >= 0")
@@ -227,8 +226,38 @@ class LRCExpertCachePolicy:
             return []
 
         candidates = [eid for eid in slot_owner.values() if eid not in protected]
-        candidates.sort(key=lambda eid: self._victim_key(layer_idx, eid))
-        return candidates[:count]
+        if not candidates:
+            return []
+
+        state = self.layer_states[layer_idx]
+        # Match scalar hotness() promotion and operation order. The public
+        # float32 hotness_array() can round distinct scores into ties.
+        score_dtype = np.asarray(self.hotness(layer_idx, candidates[0])).dtype
+        last_used = np.asarray(state.last_used, dtype=np.int64)
+        age = np.where(last_used < 0, 0, state.step - last_used)
+        scores = (
+            np.asarray(state.freq, dtype=np.float64) * self.recent_weight
+        ).astype(score_dtype) + state.ema.astype(score_dtype) * self.ema_weight
+        scores = scores + (
+            np.asarray(state.router_score, dtype=np.float64) * self.router_weight
+        ).astype(score_dtype)
+        scores = scores - (
+            age.astype(np.float64) * self.age_weight
+        ).astype(score_dtype)
+
+        candidate_ids = np.asarray(candidates, dtype=np.intp)
+        candidate_scores = scores[candidate_ids]
+        if not np.all(np.isfinite(candidate_scores)):
+            # Preserve Python's existing ordering for non-finite scores.
+            candidates.sort(key=lambda eid: self._victim_key(layer_idx, eid))
+            return candidates[:count]
+        if count == 1:
+            tied = candidate_ids[candidate_scores == candidate_scores.min()]
+            tied = tied[last_used[tied] == last_used[tied].min()]
+            return [int(tied.min())]
+
+        order = np.lexsort((candidate_ids, last_used[candidate_ids], candidate_scores))
+        return candidate_ids[order[:count]].tolist()
 
     def hotness(self, layer_idx: int, expert_id: int) -> float:
         state = self.layer_states[layer_idx]

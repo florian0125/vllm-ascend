@@ -20,6 +20,7 @@
 import copy
 import gc
 import inspect
+import os
 import logging
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
@@ -1236,6 +1237,8 @@ class NPUWorker(WorkerBase):
             )
 
         if is_start:
+            from vllm_ascend.expert_offload.transfer_trace import reset_transfer_traces
+            reset_transfer_traces()
             from vllm.distributed.utils import get_worker_rank_suffix
 
             rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
@@ -1249,11 +1252,21 @@ class NPUWorker(WorkerBase):
                 # Profiler already initialized. Restart profiling but keep
                 # the original trace name from the first initialization.
                 self.profiler.start()
+            if os.environ.get("CPU_MOE_CLOCK_CALIBRATION") == "1":
+                from vllm_ascend.expert_offload.cpu_backend.clock_calibration import record_clock_calibration
+                record_clock_calibration("begin", self.profiler_config.torch_profiler_dir)
         else:
             if self.profiler is None:
                 logger.warning("Profiler was not started, nothing to stop.")
                 return
+            if os.environ.get("CPU_MOE_CLOCK_CALIBRATION") == "1":
+                from vllm_ascend.expert_offload.cpu_backend.clock_calibration import record_clock_calibration
+                record_clock_calibration("end", self.profiler_config.torch_profiler_dir)
             self.profiler.stop()
+            from vllm_ascend.expert_offload.transfer_trace import dump_transfer_traces
+            transfer_trace_path = dump_transfer_traces(self.profiler_config.torch_profiler_dir)
+            if transfer_trace_path:
+                logger.info("[NPU-TRANSFER-TRACE] saved %s", transfer_trace_path)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)

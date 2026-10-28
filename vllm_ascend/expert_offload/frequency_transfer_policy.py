@@ -1,9 +1,8 @@
 """CPU frequency-based admission for single-expert hybrid transfer."""
 
-FREQUENCY_DECAY = 0.9
+FREQUENCY_DECAY = 0.99
 FREQUENCY_MIN_SCORE = 2.0
 FREQUENCY_REPLACEMENT_RATIO = 1.2
-FREQUENCY_REPLACEMENT_MARGIN = 0.1
 
 
 class FrequencyTransferPolicy:
@@ -46,11 +45,7 @@ class FrequencyTransferPolicy:
             if 0 <= slot < slot_count:
                 slot_scores[slot] = max(slot_scores[slot], self.scores[eid])
         victim_slot = min(available, key=lambda slot: slot_scores[slot])
-        candidate_score = self.scores[candidate]
-        victim_score = slot_scores[victim_slot]
-        if candidate_score <= victim_score * FREQUENCY_REPLACEMENT_RATIO:
-            return None
-        if candidate_score - victim_score <= FREQUENCY_REPLACEMENT_MARGIN:
+        if self.scores[candidate] <= slot_scores[victim_slot] * FREQUENCY_REPLACEMENT_RATIO:
             return None
         return candidate, victim_slot
 

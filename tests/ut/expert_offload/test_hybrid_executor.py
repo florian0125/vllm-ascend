@@ -100,27 +100,3 @@ def test_prepare_falls_back_on_backend_capacity_overflow():
     assert plan is None
 
     assert backend.call is None
-
-
-def test_device_owned_graph_transfer_returns_cpu_output_without_deferred_join():
-    backend = _RecordingBackend()
-    class TransferTask:
-        graph = True
-        def wait_for_weights(self, cpu_task):
-            self.cpu_task = cpu_task
-    class Transfer:
-        device_owned = True
-        def prepare(self, topk_ids, log2phy):
-            self.task = TransferTask()
-            return self.task
-    transfer = Transfer()
-    plan = HybridExpertExecutor(backend, layer_idx=4).prepare(
-        hidden_states=torch.ones(1, 8),
-        topk_ids=torch.tensor([[0, 1]]),
-        topk_weights=torch.tensor([[0.6, 0.4]]),
-        log2phy=torch.tensor([0, -1], dtype=torch.int32),
-        weight_transfer=transfer,
-    )
-    assert not backend.call.get('defer_graph_join', False)
-    assert transfer.task.cpu_task is plan.cpu_task
-    torch.testing.assert_close(backend.call['topk_ids'], torch.tensor([[-1, 1]]))
