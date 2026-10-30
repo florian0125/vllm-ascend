@@ -168,6 +168,7 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.expert_offload.decode_stats import get_decode_stats
+from vllm_ascend.expert_offload.benchmark_counters import get_route_counters
 from vllm_ascend.expert_offload.expert_offload_manager import (
     get_expert_offload_manager,
     has_expert_offload_manager,
@@ -2599,6 +2600,11 @@ class NPUModelRunner(GPUModelRunner):
                 dflash_topm_segments,
                 self.device,
             )
+        _route_counters = get_route_counters()
+        if _route_counters is not None:
+            _route_counters.set_forward(
+                scheduler_output.total_num_scheduled_tokens,
+                self.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding))
         # tell the statistics collector whether this forward is a decode step.
         _stats = get_decode_stats()
         if _stats is not None:
@@ -2948,6 +2954,9 @@ class NPUModelRunner(GPUModelRunner):
 
         # Capture speculative-decoding acceptance for the end-of-run summary
         self._record_spec_decode_stats(spec_decode_metadata, valid_sampled_token_ids, invalid_req_indices)
+        route_counters = get_route_counters()
+        if route_counters is not None:
+            route_counters.publish()
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -3322,6 +3331,9 @@ class NPUModelRunner(GPUModelRunner):
             proposed=proposed_total,
             n_drafts=len(indices),
         )
+        route_counters = get_route_counters()
+        if route_counters is not None:
+            route_counters.record_spec(accepted_total, proposed_total, len(indices))
 
     def _record_spec_decode_stats(self, spec_decode_metadata,
                                   valid_sampled_token_ids,
@@ -3373,6 +3385,9 @@ class NPUModelRunner(GPUModelRunner):
             proposed=proposed_total,
             n_drafts=n_drafts,
         )
+        route_counters = get_route_counters()
+        if route_counters is not None:
+            route_counters.record_spec(accepted_total, proposed_total, n_drafts)
 
     def _build_decode_stats_header(self) -> dict:
         """Run-configuration header for the statistics summary.
@@ -6664,6 +6679,8 @@ class NPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
+        from vllm_ascend.expert_offload.transfer_trace import initialize_transfer_traces
+        initialize_transfer_traces()
         parent_module_name = _get_gpu_model_runner_module_name(self)
         self._engram_capture_active = True
         try:

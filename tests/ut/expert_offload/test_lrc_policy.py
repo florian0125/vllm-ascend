@@ -260,3 +260,69 @@ def test_seed_layer_hotness_protects_offline_preloaded_experts():
     assert state.router_score[1] == 0.9
     assert state.last_used[1] == state.step
     assert policy.hotness(0, 1) > policy.hotness(0, 3)
+
+
+@pytest.mark.parametrize("count", [1, 3, 120, 256])
+def test_choose_victims_matches_scalar_ranking(count):
+    rng = np.random.default_rng(586)
+    policy = LRCExpertCachePolicy(
+        num_layers=1, num_experts=256, cache_size=120, topk=6,
+        recent_weight=0.7, ema_weight=0.37, router_weight=0.29, age_weight=0.013,
+    )
+    state = policy.layer_states[0]
+    for _ in range(30):
+        state.step = 1000
+        state.freq = rng.integers(0, 33, 256).tolist()
+        state.ema = rng.random(256).astype(np.float32)
+        state.router_score = rng.random(256).tolist()
+        state.last_used = rng.integers(-1, 1001, 256).tolist()
+        residents = rng.choice(256, 120, replace=False).tolist()
+        slot_owner = dict(enumerate(residents))
+        protected = set(residents[:5])
+        expected = sorted(
+            (eid for eid in residents if eid not in protected),
+            key=lambda eid: policy._victim_key(0, eid),
+        )[:count]
+        assert policy.choose_victims(0, slot_owner, protected, count) == expected
+
+
+@pytest.mark.parametrize("count", [1, 2, 8])
+def test_choose_victims_preserves_score_age_and_id_ties(count):
+    policy = LRCExpertCachePolicy(
+        num_layers=1, num_experts=8, cache_size=4, topk=2, age_weight=0.0,
+    )
+    state = policy.layer_states[0]
+    state.last_used[6], state.last_used[7], state.last_used[3] = 11, 5, 5
+    slot_owner = {0: 6, 1: 7, 2: 3, 3: 1}
+    assert policy.choose_victims(0, slot_owner, {1}, count) == [3, 7, 6][:count]
+    assert policy.choose_victims(0, slot_owner, {1, 3, 6, 7}, count) == []
+    assert policy.choose_victims(0, {}, set(), count) == []
+
+
+def test_choose_victims_preserves_scalar_precision():
+    policy = LRCExpertCachePolicy(
+        num_layers=1, num_experts=8, cache_size=2, topk=2,
+        recent_weight=0.0, ema_weight=0.0, router_weight=1.0, age_weight=0.0,
+    )
+    state = policy.layer_states[0]
+    state.router_score[6] = 1.0 + 2.0 ** -29
+    state.router_score[7] = 1.0 + 2.0 ** -30
+    slot_owner = {0: 6, 1: 7}
+    expected = sorted(slot_owner.values(), key=lambda eid: policy._victim_key(0, eid))
+    assert policy.choose_victims(0, slot_owner, set(), 1) == expected[:1]
+    assert policy.choose_victims(0, slot_owner, set(), 2) == expected
+
+    state.step = 2 ** 25 + 17
+    state.last_used[6], state.last_used[7] = 2 ** 25, 2 ** 25 + 1
+    policy.router_weight, policy.age_weight = 0.0, 1.0
+    assert policy.choose_victims(0, slot_owner, set(), 2) == [6, 7]
+
+
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), -float("inf")])
+def test_choose_victims_preserves_nonfinite_score_order(score):
+    policy = LRCExpertCachePolicy(num_layers=1, num_experts=8, cache_size=4, topk=2)
+    policy.layer_states[0].router_score[3] = score
+    slot_owner = {0: 6, 1: 3, 2: 1, 3: 7}
+    expected = sorted(slot_owner.values(), key=lambda eid: policy._victim_key(0, eid))
+    assert policy.choose_victims(0, slot_owner, set(), 1) == expected[:1]
+    assert policy.choose_victims(0, slot_owner, set(), 8) == expected
