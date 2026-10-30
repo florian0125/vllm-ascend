@@ -917,16 +917,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # permanently cost max_num_batched_tokens * hc_dim per rank.
         # Aligned with upstream DeepSeekV4 (see vllm PR #50312).
         spec_config = vllm_config.speculative_config
+        # Only the V1 runner's "mtp" path reads this buffer; DSpark consumes
+        # the three target-layer aux hidden states instead. Stashing for other
+        # methods is dead work that torch.compile turns into a full 4.9 GB
+        # TensorMove on every decode replay.
         self._needs_mtp_hidden_states = bool(
             get_pp_group().is_last_rank
             and spec_config is not None
-            and (spec_config.use_eagle() or spec_config.uses_draft_model())
+            and spec_config.method == "mtp"
         )
         self._mtp_buffer_shape = (
             vllm_config.scheduler_config.max_num_batched_tokens,
             hc_dim,
         )
         self._mtp_buffer_dtype = vllm_config.model_config.dtype
+        # Allocated lazily in forward (MTP only). Allocating it in __init__
+        # makes it a graph input and AOTAutograd then adds a full-buffer
+        # copy-back on every replay.
         self._mtp_hidden_buffer: torch.Tensor | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

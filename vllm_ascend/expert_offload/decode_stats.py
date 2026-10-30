@@ -33,6 +33,11 @@ from vllm.logger import logger
 #   in_csv   : whether it is a per-layer quantity worth a CSV column
 _METRICS = (
     ("gsize", "routed experts    |G| /layer", "gsize", "mean", True),
+    ("cpu_experts", "CPU experts      /layer", "cpu_experts", "mean", True),
+    ("npu_experts", "NPU experts      /layer", "npu_experts", "mean", True),
+    ("cpu_routes", "CPU routes       /layer", "cpu_routes", "mean", True),
+    ("npu_routes", "NPU routes       /layer", "npu_routes", "mean", True),
+    ("raw_hit", "raw resident hit |H|/|G|", "raw_hit", "mean", True),
     ("psize", "predicted experts |P| /layer", "psize", "mean", True),
     ("hit_post", "cache hit rate (post-subst)", "hit_post", "mean", True),
     ("hit_pre", "cache hit rate (pre-subst)", "hit_pre", "mean", True),
@@ -216,6 +221,11 @@ class DecodeStatsCollector:
         layer_idx: int,
         *,
         gsize=None,
+        cpu_experts=None,
+        npu_experts=None,
+        cpu_routes=None,
+        npu_routes=None,
+        raw_hit=None,
         psize=None,
         hit_post=None,
         hit_pre=None,
@@ -251,6 +261,11 @@ class DecodeStatsCollector:
             # gsize/psize/pf_loads/pred_prec added. Keys must match the
             # `source` column of _METRICS; nothing else keys off this dict.
             "gsize": gsize,
+            "cpu_experts": cpu_experts,
+            "npu_experts": npu_experts,
+            "cpu_routes": cpu_routes,
+            "npu_routes": npu_routes,
+            "raw_hit": raw_hit,
             "psize": psize,
             "hit_post": hit_post,
             "hit_pre": hit_pre,

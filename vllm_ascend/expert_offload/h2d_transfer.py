@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any, Protocol
 
 import torch
+from vllm_ascend.expert_offload.cpu_prefetch_diagnostics import Phase as CpuPrefetchPhase
 
 ONE_GIB = 1 << 30
 UINT32_MAX = (1 << 32) - 1
@@ -90,8 +91,18 @@ class TorchCopyH2DTransport:
         return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
 
     def copy_batch(self, tasks: list[H2DCopyTask]) -> None:
-        for task in tasks:
+        cpu_diag = getattr(self, "_cpu_prefetch_trace", None)
+        trace_local = getattr(cpu_diag, "_local", None)
+        if isinstance(trace_local, threading.local) and getattr(trace_local, "context", None) is None:
+            # Disabled callback diagnostics have no TLS context. Avoid two
+            # Python marker calls per field while retaining exact active marks.
+            cpu_diag = None
+        for index, task in enumerate(tasks):
+            if cpu_diag is not None:
+                cpu_diag.mark(CpuPrefetchPhase.COPY_FIELD_BEGIN, index, task.nbytes)
             task.destination.copy_(task.source, non_blocking=task.non_blocking)
+            if cpu_diag is not None:
+                cpu_diag.mark(CpuPrefetchPhase.COPY_FIELD_END, index, task.nbytes)
 
     @staticmethod
     def synchronize(stream) -> None:

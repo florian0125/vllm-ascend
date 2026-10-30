@@ -45,6 +45,38 @@ from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 
 
+def _prepare_expert_offload_before_super(layer_name, moe_config, quant_config, expert_map_manager):
+    """Apply the fork pre-super offload capacity contract."""
+    cfg = get_ascend_config().expert_offload_config
+    if (moe_config is None or expert_map_manager is None
+            or not cfg.expert_offload or quant_config is None
+            or "mtp" in layer_name.split(".")):
+        return
+    if moe_config.ep_size != 1:
+        return
+    try:
+        from vllm_ascend.expert_offload import get_expert_offload_manager, has_expert_offload_manager
+        if not has_expert_offload_manager():
+            return
+        manager = get_expert_offload_manager()
+    except (ImportError, AssertionError):
+        return
+    layer_idx = len(manager.moe_layers)
+    total = int(moe_config.num_logical_experts)
+    slots = int(cfg.num_device_experts_for_layer(layer_idx))
+    if not 0 < slots < total or int(moe_config.num_local_experts) != total:
+        return
+    expert_map = torch.full((total,), -1, dtype=torch.int32)
+    expert_map[:slots] = torch.arange(slots, dtype=torch.int32)
+    expert_map_manager._local_num_experts = slots
+    expert_map_manager._expert_map = expert_map
+    moe_config.num_local_experts = slots
+    logger.info_once(
+        "[EXPERT-OFFLOAD] pre-super allocation: layer=%s logical_experts=%d device_slots=%d",
+        layer_name, total, slots,
+    )
+
+
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """Unquantized MoE method with Ascend-specific kernels.
 
@@ -384,6 +416,16 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         **kwargs,
     ):
         object.__setattr__(self, "tid2eid", tid2eid)
+        if len(args) >= 3:
+            _prepare_expert_offload_before_super(
+                args[0], args[2], args[3] if len(args) > 3 else kwargs.get("quant_config"),
+                args[4] if len(args) > 4 else kwargs.get("expert_map_manager"),
+            )
+        else:
+            _prepare_expert_offload_before_super(
+                kwargs.get("layer_name", ""), kwargs.get("moe_config"),
+                kwargs.get("quant_config"), kwargs.get("expert_map_manager"),
+            )
         super().__init__(*args, **kwargs)
         if self.quant_config is None:
             # Preserve the pre-refactor BF16 lifecycle: let upstream create
@@ -484,6 +526,17 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             global_num_experts=self.moe_config.num_experts,
         )
         mgr.init_layer_cpu_buffers(self, self.offload_layer_idx)
+        from vllm_ascend.expert_offload.cpu_backend.wiring import maybe_attach_cpu_expert_backend
+
+        if not mgr.native_mxfp4_enabled:
+            maybe_attach_cpu_expert_backend(
+                routed_experts=self,
+                layer_name=self.layer_name,
+                moe_config=self.moe_config,
+                cpu_moe_config=cfg.cpu_moe,
+                enable_multi_card=self.enable_multi_card,
+                tp_size=get_current_vllm_config().parallel_config.tensor_parallel_size,
+            )
 
     def _wrap_weight_loader_for_offload(self):
         """Wrap weight_loader to intercept w13/w2 weights and store them on CPU.
@@ -896,8 +949,15 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             else:
                 self.moe_load.add_(local_load)
 
+        routed_hidden_states = fused_experts_results.routed_out
+        if fused_experts_results.cpu_expert_task is not None:
+            from vllm_ascend.expert_offload.hybrid_executor import HybridExpertExecutor
+
+            routed_hidden_states = HybridExpertExecutor.finish(
+                routed_hidden_states, fused_experts_results.cpu_expert_task
+            )
         routed_out = _EXTRA_CTX.moe_comm_method.finalize(
-            hidden_states=fused_experts_results.routed_out,
+            hidden_states=routed_hidden_states,
             reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
             padded_hidden_states_shape=padded_hidden_states_shape,
         )

@@ -243,3 +243,4 @@ csrc/third_party/
 
 # local build cache
 .vllm_ascend/
+extra-info/
